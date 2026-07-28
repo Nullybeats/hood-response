@@ -10,7 +10,7 @@ import { buildServer } from './api/server.js';
 import { configuredChannels, dispatchMilestone } from './notify/index.js';
 import { SafetyChecker } from './chain/safety.js';
 import { PerformanceTracker, type TrackedCall } from './engine/performance.js';
-import { SniperEngine } from './sniper/engine.js';
+import { SniperRegistry } from './sniper/registry.js';
 import { TelegramCommands } from './telegram/commands.js';
 import type { Swarm, SwapEvent } from './types.js';
 
@@ -42,9 +42,11 @@ async function main(): Promise<void> {
     void dispatchMilestone(call, milestonePct, price.dexUrl(call.token));
   });
 
-  // Sniper: auto-buy qualifying alerts with a server hot wallet (off by default).
-  const sniper = new SniperEngine(price);
-  await sniper.load();
+  // Sniper: one independent hot-wallet engine per admin (off by default). The
+  // registry restores every known operator's engine on boot so their positions
+  // survive redeploys and stay viewable; the live alert stream fans out to all.
+  const sniper = new SniperRegistry(price);
+  await sniper.loadAll();
   sniper.start();
 
   // Inbound Telegram commands (/t5, /t10, /l5) answered from live performance data.
@@ -54,7 +56,7 @@ async function main(): Promise<void> {
   store.on('alert', (a) => {
     performance.track(a.swarm);
     performance.sampleSoon();
-    void sniper.onAlert(a.swarm);
+    sniper.onAlert(a.swarm); // fans out to every admin's engine
   });
 
   const detachPersistence = await attachPersistence(store);
@@ -253,7 +255,7 @@ async function main(): Promise<void> {
     sniper.stop();
     telegramCommands.stop();
     await performance.flush().catch(() => undefined);
-    await sniper.flush().catch(() => undefined);
+    await sniper.flushAll().catch(() => undefined);
     await app.close().catch(() => undefined);
     await detachPersistence();
     process.exit(0);

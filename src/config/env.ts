@@ -215,6 +215,7 @@ const schema = z.object({
   // After a token stops us out at a loss, don't re-buy it for this many minutes (0 = off).
   SNIPER_LOSS_COOLDOWN_MIN: num(90),
   SNIPER_JOURNAL_PATH: z.string().default(''), // append-only JSONL trade journal for offline analysis
+  WALLET_OVERRIDES_PATH: z.string().default(''), // persist manual wallet add/remove/retier across restarts
   SNIPER_STORE_PATH: z.string().default(''), // persist positions across redeploys
 
   DISCORD_WEBHOOK_URL: z.string().default(''),

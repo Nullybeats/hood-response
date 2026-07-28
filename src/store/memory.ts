@@ -10,6 +10,7 @@ import type {
   TrackedWallet,
 } from '../types.js';
 import { SEED_TOKENS, SEED_WALLETS } from '../data/seed.js';
+import { applyWalletOverrides } from './walletOverrides.js';
 import { config } from '../config/env.js';
 import { logger } from '../logger.js';
 
@@ -102,6 +103,7 @@ export class MemoryStore extends EventEmitter {
       this.tokensBySymbol.set(t.symbol, t);
     }
     for (const w of SEED_WALLETS) this.wallets.set(w.address, w);
+    applyWalletOverrides(this.wallets); // re-apply the operator's manual add/remove/retier on top of the seed
     for (const sym of config.mutedWalletTokens) this.mutedTokens.add(sym.toUpperCase());
   }
 

@@ -4,10 +4,11 @@ import { z } from 'zod';
 import { config } from '../config/env.js';
 import { logger } from '../logger.js';
 import type { MemoryStore } from '../store/memory.js';
+import { recordWalletUpsert, recordWalletRemove } from '../store/walletOverrides.js';
 import type { AlertEngine } from '../engine/alertEngine.js';
 import type { Aggregator } from '../engine/aggregator.js';
 import type { PerformanceTracker } from '../engine/performance.js';
-import type { SniperEngine } from '../sniper/engine.js';
+import type { SniperRegistry } from '../sniper/registry.js';
 import { configuredChannels, dispatch } from '../notify/index.js';
 import type { Alert, AlertRule, Swarm, SwapEvent, WalletCategory } from '../types.js';
 import { DASHBOARD_HTML } from './dashboard.js';
@@ -84,7 +85,7 @@ export async function buildServer(
   engine: AlertEngine,
   aggregator: Aggregator,
   performance?: PerformanceTracker,
-  sniper?: SniperEngine,
+  sniper?: SniperRegistry,
 ): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
   await app.register(cors, { origin: true });
@@ -139,9 +140,13 @@ export async function buildServer(
     let wallets = [...store.wallets.values()];
     if (category) wallets = wallets.filter((w) => w.category === category);
     if (tier) wallets = wallets.filter((w) => w.tier === tier);
-    // Omit the raw address from the public list; keep label/category/stats.
+    // Address is redacted for the PUBLIC list; the authenticated admin (the cipherfi
+    // wallet-manager) gets it so it can identify wallets to retier/remove.
+    const showAddr =
+      config.ADMIN_PASSWORD.length === 0 || req.headers['x-admin-password'] === config.ADMIN_PASSWORD;
     return wallets.map(({ address, ...w }) => ({
       ...w,
+      address: showAddr ? address : undefined,
       stats: store.walletStats.get(address) ?? null,
     }));
   });
@@ -166,6 +171,7 @@ export async function buildServer(
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
     const w = { ...parsed.data, address: parsed.data.address.toLowerCase() };
     store.wallets.set(w.address, w);
+    recordWalletUpsert(w); // persist so the add/retier survives a restart (seed re-runs on boot)
     return reply.code(201).send(w);
   });
 
@@ -173,6 +179,7 @@ export async function buildServer(
     const address = (req.params as { address: string }).address.toLowerCase();
     const ok = store.wallets.delete(address);
     if (!ok) return reply.code(404).send({ error: 'wallet not tracked' });
+    recordWalletRemove(address); // persist the removal (even of a seed wallet) across restarts
     return { deleted: address };
   });
 
@@ -189,6 +196,15 @@ export async function buildServer(
   };
   const denyAdmin = (reply: { code: (n: number) => { send: (b: unknown) => unknown } }): unknown =>
     reply.code(401).send({ error: 'unauthorized' });
+
+  // Which admin's sniper this request targets. cipherfi injects `x-user-id` (the
+  // logged-in operator's email) after authenticating the browser; absent it we
+  // fall back to the single 'default' engine (dev / direct access). Each owner
+  // gets a fully independent engine + hot wallet (see SniperRegistry).
+  const userIdOf = (req: { headers: Record<string, unknown> }): string => {
+    const h = req.headers['x-user-id'];
+    return (typeof h === 'string' && h.trim()) || 'default';
+  };
 
   app.post('/api/admin/verify', async (req, reply) =>
     adminOk(req) ? { ok: true } : denyAdmin(reply),
@@ -240,25 +256,30 @@ export async function buildServer(
     return mutedState();
   });
 
-  // ── Sniper (auto-buy) — admin only, holds a hot wallet ─────────────────────────
+  // ── Sniper (auto-buy) — admin only, one independent hot wallet per operator ────
+  // Every route resolves the caller's OWN engine from `x-user-id` (SniperRegistry),
+  // so two admins run fully separate snipers — separate wallets, positions, settings.
   app.get('/api/sniper', async (req, reply) => {
     if (!adminOk(req)) return denyAdmin(reply);
     if (!sniper) return { enabled: false, configured: false, positions: [] };
-    return sniper.snapshot();
+    const engine = await sniper.get(userIdOf(req));
+    return engine.snapshot();
   });
   app.post('/api/sniper/settings', async (req, reply) => {
     if (!adminOk(req)) return denyAdmin(reply);
     if (!sniper) return reply.code(503).send({ error: 'sniper not available' });
     const parsed = sniperSettingsBody.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
-    sniper.updateSettings(parsed.data);
-    return sniper.snapshot();
+    const engine = await sniper.get(userIdOf(req));
+    engine.updateSettings(parsed.data);
+    return engine.snapshot();
   });
   app.post('/api/sniper/toggle', async (req, reply) => {
     if (!adminOk(req)) return denyAdmin(reply);
     if (!sniper) return reply.code(503).send({ error: 'sniper not available' });
-    sniper.updateSettings({ enabled: !sniper.settings.enabled });
-    return sniper.snapshot();
+    const engine = await sniper.get(userIdOf(req));
+    engine.updateSettings({ enabled: !engine.settings.enabled });
+    return engine.snapshot();
   });
   // Set the hot-wallet key in-app (memory only; never persisted or echoed back).
   app.post('/api/sniper/wallet', async (req, reply) => {
@@ -267,8 +288,9 @@ export async function buildServer(
     const pk = (req.body as { privateKey?: string } | undefined)?.privateKey;
     if (!pk || typeof pk !== 'string') return reply.code(400).send({ error: 'privateKey required' });
     try {
-      const address = sniper.setPrivateKey(pk);
-      logger.info({ address }, 'sniper: wallet key set in-app');
+      const engine = await sniper.get(userIdOf(req));
+      const address = engine.setPrivateKey(pk);
+      logger.info({ owner: engine.owner, address }, 'sniper: wallet key set in-app');
       return { ok: true, address };
     } catch {
       return reply.code(400).send({ error: 'invalid private key' });
@@ -280,7 +302,8 @@ export async function buildServer(
     if (!sniper) return reply.code(503).send({ error: 'sniper not available' });
     const id = (req.params as { id: string }).id;
     try {
-      const pos = await sniper.sellNow(id);
+      const engine = await sniper.get(userIdOf(req));
+      const pos = await engine.sellNow(id);
       return { ok: true, position: pos };
     } catch (err) {
       return reply.code(400).send({ error: String(err instanceof Error ? err.message : err) });
@@ -296,7 +319,8 @@ export async function buildServer(
     const b = req.body as { pct?: number | null | 'default' } | undefined;
     const pct = b?.pct === 'default' ? undefined : (b?.pct ?? null);
     try {
-      const pos = sniper.setPositionTakeProfit(id, pct);
+      const engine = await sniper.get(userIdOf(req));
+      const pos = engine.setPositionTakeProfit(id, pct);
       return { ok: true, position: pos };
     } catch (err) {
       return reply.code(400).send({ error: String(err instanceof Error ? err.message : err) });
@@ -308,7 +332,8 @@ export async function buildServer(
     if (!adminOk(req)) return denyAdmin(reply);
     if (!sniper) return reply.code(503).send({ error: 'sniper not available' });
     const id = (req.params as { id: string }).id;
-    const ok = sniper.untrack(id);
+    const engine = await sniper.get(userIdOf(req));
+    const ok = engine.untrack(id);
     if (!ok) return reply.code(404).send({ error: 'position not found' });
     return { ok: true };
   });
@@ -320,7 +345,8 @@ export async function buildServer(
     const b = req.body as { token?: string } | undefined;
     if (!b?.token || !ADDR.test(b.token)) return reply.code(400).send({ error: 'valid token address required' });
     try {
-      const pos = await sniper.importPosition(b.token.toLowerCase());
+      const engine = await sniper.get(userIdOf(req));
+      const pos = await engine.importPosition(b.token.toLowerCase());
       return { ok: true, position: pos };
     } catch (err) {
       return reply.code(400).send({ error: String(err instanceof Error ? err.message : err) });
@@ -337,7 +363,8 @@ export async function buildServer(
       return reply.code(400).send({ error: 'valid 32-byte tx hash required' });
     }
     try {
-      const pos = await sniper.restoreFromTx(b.token.toLowerCase(), b.txHash);
+      const engine = await sniper.get(userIdOf(req));
+      const pos = await engine.restoreFromTx(b.token.toLowerCase(), b.txHash);
       return { ok: true, position: pos };
     } catch (err) {
       return reply.code(400).send({ error: String(err instanceof Error ? err.message : err) });
@@ -350,7 +377,8 @@ export async function buildServer(
     const b = req.body as { token?: string; eth?: number } | undefined;
     if (!b?.token || !ADDR.test(b.token)) return reply.code(400).send({ error: 'valid token address required' });
     try {
-      const pos = await sniper.testBuy(b.token.toLowerCase(), b.eth && b.eth > 0 ? b.eth : 0.0005);
+      const engine = await sniper.get(userIdOf(req));
+      const pos = await engine.testBuy(b.token.toLowerCase(), b.eth && b.eth > 0 ? b.eth : 0.0005);
       return { ok: true, position: pos };
     } catch (err) {
       return reply.code(400).send({ error: String(err instanceof Error ? err.message : err) });

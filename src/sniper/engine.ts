@@ -158,13 +158,26 @@ export class SniperEngine {
    *  (resets on restart, which is fine — a fresh process starts with a clean slate). */
   private readonly recentLosses = new Map<string, number>();
 
+  /** Owner of this engine (a cipherfi admin email, or 'default'). Purely for
+   *  logging/telemetry — the engine itself is otherwise identity-agnostic. */
+  readonly owner: string;
+  /** Per-engine persistence paths. In the multi-tenant setup each admin's
+   *  engine writes to its own file so positions never mix (see SniperRegistry).
+   *  Empty string = persistence disabled, exactly as before. */
+  private readonly storePath: string;
+  private readonly journalPath: string;
+
   constructor(
     private readonly price: PriceOracle,
     executor?: SwapExecutor,
     safety?: SafetyChecker,
+    opts?: { owner?: string; storePath?: string; journalPath?: string },
   ) {
     this.executor = executor ?? new SwapExecutor();
     this.safety = safety ?? new SafetyChecker();
+    this.owner = opts?.owner ?? 'default';
+    this.storePath = opts?.storePath ?? config.SNIPER_STORE_PATH;
+    this.journalPath = opts?.journalPath ?? config.SNIPER_JOURNAL_PATH;
   }
 
   /** Best-effort buy/sell tax lookup — never blocks or fails the caller. */
@@ -398,7 +411,7 @@ export class SniperEngine {
    *  analysis (slippage in/out, gas, venue, latency, round-trip). Best-effort:
    *  a journal write must never affect the trade or throw into the sell path. */
   private async journal(p: Position): Promise<void> {
-    if (!config.SNIPER_JOURNAL_PATH) return;
+    if (!this.journalPath) return;
     try {
       const grossPnlEth = (p.exitValueEth ?? 0) - p.ethIn;
       const netPnlEth = grossPnlEth - (p.buyGasEth ?? 0) - (p.sellGasEth ?? 0);
@@ -431,8 +444,8 @@ export class SniperEngine {
         netPnlEth,
         netPnlPct: p.ethIn > 0 ? (netPnlEth / p.ethIn) * 100 : null,
       };
-      await mkdir(dirname(config.SNIPER_JOURNAL_PATH), { recursive: true }).catch(() => undefined);
-      await writeFile(config.SNIPER_JOURNAL_PATH, JSON.stringify(row) + '\n', { flag: 'a' });
+      await mkdir(dirname(this.journalPath), { recursive: true }).catch(() => undefined);
+      await writeFile(this.journalPath, JSON.stringify(row) + '\n', { flag: 'a' });
     } catch (err) {
       logger.warn({ err: String(err) }, 'sniper: journal append failed');
     }
@@ -738,9 +751,9 @@ export class SniperEngine {
 
   // ── Persistence (survive redeploys via SNIPER_STORE_PATH) ─────────────────────
   async load(): Promise<void> {
-    if (!config.SNIPER_STORE_PATH) return;
+    if (!this.storePath) return;
     try {
-      const raw = await readFile(config.SNIPER_STORE_PATH, 'utf8');
+      const raw = await readFile(this.storePath, 'utf8');
       const parsed = JSON.parse(raw) as unknown;
       const arr = Array.isArray(parsed) ? (parsed as Position[]) : [];
       for (const p of arr) if (p && p.id) this.positions.set(p.id, p);
@@ -758,10 +771,10 @@ export class SniperEngine {
   /** Write positions to disk now (used on each change and on graceful shutdown
    *  so the pre-redeploy state is captured). */
   async flush(): Promise<void> {
-    if (!config.SNIPER_STORE_PATH) return;
+    if (!this.storePath) return;
     this.persisting = true;
     try {
-      const path = config.SNIPER_STORE_PATH;
+      const path = this.storePath;
       await mkdir(dirname(path), { recursive: true });
       const tmp = `${path}.tmp`;
       await writeFile(tmp, JSON.stringify([...this.positions.values()]));
