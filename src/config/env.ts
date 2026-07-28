@@ -204,7 +204,10 @@ const schema = z.object({
   // Only applies to sells; buys are never force-executed past normal slippage.
   SNIPER_MAX_SELL_SLIPPAGE_PCT: num(50),
   SNIPER_TAKE_PROFIT_PCT: num(0), // auto-sell a position at +this% (0 = off)
-  SNIPER_KINDS: z.string().default('BUY,SOLO,ENTRY'), // alert kinds to snipe
+  SNIPER_REQUIRE_SAFE: bool(true), // never buy a token that fails the honeypot/sellability check (−100% trap)
+  SNIPER_TRAILING_STOP_PCT: num(15), // trailing stop % off the high-water mark; doubles as the stop-loss
+  // (peak starts at entry). The validated edge: tight ~15% on non-SOLO swarms. 0 = off.
+  SNIPER_KINDS: z.string().default('BUY,ENTRY'), // alert kinds to snipe — non-SOLO by default (SOLO was −EV in backtest)
   SNIPER_STORE_PATH: z.string().default(''), // persist positions across redeploys
 
   DISCORD_WEBHOOK_URL: z.string().default(''),

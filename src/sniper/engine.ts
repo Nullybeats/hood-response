@@ -26,11 +26,13 @@ export interface Position {
   openedAt: number;
   lastPriceUsd: number;
   updatedAt: number;
+  /** High-water mark price since entry (initialised to entry). Drives the trailing stop. */
+  peakPriceUsd?: number;
   status: 'open' | 'closed';
   closedAt?: number;
   sellTx?: string;
   exitPriceUsd?: number;
-  closeReason?: 'take-profit' | 'manual';
+  closeReason?: 'take-profit' | 'manual' | 'trailing-stop';
   /** Per-position take-profit %, overriding the global setting when set.
    *  null explicitly disables take-profit for this position. */
   takeProfitPct?: number | null;
@@ -54,6 +56,14 @@ export interface SniperSettings {
   maxConviction: number;
   buyEth: number;
   takeProfitPct: number;
+  /** Trailing stop % off the high-water mark. Because the high-water starts at entry, this doubles
+   *  as the stop-loss: a coin that never runs exits at −trailingStopPct; a runner exits that far
+   *  below its peak. 0 = off. This is the validated edge (tight ~15% on non-SOLO swarms). */
+  trailingStopPct: number;
+  /** Require the honeypot/sellability check to pass before buying (never buy what we can't sell). */
+  requireSafe: boolean;
+  /** Comma-separated alert kinds to snipe, e.g. "BUY,ENTRY" (non-SOLO). Case-insensitive. */
+  kinds: string;
 }
 
 const priceRatio = (p: Position, price: number): number =>
@@ -111,6 +121,9 @@ export class SniperEngine {
     maxConviction: config.SNIPER_MAX_CONVICTION,
     buyEth: config.SNIPER_BUY_ETH,
     takeProfitPct: config.SNIPER_TAKE_PROFIT_PCT,
+    trailingStopPct: config.SNIPER_TRAILING_STOP_PCT,
+    requireSafe: config.SNIPER_REQUIRE_SAFE,
+    kinds: [...config.sniperKinds].join(','),
   };
 
   constructor(
@@ -185,7 +198,8 @@ export class SniperEngine {
   /** Alert hook: decide whether to snipe, and buy if so. */
   async onAlert(swarm: Swarm): Promise<void> {
     if (!this.settings.enabled) return this.decide(swarm, 'skipped', 'sniper is OFF');
-    if (!config.sniperKinds.has(swarm.kind)) return this.decide(swarm, 'skipped', `kind ${swarm.kind} not in buy list`);
+    const allowedKinds = new Set(this.settings.kinds.split(',').map((k) => k.trim().toUpperCase()).filter(Boolean));
+    if (!allowedKinds.has(swarm.kind)) return this.decide(swarm, 'skipped', `kind ${swarm.kind} not in buy list`);
     if (swarm.conviction < this.settings.minConviction || swarm.conviction > this.settings.maxConviction)
       return this.decide(swarm, 'skipped', `conviction ${swarm.conviction} outside ${this.settings.minConviction}-${this.settings.maxConviction}`);
     if (this.holdsOpen(swarm.token)) return this.decide(swarm, 'skipped', 'already holding this token');
@@ -205,6 +219,12 @@ export class SniperEngine {
     const size = this.sizeEth();
     if (this.spentLast24h(now) + size > config.SNIPER_DAILY_CAP_ETH) {
       return this.decide(swarm, 'skipped', 'daily spend cap reached');
+    }
+
+    // Honeypot / sellability gate — never buy something we can't sell (the −100% trap). Cached, cheap.
+    if (this.settings.requireSafe) {
+      const safe = await this.safety.check(swarm.token, this.price.liquidityOf(swarm.token)).catch(() => null);
+      if (safe && safe.ok === false) return this.decide(swarm, 'skipped', `unsafe: ${(safe.hardFails ?? []).join(', ')}`);
     }
 
     try {
@@ -264,7 +284,16 @@ export class SniperEngine {
       if (px > 0) {
         p.lastPriceUsd = px;
         p.updatedAt = now;
-        // Per-position TP overrides the global one; null explicitly disables it.
+        // High-water mark (starts at entry) — drives the trailing stop.
+        p.peakPriceUsd = Math.max(p.peakPriceUsd ?? p.entryPriceUsd, px);
+        // 1) Trailing stop (downside first). Peak starts at entry, so this also caps the loss at
+        //    −trailingStopPct on coins that never run — the validated tight-stop edge.
+        const trail = this.settings.trailingStopPct;
+        if (trail > 0 && p.peakPriceUsd > 0 && px <= p.peakPriceUsd * (1 - trail / 100)) {
+          await this.closeOut(p, 'trailing-stop');
+          continue;
+        }
+        // 2) Take-profit (upside cap). Per-position TP overrides the global; null disables it.
         const tp = p.takeProfitPct !== undefined ? (p.takeProfitPct ?? 0) : this.settings.takeProfitPct;
         if (tp > 0 && p.entryPriceUsd > 0 && (px / p.entryPriceUsd - 1) * 100 >= tp) {
           await this.takeProfit(p);
@@ -274,7 +303,7 @@ export class SniperEngine {
     void this.persist();
   }
 
-  private async closePosition(p: Position, reason: 'take-profit' | 'manual'): Promise<void> {
+  private async closePosition(p: Position, reason: 'take-profit' | 'manual' | 'trailing-stop'): Promise<void> {
     const ethUsd = this.price.ethUsdPrice();
     const expectedPriceEth = p.lastPriceUsd > 0 && ethUsd && ethUsd > 0 ? p.lastPriceUsd / ethUsd : null;
     const res = await this.executor.sell(p.token, this.price.pairIdOf(p.token), expectedPriceEth);
@@ -289,11 +318,17 @@ export class SniperEngine {
   }
 
   private async takeProfit(p: Position): Promise<void> {
+    await this.closeOut(p, 'take-profit');
+  }
+
+  /** Close a position for a rules-driven reason (take-profit / trailing-stop), logging on failure.
+   *  A failed sell leaves the position OPEN so the next sample retries — the honeypot escape hatch. */
+  private async closeOut(p: Position, reason: 'take-profit' | 'trailing-stop'): Promise<void> {
     if (p.status !== 'open') return;
     try {
-      await this.closePosition(p, 'take-profit');
+      await this.closePosition(p, reason);
     } catch (err) {
-      logger.error({ token: p.tokenSymbol, err: String(err) }, 'sniper: take-profit sell failed');
+      logger.error({ token: p.tokenSymbol, reason, err: String(err) }, `sniper: ${reason} sell failed`);
     }
   }
 
@@ -512,6 +547,13 @@ export class SniperEngine {
     if (typeof patch.maxConviction === 'number') this.settings.maxConviction = clamp(patch.maxConviction, 0, 100);
     if (typeof patch.buyEth === 'number') this.settings.buyEth = Math.max(MIN_BUY_ETH, patch.buyEth);
     if (typeof patch.takeProfitPct === 'number') this.settings.takeProfitPct = Math.max(0, patch.takeProfitPct);
+    if (typeof patch.trailingStopPct === 'number') this.settings.trailingStopPct = Math.max(0, patch.trailingStopPct);
+    if (typeof patch.requireSafe === 'boolean') this.settings.requireSafe = patch.requireSafe;
+    if (typeof patch.kinds === 'string') {
+      // normalise to upper, comma-joined; ignore empty so the buy list can't be wiped by accident
+      const norm = patch.kinds.split(',').map((k) => k.trim().toUpperCase()).filter(Boolean).join(',');
+      if (norm) this.settings.kinds = norm;
+    }
     logger.info({ settings: this.settings }, 'sniper: settings updated');
     return this.settings;
   }

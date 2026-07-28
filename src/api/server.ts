@@ -72,6 +72,9 @@ const sniperSettingsBody = z.object({
   maxConviction: z.number().min(0).max(100).optional(),
   buyEth: z.number().positive().optional(),
   takeProfitPct: z.number().min(0).optional(),
+  trailingStopPct: z.number().min(0).max(100).optional(),
+  requireSafe: z.boolean().optional(),
+  kinds: z.string().optional(),
 });
 
 export async function buildServer(

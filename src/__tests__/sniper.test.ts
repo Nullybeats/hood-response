@@ -15,10 +15,10 @@ function stubPrice(prices: Record<string, number>, ethUsd: number | null = null)
 }
 
 // No real GoPlus network call in tests — deterministic, instant.
-function stubSafety(buyTaxPct: number | null = 0, sellTaxPct: number | null = 0) {
+function stubSafety(buyTaxPct: number | null = 0, sellTaxPct: number | null = 0, ok = true, hardFails: string[] = []) {
   return {
     async check() {
-      return { buyTaxPct, sellTaxPct } as unknown as Awaited<
+      return { ok, honeypot: !ok, hardFails, buyTaxPct, sellTaxPct } as unknown as Awaited<
         ReturnType<import('../chain/safety.js').SafetyChecker['check']>
       >;
     },
@@ -317,5 +317,43 @@ describe('SniperEngine', () => {
 
     const snap = await eng.snapshot();
     expect(snap.positions[0]!.status).toBe('open'); // stays open — TP is off
+  });
+
+  it('honeypot gate: skips a buy when the safety check fails (cannot sell)', async () => {
+    const log: string[] = [];
+    const eng = new SniperEngine(stubPrice({ '0xtok': 1 }), stubExecutor(log), stubSafety(0, 0, false, ['honeypot']));
+    eng.updateSettings({ enabled: true });
+    await eng.onAlert(swarm());
+    expect(log.some((l) => l.startsWith('buy'))).toBe(false); // never bought the honeypot
+  });
+
+  it('trailing stop: exits when price falls trailingStopPct below the peak', async () => {
+    const prices: Record<string, number> = { '0xtok': 1 };
+    const eng = new SniperEngine(stubPrice(prices), stubExecutor([]), stubSafety());
+    eng.updateSettings({ enabled: true, takeProfitPct: 0, trailingStopPct: 15 });
+    await eng.onAlert(swarm()); // entry @ 1
+    prices['0xtok'] = 2; // runs to 2 → peak 2, no drawdown
+    // @ts-expect-error exercise the private sampler
+    await eng.sample();
+    expect((await eng.snapshot()).positions[0]!.status).toBe('open');
+    prices['0xtok'] = 1.6; // −20% off the peak (past 15%)
+    // @ts-expect-error exercise the private sampler
+    await eng.sample();
+    const snap = await eng.snapshot();
+    expect(snap.positions[0]!.status).toBe('closed');
+    expect(snap.positions[0]!.closeReason).toBe('trailing-stop');
+  });
+
+  it('trailing stop doubles as stop-loss: a coin that never runs exits near −trailingStopPct', async () => {
+    const prices: Record<string, number> = { '0xtok': 1 };
+    const eng = new SniperEngine(stubPrice(prices), stubExecutor([]), stubSafety());
+    eng.updateSettings({ enabled: true, takeProfitPct: 0, trailingStopPct: 15 });
+    await eng.onAlert(swarm()); // entry @ 1, peak = entry = 1
+    prices['0xtok'] = 0.8; // −20% from entry, never made a new high
+    // @ts-expect-error exercise the private sampler
+    await eng.sample();
+    const snap = await eng.snapshot();
+    expect(snap.positions[0]!.status).toBe('closed');
+    expect(snap.positions[0]!.closeReason).toBe('trailing-stop');
   });
 });

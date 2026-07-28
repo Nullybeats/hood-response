@@ -392,6 +392,9 @@ function renderSniperPanel(d){
       '<div class="field"><label>max</label><input id="sn-max" type="number" value="'+s.maxConviction+'"></div>'+
       '<div class="field"><label>Buy amount (Ξ, min '+d.minBuyEth+')</label><input id="sn-buy" type="number" step="0.0001" value="'+s.buyEth+'"></div>'+
       '<div class="field"><label>Take profit %</label><input id="sn-tp" type="number" value="'+s.takeProfitPct+'"></div>'+
+      '<div class="field"><label>Trailing stop % (0=off)</label><input id="sn-trail" type="number" value="'+s.trailingStopPct+'"></div>'+
+      '<div class="field"><label>Buy kinds (comma)</label><input id="sn-kinds" type="text" value="'+s.kinds+'"></div>'+
+      '<div class="field"><label>Require safe (no honeypot)</label><input id="sn-safe" type="checkbox" '+(s.requireSafe?'checked':'')+'></div>'+
       '<button id="sn-save" class="snbtn" style="background:var(--panel2);color:var(--accent);margin-bottom:12px">Save</button>'+
       '<button id="sn-reset" class="snbtn" style="background:var(--panel2);color:var(--muted);margin:0 0 12px 8px">Reset</button>'+
       '<span id="sn-saved" class="mono" style="margin:0 0 16px 12px"></span>'+
@@ -407,8 +410,8 @@ function renderSniperPanel(d){
     if(r.ok){ const nd=await r.json(); renderSniperPanel(nd); updateSniperDynamic(nd); const m=$('sn-saved'); if(m) m.innerHTML='<span style="color:var(--green)">✓ '+(note||'saved')+'</span>'; }
     else { const j=await r.json().catch(()=>({})); const m=$('sn-saved'); if(m) m.innerHTML='<span style="color:var(--red)">✕ '+((j.error&&j.error.formErrors)?'invalid values':(j.error||'failed'))+'</span>'; }
   };
-  $('sn-save').onclick=()=>saveSettings({ minConviction:+$('sn-min').value, maxConviction:+$('sn-max').value, buyEth:+$('sn-buy').value, takeProfitPct:+$('sn-tp').value },'saved');
-  $('sn-reset').onclick=()=>{ if(confirm('Reset sniper settings to defaults?')) saveSettings({ minConviction:60, maxConviction:100, buyEth:0.0005, takeProfitPct:0 },'reset to defaults'); };
+  $('sn-save').onclick=()=>saveSettings({ minConviction:+$('sn-min').value, maxConviction:+$('sn-max').value, buyEth:+$('sn-buy').value, takeProfitPct:+$('sn-tp').value, trailingStopPct:+$('sn-trail').value, kinds:$('sn-kinds').value, requireSafe:$('sn-safe').checked },'saved');
+  $('sn-reset').onclick=()=>{ if(confirm('Reset sniper settings to defaults?')) saveSettings({ minConviction:60, maxConviction:100, buyEth:0.0005, takeProfitPct:0, trailingStopPct:15, kinds:'BUY,ENTRY', requireSafe:true },'reset to defaults'); };
   $('sn-toggle').onclick=async()=>{ const r=await fetch('/api/sniper/toggle',{method:'POST',headers:adminHeaders()}); const nd=await r.json(); renderSniperPanel(nd); updateSniperDynamic(nd); };
   if($('sn-connect')) $('sn-connect').onclick=async()=>{
     const key=$('sn-key').value.trim(); if(!key) return;
