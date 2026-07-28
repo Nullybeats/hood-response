@@ -35,6 +35,10 @@ function stubExecutor(
       txHash: string,
     ) => Promise<{ ethSpent: number; tokensReceived: number; blockTimestamp: number; gasEth: number }>;
     protocolFeeInfo: (token: string) => Promise<{ hook: string; feePctPerSwap: number | null }>;
+    previewRoundTrip: (
+      token: string,
+      eth: number,
+    ) => Promise<{ venue: 'v4' | 'v3'; ethIn: number; quotedTokens: number; ethBack: number; lossPct: number; poolLiquidity: number | null } | null>;
   }> = {},
 ) {
   return {
@@ -45,12 +49,22 @@ function stubExecutor(
     },
     async buy(token: string, eth: number) {
       log.push('buy:' + token + ':' + eth);
-      return { txHash: '0xbuy', tokensReceived: 1000, ethSpent: eth, gasEth: 0.00001 };
+      return { txHash: '0xbuy', tokensReceived: 1000, ethSpent: eth, gasEth: 0.00001, quotedTokens: 1000, venue: 'v4' as const };
     },
     async sell(token: string) {
       log.push('sell:' + token);
-      return { txHash: '0xsell', ethReceived: 0.002, tokensSold: 1000, gasEth: 0.00001 };
+      return { txHash: '0xsell', ethReceived: 0.002, quotedEthOut: 0.002, tokensSold: 1000, gasEth: 0.00001, venue: 'v4' as const };
     },
+    previewRoundTrip:
+      overrides.previewRoundTrip ??
+      (async (_token: string, eth: number) => ({
+        venue: 'v4' as const,
+        ethIn: eth,
+        quotedTokens: 1000,
+        ethBack: eth * 0.9, // healthy pool: 10% round-trip loss, under the 35% gate
+        lossPct: 10,
+        poolLiquidity: 1e18,
+      })),
     valueInEth: overrides.valueInEth ?? (async () => ({ tokens: 1000, ethOut: 0.001 })),
     tokenMeta: overrides.tokenMeta ?? (async () => ({ symbol: 'REAL', totalSupply: 1_000_000 })),
     readBuyTx:
@@ -112,6 +126,69 @@ describe('SniperEngine', () => {
     expect(snap.positions[0]!.status).toBe('open');
   });
 
+  it('depth gate: skips a pool whose round-trip loss exceeds the cap, captures telemetry when it buys', async () => {
+    // Thin pool: buying 0.0005Ξ round-trips to 0.00025Ξ (−50% loss) → over the 35% cap.
+    const thin: string[] = [];
+    const thinEng = new SniperEngine(
+      stubPrice({ '0xtok': 1 }),
+      stubExecutor(thin, {
+        previewRoundTrip: async (_t, eth) => ({ venue: 'v4', ethIn: eth, quotedTokens: 1000, ethBack: eth * 0.5, lossPct: 50, poolLiquidity: 1 }),
+      }),
+      stubSafety(),
+    );
+    thinEng.updateSettings({ enabled: true });
+    await thinEng.onAlert(swarm());
+    expect(thin).toHaveLength(0); // never reached executor.buy
+    const td = (await thinEng.snapshot()).decisions;
+    expect(td[0]!.reason).toContain('too thin');
+
+    // Healthy pool (default stub = 10% round-trip): buys AND records telemetry.
+    const ok: string[] = [];
+    const okEng = new SniperEngine(stubPrice({ '0xtok': 1 }), stubExecutor(ok), stubSafety());
+    okEng.updateSettings({ enabled: true });
+    await okEng.onAlert(swarm());
+    expect(ok).toEqual(['buy:0xtok:0.0005']);
+    const pos = (await okEng.snapshot()).positions[0]!;
+    expect(pos.entryRoundTripPct).toBe(10);
+    expect(pos.venue).toBe('v4');
+    expect(pos.entrySlippagePct).toBe(0); // stub: received 1000 == quoted 1000
+    expect(typeof pos.buyLatencyMs).toBe('number');
+  });
+
+  it('recent-loss cooldown: skips re-buying a token that just stopped us out at a loss', async () => {
+    const log: string[] = [];
+    const prices: Record<string, number> = { '0xtok': 1 };
+    // stub sell returns ethReceived 0.002; make the buy cost 0.005 so the close books a LOSS.
+    const eng = new SniperEngine(stubPrice(prices), stubExecutor(log), stubSafety());
+    eng.updateSettings({ enabled: true, buyEth: 0.005, lossCooldownMin: 90, trailingStopPct: 15 });
+    await eng.onAlert(swarm({ token: '0xtok' }));
+    expect(log).toContain('buy:0xtok:0.005'); // bought (0.005 in, stub sells for 0.002 → loss)
+    prices['0xtok'] = 0.5; // −50% → trips the trailing stop, books a loss
+    // @ts-expect-error exercise the private sampler
+    await eng.sample();
+    expect(log).toContain('sell:0xtok');
+    // A fresh alert for the same token is now blocked by the cooldown.
+    log.length = 0;
+    await eng.onAlert(swarm({ token: '0xtok' }));
+    expect(log).toHaveLength(0); // no re-buy
+    const d = (await eng.snapshot()).decisions;
+    expect(d[0]!.reason).toContain('loss cooldown');
+  });
+
+  it('depth gate off (maxRoundtripPct=0) buys even a thin pool', async () => {
+    const log: string[] = [];
+    const eng = new SniperEngine(
+      stubPrice({ '0xtok': 1 }),
+      stubExecutor(log, {
+        previewRoundTrip: async (_t, eth) => ({ venue: 'v4', ethIn: eth, quotedTokens: 1000, ethBack: eth * 0.4, lossPct: 60, poolLiquidity: 1 }),
+      }),
+      stubSafety(),
+    );
+    eng.updateSettings({ enabled: true, maxRoundtripPct: 0 });
+    await eng.onAlert(swarm());
+    expect(log).toEqual(['buy:0xtok:0.0005']);
+  });
+
   it('skips alerts outside the conviction band, wrong kind, or already held', async () => {
     const log: string[] = [];
     const eng = new SniperEngine(stubPrice({ '0xtok': 1, '0xb': 1 }), stubExecutor(log), stubSafety());
@@ -165,7 +242,11 @@ describe('SniperEngine', () => {
     const snap = await eng.snapshot();
     expect(snap.positions[0]!.status).toBe('closed');
     expect(snap.positions[0]!.closeReason).toBe('take-profit');
-    expect(snap.pnl.realizedPnlEth).toBeCloseTo(0.0005, 6); // entry 0.0005 Ξ → 2x = +0.0005
+    // Realized PnL now books the ACTUAL ETH received on the sell (stub: 0.002) minus
+    // the 0.0005 Ξ spent = +0.0015 — the real fill, not a price-ratio estimate.
+    expect(snap.pnl.realizedPnlEth).toBeCloseTo(0.0015, 6);
+    expect(snap.positions[0]!.exitValueEth).toBe(0.002);
+    expect(snap.positions[0]!.exitSlippagePct).toBe(0); // stub: received == quoted
   });
 
   it('imports a wallet holding with the real symbol, MC, and a market-priced ETH value', async () => {

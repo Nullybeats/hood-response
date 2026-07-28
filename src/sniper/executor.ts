@@ -110,12 +110,33 @@ export interface BuyResult {
   ethSpent: number;
   /** Real network fee paid for this tx (gasUsed × effective gas price), ETH. */
   gasEth: number;
+  /** Tokens the pre-trade quote promised — realized vs this = entry slippage. */
+  quotedTokens: number;
+  /** Which venue actually executed the fill. */
+  venue: 'v4' | 'v3';
 }
 export interface SellResult {
   txHash: string;
+  /** ACTUAL ETH the wallet received (native balance delta + gas), not the quote. */
   ethReceived: number;
+  /** ETH the pre-trade quote promised — actual vs this = exit slippage. */
+  quotedEthOut: number;
   tokensSold: number;
   gasEth: number;
+  venue: 'v4' | 'v3';
+}
+
+/** Round-trip preview: buy `ethIn`, immediately sell the tokens back. `lossPct`
+ *  is the true floor cost of a trade at this size — price impact both ways + LP
+ *  fees + any hook/protocol tax — the single number the entry gate keys on. */
+export interface RoundTrip {
+  venue: 'v4' | 'v3';
+  ethIn: number;
+  quotedTokens: number;
+  ethBack: number;
+  lossPct: number;
+  /** Raw on-chain pool liquidity (uint128 L) at preview time, as a relative depth proxy. */
+  poolLiquidity: number | null;
 }
 
 /** gasUsed × effective gas price, in ETH — the real network fee for a tx. */
@@ -330,6 +351,74 @@ export class SwapExecutor {
     const c0 = eth.toLowerCase() < t.toLowerCase() ? eth : t;
     const c1 = c0 === t ? eth : t;
     return { currency0: c0, currency1: c1, fee, tickSpacing, hooks, ethCurrency: eth, tokenIs0: c0 === t };
+  }
+
+  /** Raw on-chain liquidity (uint128 L) for a resolved v4 pool; 0n on failure. */
+  private async readLiquidity(p: ResolvedPool): Promise<bigint> {
+    try {
+      const sv = new Contract(STATE_VIEW, STATE_VIEW_ABI, this.provider!);
+      return (await sv.getFunction('getLiquidity')(poolIdOf(p))) as bigint;
+    } catch {
+      return 0n;
+    }
+  }
+
+  /**
+   * Round-trip preview: quote buying `ethAmount` of `token`, then quote selling
+   * those exact tokens straight back. The gap is the true floor cost of a trade
+   * at THIS size — price impact both directions + LP fees + hook/protocol tax —
+   * captured before a single wei is spent. This is the entry gate's key signal
+   * and also the entry-slippage baseline recorded in the trade journal. Returns
+   * null only when neither venue can quote (caller decides how to treat that).
+   */
+  async previewRoundTrip(
+    token: string,
+    ethAmount: number,
+    poolIdHint?: string | null,
+  ): Promise<RoundTrip | null> {
+    this.init();
+    if (!this.wallet) return null;
+    const amountIn = parseEther(ethAmount.toString());
+    // v4 first (the venue we'll almost always trade), then v3 fallback.
+    try {
+      const pool = await this.resolvePool(token, poolIdHint);
+      const tokensOut = await this.quoteOut(pool, amountIn, true);
+      if (tokensOut <= 0n) throw new Error('zero buy quote');
+      const ethBackWei = await this.quoteOut(pool, tokensOut, false);
+      const liq = await this.readLiquidity(pool);
+      const ethIn = Number(formatEther(amountIn));
+      const ethBack = Number(formatEther(ethBackWei));
+      return {
+        venue: 'v4',
+        ethIn,
+        quotedTokens: Number(tokensOut),
+        ethBack,
+        lossPct: ethIn > 0 ? (1 - ethBack / ethIn) * 100 : 100,
+        poolLiquidity: liq > 0n ? Number(liq) : null,
+      };
+    } catch {
+      const v3 = await this.resolveV3Pool(token).catch(() => null);
+      if (!v3) return null;
+      try {
+        const weth = getAddress(config.SNIPER_WETH);
+        const t = getAddress(token);
+        const tokensOut = await this.quoteV3(weth, t, v3.fee, amountIn);
+        if (tokensOut <= 0n) return null;
+        const ethBackWei = await this.quoteV3(t, weth, v3.fee, tokensOut);
+        const ethIn = Number(formatEther(amountIn));
+        const ethBack = Number(formatEther(ethBackWei));
+        return {
+          venue: 'v3',
+          ethIn,
+          quotedTokens: Number(tokensOut),
+          ethBack,
+          lossPct: ethIn > 0 ? (1 - ethBack / ethIn) * 100 : 100,
+          poolLiquidity: null,
+        };
+      } catch {
+        return null;
+      }
+    }
   }
 
   /** True when this pool id is initialized on the PoolManager. */
@@ -596,7 +685,14 @@ export class SwapExecutor {
       /* balance read failed — tx still landed */
     }
     const gasEth = receipt ? gasCostEth(receipt) : 0;
-    return { txHash: tx.hash, tokensReceived, ethSpent: ethAmount, gasEth };
+    return {
+      txHash: tx.hash,
+      tokensReceived,
+      ethSpent: ethAmount,
+      gasEth,
+      quotedTokens: Number(formatUnits(quoted, decimals)),
+      venue: 'v4',
+    };
   }
 
   private async buyV3(
@@ -647,7 +743,14 @@ export class SwapExecutor {
       /* balance read failed — tx still landed */
     }
     const gasEth = receipt ? gasCostEth(receipt) : 0;
-    return { txHash: tx.hash, tokensReceived, ethSpent: ethAmount, gasEth };
+    return {
+      txHash: tx.hash,
+      tokensReceived,
+      ethSpent: ethAmount,
+      gasEth,
+      quotedTokens: Number(formatUnits(quoted, decimals)),
+      venue: 'v3',
+    };
   }
 
   /** Read the token's real symbol + total supply straight from the contract —
@@ -871,6 +974,10 @@ export class SwapExecutor {
 
     const router = new Contract(config.SNIPER_ROUTER, ROUTER_ABI, this.wallet!);
     const deadline = Math.floor(Date.now() / 1000) + 120;
+    // Native balance before the sell — the sell sends no value, so the only ETH
+    // movement is (received − gas); actual received = Δbalance + gas. This is the
+    // REAL fill, vs quotedOut which is only what the pre-trade quote promised.
+    const balBefore = await this.provider!.getBalance(this.wallet!.address).catch(() => null);
     let tx;
     try {
       tx = await router.getFunction('execute')(commands, inputs, deadline);
@@ -879,12 +986,33 @@ export class SwapExecutor {
     }
     logger.info({ token, tx: tx.hash, venue: 'v4', slippagePct }, 'sniper: sell sent');
     const receipt = await tx.wait(1);
+    const gasEth = receipt ? gasCostEth(receipt) : 0;
     return {
       txHash: tx.hash,
-      ethReceived: Number(formatEther(quotedOut)),
+      ethReceived: await this.actualEthReceived(balBefore, gasEth, quotedOut),
+      quotedEthOut: Number(formatEther(quotedOut)),
       tokensSold: Number(formatUnits(bal, decimals)),
-      gasEth: receipt ? gasCostEth(receipt) : 0,
+      gasEth,
+      venue: 'v4',
     };
+  }
+
+  /** Actual ETH the wallet netted from a sell: Δ(native balance) + gas paid.
+   *  Falls back to the quote if the post-trade balance read fails. */
+  private async actualEthReceived(
+    balBefore: bigint | null,
+    gasEth: number,
+    quotedOut: bigint,
+  ): Promise<number> {
+    if (balBefore == null) return Number(formatEther(quotedOut));
+    try {
+      const balAfter = await this.provider!.getBalance(this.wallet!.address);
+      const delta = Number(formatEther(balAfter - balBefore));
+      const received = delta + gasEth; // add gas back — it left the same balance
+      return received > 0 ? received : Number(formatEther(quotedOut));
+    } catch {
+      return Number(formatEther(quotedOut));
+    }
   }
 
   private async sellV3(
@@ -949,6 +1077,7 @@ export class SwapExecutor {
       amountOutMin,
       this.wallet!.address,
     ]);
+    const balBefore = await this.provider!.getBalance(this.wallet!.address).catch(() => null);
     let tx;
     try {
       tx = await router.getFunction('multicall')([swapCalldata, unwrapCalldata]);
@@ -957,11 +1086,14 @@ export class SwapExecutor {
     }
     logger.info({ token, tx: tx.hash, venue: 'v3', fee, slippagePct }, 'sniper: sell sent');
     const receipt = await tx.wait(1);
+    const gasEth = receipt ? gasCostEth(receipt) : 0;
     return {
       txHash: tx.hash,
-      ethReceived: Number(formatEther(quoted)),
+      ethReceived: await this.actualEthReceived(balBefore, gasEth, quoted),
+      quotedEthOut: Number(formatEther(quoted)),
       tokensSold: Number(formatUnits(bal, decimals)),
-      gasEth: receipt ? gasCostEth(receipt) : 0,
+      gasEth,
+      venue: 'v3',
     };
   }
 }

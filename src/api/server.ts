@@ -73,6 +73,8 @@ const sniperSettingsBody = z.object({
   buyEth: z.number().positive().optional(),
   takeProfitPct: z.number().min(0).optional(),
   trailingStopPct: z.number().min(0).max(100).optional(),
+  maxRoundtripPct: z.number().min(0).max(100).optional(),
+  lossCooldownMin: z.number().min(0).max(10_080).optional(),
   requireSafe: z.boolean().optional(),
   kinds: z.string().optional(),
 });

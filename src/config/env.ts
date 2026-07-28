@@ -208,6 +208,13 @@ const schema = z.object({
   SNIPER_TRAILING_STOP_PCT: num(15), // trailing stop % off the high-water mark; doubles as the stop-loss
   // (peak starts at entry). The validated edge: tight ~15% on non-SOLO swarms. 0 = off.
   SNIPER_KINDS: z.string().default('BUY,ENTRY'), // alert kinds to snipe — non-SOLO by default (SOLO was −EV in backtest)
+  // Depth gate: refuse a buy when a round-trip (buy then immediately sell the tokens
+  // back) would lose more than this % at our size — price impact both ways + LP fees +
+  // hook tax. The direct measure of "can we even exit this pool cleanly." 0 = off.
+  SNIPER_MAX_ROUNDTRIP_PCT: num(35),
+  // After a token stops us out at a loss, don't re-buy it for this many minutes (0 = off).
+  SNIPER_LOSS_COOLDOWN_MIN: num(90),
+  SNIPER_JOURNAL_PATH: z.string().default(''), // append-only JSONL trade journal for offline analysis
   SNIPER_STORE_PATH: z.string().default(''), // persist positions across redeploys
 
   DISCORD_WEBHOOK_URL: z.string().default(''),

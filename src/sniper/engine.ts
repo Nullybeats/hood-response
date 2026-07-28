@@ -47,6 +47,23 @@ export interface Position {
   /** Documented DEX-hook protocol fee taken per swap (e.g. Bags' 2%), separate
    *  from gas and from any ERC-20 tax GoPlus can see. null = no known hook fee. */
   protocolFeePctPerSwap?: number | null;
+
+  // ── Execution telemetry (Track 1) — the microstructure that tells a bad signal
+  //    from a bad fill. All best-effort; undefined on imported/legacy positions. ──
+  /** Round-trip loss % estimated at entry (buy→instant-sell): the pool's floor cost at our size. */
+  entryRoundTripPct?: number;
+  /** Buy fill vs the pre-trade quote: (1 − tokensReceived/quotedTokens)·100. */
+  entrySlippagePct?: number;
+  /** Sell fill vs the pre-trade quote: (1 − actualEthOut/quotedEthOut)·100 — the gap BURN hid. */
+  exitSlippagePct?: number;
+  /** ACTUAL ETH received on the sell (native Δ + gas), not the quote. */
+  exitValueEth?: number;
+  /** Which venue executed (v4 / v3). */
+  venue?: 'v4' | 'v3';
+  /** Raw on-chain pool liquidity (uint128 L) at entry — relative depth proxy. */
+  poolLiquidityEntry?: number | null;
+  /** Alert-timestamp → buy-confirmed latency, ms (how late we entered the swarm). */
+  buyLatencyMs?: number;
 }
 
 /** Runtime-adjustable knobs (seeded from env, editable via the API). */
@@ -64,6 +81,11 @@ export interface SniperSettings {
   requireSafe: boolean;
   /** Comma-separated alert kinds to snipe, e.g. "BUY,ENTRY" (non-SOLO). Case-insensitive. */
   kinds: string;
+  /** Depth gate: skip a buy when the round-trip loss at our size exceeds this %. 0 = off. */
+  maxRoundtripPct: number;
+  /** After a token stops us out at a loss, don't re-buy it for this many minutes — stops the
+   *  re-buy-the-whipsaw money pump (a token that just trailing-stopped us keeps re-signalling). 0 = off. */
+  lossCooldownMin: number;
 }
 
 const priceRatio = (p: Position, price: number): number =>
@@ -73,14 +95,18 @@ const priceRatio = (p: Position, price: number): number =>
 function view(p: Position) {
   const ref = p.status === 'closed' ? (p.exitPriceUsd ?? p.lastPriceUsd) : p.lastPriceUsd;
   const ratio = priceRatio(p, ref);
-  const valueEth = p.ethIn * ratio;
+  // Closed positions value at the ACTUAL ETH received when we have it (the real
+  // fill, slippage and all) — not the price-ratio estimate. Open positions still
+  // mark-to-market off the live price.
+  const valueEth =
+    p.status === 'closed' && p.exitValueEth != null ? p.exitValueEth : p.ethIn * ratio;
   const pnlEth = valueEth - p.ethIn;
   const gasEth = (p.buyGasEth ?? 0) + (p.sellGasEth ?? 0);
   return {
     ...p,
     valueEth: Math.round(valueEth * 1e6) / 1e6,
     pnlEth: Math.round(pnlEth * 1e6) / 1e6,
-    pnlPct: Math.round((ratio - 1) * 1000) / 10,
+    pnlPct: p.ethIn > 0 ? Math.round((pnlEth / p.ethIn) * 1000) / 10 : 0,
     gasEth: Math.round(gasEth * 1e6) / 1e6,
     /** PnL after subtracting real network fees paid so far (buy gas always,
      *  sell gas once closed) — the honest "what did I actually net" number. */
@@ -124,7 +150,13 @@ export class SniperEngine {
     trailingStopPct: config.SNIPER_TRAILING_STOP_PCT,
     requireSafe: config.SNIPER_REQUIRE_SAFE,
     kinds: [...config.sniperKinds].join(','),
+    maxRoundtripPct: config.SNIPER_MAX_ROUNDTRIP_PCT,
+    lossCooldownMin: config.SNIPER_LOSS_COOLDOWN_MIN,
   };
+
+  /** token → timestamp we last stopped out at a loss. Drives the re-buy cooldown. In-memory
+   *  (resets on restart, which is fine — a fresh process starts with a clean slate). */
+  private readonly recentLosses = new Map<string, number>();
 
   constructor(
     private readonly price: PriceOracle,
@@ -204,6 +236,17 @@ export class SniperEngine {
       return this.decide(swarm, 'skipped', `conviction ${swarm.conviction} outside ${this.settings.minConviction}-${this.settings.maxConviction}`);
     if (this.holdsOpen(swarm.token)) return this.decide(swarm, 'skipped', 'already holding this token');
 
+    // Recent-loss cooldown: a token that just stopped us out keeps re-signalling; re-buying it
+    // into the same whipsaw is a money pump (see BURN: repeated −22%/−27% trailing-stop losses).
+    const cool = this.settings.lossCooldownMin;
+    if (cool > 0) {
+      const lostAt = this.recentLosses.get(swarm.token);
+      if (lostAt && Date.now() - lostAt < cool * 60_000) {
+        const mins = Math.ceil((cool * 60_000 - (Date.now() - lostAt)) / 60_000);
+        return this.decide(swarm, 'skipped', `loss cooldown: stopped out recently, ${mins}m left`);
+      }
+    }
+
     const entryPrice = swarm.priceUsd ?? 0;
     if (!swarm.priceLive || !(entryPrice > 0)) return this.decide(swarm, 'skipped', 'no live price');
 
@@ -227,15 +270,27 @@ export class SniperEngine {
       if (safe && safe.ok === false) return this.decide(swarm, 'skipped', `unsafe: ${(safe.hardFails ?? []).join(', ')}`);
     }
 
+    // Depth gate (Track 1): a round-trip preview measures the true floor cost of a
+    // trade at our size — price impact both ways + LP fees + hook tax — BEFORE any
+    // ETH moves. Refuse pools we couldn't exit cleanly (the BURN −22.8% failure mode).
+    const roundTrip = await this.executor.previewRoundTrip(swarm.token, size, this.price.pairIdOf(swarm.token)).catch(() => null);
+    if (this.settings.maxRoundtripPct > 0 && roundTrip && roundTrip.lossPct > this.settings.maxRoundtripPct) {
+      return this.decide(swarm, 'skipped', `too thin: round-trip −${roundTrip.lossPct.toFixed(0)}% > ${this.settings.maxRoundtripPct}% cap`);
+    }
+
     try {
       const ethUsd = this.price.ethUsdPrice();
       const expectedPriceEth = ethUsd && ethUsd > 0 ? entryPrice / ethUsd : null;
       const res = await this.executor.buy(swarm.token, size, this.price.pairIdOf(swarm.token), expectedPriceEth);
+      const filledAt = Date.now();
       this.buys.push({ at: now, eth: res.ethSpent });
       const [tax, protocolFeePctPerSwap] = await Promise.all([
         this.lookupTax(swarm.token),
         this.lookupProtocolFee(swarm.token),
       ]);
+      const entrySlippagePct =
+        res.quotedTokens > 0 ? (1 - res.tokensReceived / res.quotedTokens) * 100 : undefined;
+      const alertTs = swarm.firstSeen || now;
       const pos: Position = {
         id: randomUUID(),
         token: swarm.token,
@@ -255,6 +310,11 @@ export class SniperEngine {
         buyTaxPct: tax.buyTaxPct,
         sellTaxPct: tax.sellTaxPct,
         protocolFeePctPerSwap,
+        venue: res.venue,
+        entrySlippagePct,
+        entryRoundTripPct: roundTrip?.lossPct,
+        poolLiquidityEntry: roundTrip?.poolLiquidity ?? null,
+        buyLatencyMs: filledAt - alertTs,
       };
       this.positions.set(pos.id, pos);
       this.decide(swarm, 'bought', `bought ${size} Ξ · tx ${res.txHash.slice(0, 10)}`);
@@ -310,11 +370,72 @@ export class SniperEngine {
     p.status = 'closed';
     p.closedAt = Date.now();
     p.sellTx = res.txHash;
-    p.exitPriceUsd = p.lastPriceUsd;
+    // Exit price from the ACTUAL eth received (not the quote): the realized fill.
+    if (p.tokensReceived > 0 && ethUsd && ethUsd > 0) {
+      p.exitPriceUsd = (res.ethReceived * ethUsd) / p.tokensReceived;
+    } else {
+      p.exitPriceUsd = p.lastPriceUsd;
+    }
     p.closeReason = reason;
     p.sellGasEth = res.gasEth;
-    logger.info({ token: p.tokenSymbol, tx: res.txHash, ethOut: res.ethReceived, reason }, 'sniper: position sold');
+    p.exitValueEth = res.ethReceived;
+    p.exitSlippagePct =
+      res.quotedEthOut > 0 ? (1 - res.ethReceived / res.quotedEthOut) * 100 : undefined;
+    if (res.venue) p.venue = res.venue;
+    // Record a loss for the re-buy cooldown: real ETH out < ETH in (net of nothing — the raw fill).
+    if (p.exitValueEth != null && p.exitValueEth < p.ethIn) {
+      this.recentLosses.set(p.token, Date.now());
+    }
+    logger.info(
+      { token: p.tokenSymbol, tx: res.txHash, ethOut: res.ethReceived, quoted: res.quotedEthOut, exitSlipPct: p.exitSlippagePct, reason },
+      'sniper: position sold',
+    );
+    void this.journal(p);
     void this.persist();
+  }
+
+  /** Append a closed trade's full telemetry to the JSONL journal for offline
+   *  analysis (slippage in/out, gas, venue, latency, round-trip). Best-effort:
+   *  a journal write must never affect the trade or throw into the sell path. */
+  private async journal(p: Position): Promise<void> {
+    if (!config.SNIPER_JOURNAL_PATH) return;
+    try {
+      const grossPnlEth = (p.exitValueEth ?? 0) - p.ethIn;
+      const netPnlEth = grossPnlEth - (p.buyGasEth ?? 0) - (p.sellGasEth ?? 0);
+      const row = {
+        at: p.closedAt ?? Date.now(),
+        token: p.token,
+        symbol: p.tokenSymbol,
+        kind: p.kind,
+        conviction: p.conviction,
+        venue: p.venue ?? null,
+        ethIn: p.ethIn,
+        exitValueEth: p.exitValueEth ?? null,
+        entryPriceUsd: p.entryPriceUsd,
+        exitPriceUsd: p.exitPriceUsd ?? null,
+        peakPriceUsd: p.peakPriceUsd ?? null,
+        peakPct: p.peakPriceUsd && p.entryPriceUsd > 0 ? (p.peakPriceUsd / p.entryPriceUsd - 1) * 100 : null,
+        closeReason: p.closeReason ?? null,
+        entryRoundTripPct: p.entryRoundTripPct ?? null,
+        entrySlippagePct: p.entrySlippagePct ?? null,
+        exitSlippagePct: p.exitSlippagePct ?? null,
+        buyGasEth: p.buyGasEth ?? null,
+        sellGasEth: p.sellGasEth ?? null,
+        buyTaxPct: p.buyTaxPct ?? null,
+        sellTaxPct: p.sellTaxPct ?? null,
+        protocolFeePctPerSwap: p.protocolFeePctPerSwap ?? null,
+        poolLiquidityEntry: p.poolLiquidityEntry ?? null,
+        buyLatencyMs: p.buyLatencyMs ?? null,
+        holdMs: p.closedAt && p.openedAt ? p.closedAt - p.openedAt : null,
+        grossPnlEth,
+        netPnlEth,
+        netPnlPct: p.ethIn > 0 ? (netPnlEth / p.ethIn) * 100 : null,
+      };
+      await mkdir(dirname(config.SNIPER_JOURNAL_PATH), { recursive: true }).catch(() => undefined);
+      await writeFile(config.SNIPER_JOURNAL_PATH, JSON.stringify(row) + '\n', { flag: 'a' });
+    } catch (err) {
+      logger.warn({ err: String(err) }, 'sniper: journal append failed');
+    }
   }
 
   private async takeProfit(p: Position): Promise<void> {
@@ -548,6 +669,8 @@ export class SniperEngine {
     if (typeof patch.buyEth === 'number') this.settings.buyEth = Math.max(MIN_BUY_ETH, patch.buyEth);
     if (typeof patch.takeProfitPct === 'number') this.settings.takeProfitPct = Math.max(0, patch.takeProfitPct);
     if (typeof patch.trailingStopPct === 'number') this.settings.trailingStopPct = Math.max(0, patch.trailingStopPct);
+    if (typeof patch.maxRoundtripPct === 'number') this.settings.maxRoundtripPct = Math.max(0, patch.maxRoundtripPct);
+    if (typeof patch.lossCooldownMin === 'number') this.settings.lossCooldownMin = Math.max(0, patch.lossCooldownMin);
     if (typeof patch.requireSafe === 'boolean') this.settings.requireSafe = patch.requireSafe;
     if (typeof patch.kinds === 'string') {
       // normalise to upper, comma-joined; ignore empty so the buy list can't be wiped by accident
