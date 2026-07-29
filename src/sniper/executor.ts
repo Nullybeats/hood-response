@@ -236,7 +236,9 @@ export class SwapExecutor {
 
   private init(): void {
     if (this.wallet || !this.ready) return;
-    const rpc = config.CHAIN_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com';
+    // Executor uses its own RPC when set (a reliable metered node for tx sends) so the continuous
+    // chain listener can stay on the free public node. Falls back to CHAIN_HTTP_URL for back-compat.
+    const rpc = config.SNIPER_EXECUTOR_RPC || config.CHAIN_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com';
     this.provider = new JsonRpcProvider(rpc);
     this.wallet = new Wallet(this.key(), this.provider);
   }

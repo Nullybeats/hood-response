@@ -188,6 +188,10 @@ const schema = z.object({
   // are set. Per-trade + daily caps and the off switch are the safety rails.
   SNIPER_ENABLED: bool(false), // master on/off — ON = real buys
   SNIPER_PRIVATE_KEY: z.string().default(''), // burner hot-wallet key (env OR entered in-app)
+  // Dedicated RPC for the EXECUTOR only (tx sends + its reads). Lets the continuous chain LISTENER
+  // stay on the free/unmetered public node (CHAIN_HTTP_URL) while sends use a reliable metered node —
+  // the public RPC 429s on execution but is fine for polling. Empty = fall back to CHAIN_HTTP_URL.
+  SNIPER_EXECUTOR_RPC: z.string().default(''),
   // Robinhood Chain Uniswap-v4 addresses (verified from official docs). The
   // UniversalRouter is Robinhood's MODIFIED fork — only this address works.
   SNIPER_ROUTER: z.string().default('0x8876789976deCbfCbBbe364623c63652db8C0904'),
@@ -205,6 +209,10 @@ const schema = z.object({
   SNIPER_MAX_SELL_SLIPPAGE_PCT: num(50),
   SNIPER_TAKE_PROFIT_PCT: num(0), // auto-sell a position at +this% (0 = off)
   SNIPER_REQUIRE_SAFE: bool(true), // never buy a token that fails the honeypot/sellability check (−100% trap)
+  // PRIME-only: buy ONLY alerts flagged prime (PRIME_KINDS × conviction ≥ PRIME_MIN_CONVICTION —
+  // the ENTRY@80+ combo that backtested well). ON collapses the buy set to just those, ignoring the
+  // broader kinds/conviction gates. This is the intended default — the wide filter over-buys.
+  SNIPER_PRIME_ONLY: bool(true),
   SNIPER_TRAILING_STOP_PCT: num(15), // trailing stop % off the high-water mark; doubles as the stop-loss
   // (peak starts at entry). The validated edge: tight ~15% on non-SOLO swarms. 0 = off.
   SNIPER_KINDS: z.string().default('BUY,ENTRY'), // alert kinds to snipe — non-SOLO by default (SOLO was −EV in backtest)

@@ -79,6 +79,9 @@ export interface SniperSettings {
   trailingStopPct: number;
   /** Require the honeypot/sellability check to pass before buying (never buy what we can't sell). */
   requireSafe: boolean;
+  /** PRIME-only: buy ONLY prime-flagged alerts (the backtested ENTRY@80+ tier). When on, the broad
+   *  kinds/conviction gates are bypassed — a non-prime alert is skipped regardless of them. */
+  primeOnly: boolean;
   /** Comma-separated alert kinds to snipe, e.g. "BUY,ENTRY" (non-SOLO). Case-insensitive. */
   kinds: string;
   /** Depth gate: skip a buy when the round-trip loss at our size exceeds this %. 0 = off. */
@@ -149,6 +152,7 @@ export class SniperEngine {
     takeProfitPct: config.SNIPER_TAKE_PROFIT_PCT,
     trailingStopPct: config.SNIPER_TRAILING_STOP_PCT,
     requireSafe: config.SNIPER_REQUIRE_SAFE,
+    primeOnly: config.SNIPER_PRIME_ONLY,
     kinds: [...config.sniperKinds].join(','),
     maxRoundtripPct: config.SNIPER_MAX_ROUNDTRIP_PCT,
     lossCooldownMin: config.SNIPER_LOSS_COOLDOWN_MIN,
@@ -157,6 +161,10 @@ export class SniperEngine {
   /** token → timestamp we last stopped out at a loss. Drives the re-buy cooldown. In-memory
    *  (resets on restart, which is fine — a fresh process starts with a clean slate). */
   private readonly recentLosses = new Map<string, number>();
+
+  /** Tokens with a buy currently being evaluated/executed — a per-token lock that stops two
+   *  simultaneous alerts for the same token from both passing holdsOpen and double-buying. */
+  private readonly buying = new Set<string>();
 
   /** Owner of this engine (a cipherfi admin email, or 'default'). Purely for
    *  logging/telemetry — the engine itself is otherwise identity-agnostic. */
@@ -243,11 +251,22 @@ export class SniperEngine {
   /** Alert hook: decide whether to snipe, and buy if so. */
   async onAlert(swarm: Swarm): Promise<void> {
     if (!this.settings.enabled) return this.decide(swarm, 'skipped', 'sniper is OFF');
-    const allowedKinds = new Set(this.settings.kinds.split(',').map((k) => k.trim().toUpperCase()).filter(Boolean));
-    if (!allowedKinds.has(swarm.kind)) return this.decide(swarm, 'skipped', `kind ${swarm.kind} not in buy list`);
-    if (swarm.conviction < this.settings.minConviction || swarm.conviction > this.settings.maxConviction)
-      return this.decide(swarm, 'skipped', `conviction ${swarm.conviction} outside ${this.settings.minConviction}-${this.settings.maxConviction}`);
+    if (this.settings.primeOnly) {
+      // PRIME-only: the single backtested-good tier (PRIME_KINDS × conviction ≥ PRIME_MIN_CONVICTION).
+      // Collapses the buy set to just those — the broad kinds/conviction gates are intentionally bypassed.
+      if (!swarm.prime) return this.decide(swarm, 'skipped', 'not a PRIME alert');
+    } else {
+      const allowedKinds = new Set(this.settings.kinds.split(',').map((k) => k.trim().toUpperCase()).filter(Boolean));
+      if (!allowedKinds.has(swarm.kind)) return this.decide(swarm, 'skipped', `kind ${swarm.kind} not in buy list`);
+      if (swarm.conviction < this.settings.minConviction || swarm.conviction > this.settings.maxConviction)
+        return this.decide(swarm, 'skipped', `conviction ${swarm.conviction} outside ${this.settings.minConviction}-${this.settings.maxConviction}`);
+    }
     if (this.holdsOpen(swarm.token)) return this.decide(swarm, 'skipped', 'already holding this token');
+    // Per-token in-flight lock: two alerts for the same token can both clear holdsOpen before either
+    // records a position (the duplicate-WOOD race). Claim it for this evaluation; released in finally.
+    if (this.buying.has(swarm.token)) return this.decide(swarm, 'skipped', 'buy already in flight');
+    this.buying.add(swarm.token);
+    try {
 
     // Recent-loss cooldown: a token that just stopped us out keeps re-signalling; re-buying it
     // into the same whipsaw is a money pump (see BURN: repeated −22%/−27% trailing-stop losses).
@@ -340,6 +359,9 @@ export class SniperEngine {
       const msg = err instanceof Error ? err.message : String(err);
       this.decide(swarm, 'skipped', `buy failed: ${msg.slice(0, 80)}`);
       logger.error({ token: swarm.tokenSymbol, err: String(err) }, 'sniper: buy failed');
+    }
+    } finally {
+      this.buying.delete(swarm.token); // release the per-token lock (runs on every early return too)
     }
   }
 
@@ -685,6 +707,7 @@ export class SniperEngine {
     if (typeof patch.maxRoundtripPct === 'number') this.settings.maxRoundtripPct = Math.max(0, patch.maxRoundtripPct);
     if (typeof patch.lossCooldownMin === 'number') this.settings.lossCooldownMin = Math.max(0, patch.lossCooldownMin);
     if (typeof patch.requireSafe === 'boolean') this.settings.requireSafe = patch.requireSafe;
+    if (typeof patch.primeOnly === 'boolean') this.settings.primeOnly = patch.primeOnly;
     if (typeof patch.kinds === 'string') {
       // normalise to upper, comma-joined; ignore empty so the buy list can't be wiped by accident
       const norm = patch.kinds.split(',').map((k) => k.trim().toUpperCase()).filter(Boolean).join(',');
