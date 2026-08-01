@@ -186,6 +186,14 @@ export class FeedSubscriber {
       /* leave feed price as-is — the sniper fails closed on a missing live price */
     }
     swarm.enrichMs = Date.now() - receivedAt; // measured: is the blocking Dexscreener enrich the bottleneck?
+    // Entry-latency diagnostic (every alert, not just buys): ageMs = how old the alert already is when
+    // the box receives it = Railway detection→emit + SSE hop. If this dominates, the entry latency is
+    // upstream (feed-side), not box-side, and the box can only gate staleness — not speed entries up.
+    const ageMs = swarm.firstSeen ? receivedAt - swarm.firstSeen : null;
+    logger.info(
+      { token: swarm.tokenSymbol, kind: swarm.kind, ageMs, enrichMs: swarm.enrichMs, conviction: swarm.conviction },
+      'sniper feed: alert received (entry-latency diag)',
+    );
     this.registry.onAlert(swarm);
   }
 }
