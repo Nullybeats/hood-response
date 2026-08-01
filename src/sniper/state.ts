@@ -12,6 +12,9 @@ export interface StoredSniperState {
   /** Execution mode is durable per owner: once an operator turns their sniper on it stays on
    *  across restarts (the wallet still starts locked, so no trade runs until they unlock). */
   mode?: SniperMode;
+  /** Durable settings-schema version — drives one-time forced-default migrations
+   *  in the engine (absent/undefined ⇒ treated as v1, pre-migration). */
+  settingsSchemaVersion?: number;
   positions: unknown[];
   settings: unknown;
   buys: { at: number; eth: number }[];

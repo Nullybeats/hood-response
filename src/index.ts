@@ -48,6 +48,10 @@ async function main(): Promise<void> {
   // survive redeploys and stay viewable; the live alert stream fans out to all.
   const sniper = new SniperRegistry(price);
   await sniper.loadAll();
+  // Resume trading immediately after a restart/deploy: auto-unlock the primary
+  // operator's wallet (SNIPER_AUTO_UNLOCK_OWNERS) so an ON sniper isn't left dark
+  // waiting for a manual unlock, and fire a health alert either way.
+  sniper.resumeAll();
   sniper.start();
   // The sniper buys ONLY from the canonical swarm feed (the source of truth the
   // operator watches), never from this box engine's own local alerts. This

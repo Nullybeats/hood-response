@@ -1,5 +1,6 @@
 import { logger } from '../logger.js';
 import { config } from '../config/env.js';
+import { notifyBotState } from '../notify/state.js';
 import type { PriceOracle } from '../chain/price.js';
 import type { SniperRegistry } from './registry.js';
 import type { Alert, Swarm } from '../types.js';
@@ -28,6 +29,14 @@ export class FeedSubscriber {
   private abort: AbortController | null = null;
   private stopped = false;
   private reconnectMs = 1000;
+  /** Last time ANY bytes arrived on the stream (not just alerts) — drives the
+   *  staleness watchdog. Most SSE servers heartbeat, so a long silence means a
+   *  half-open/dead connection even though no error fired. */
+  private lastDataAt = 0;
+  private watchdog: NodeJS.Timeout | null = null;
+  private connected = false;
+  /** Whether we're currently in a reported-dead state, so recovery fires once. */
+  private feedDead = false;
 
   constructor(
     private readonly registry: SniperRegistry,
@@ -43,11 +52,28 @@ export class FeedSubscriber {
     this.stopped = false;
     void this.seedLedger();
     void this.loop();
+    // Watchdog: a silently-dead feed (no bytes past the stale threshold while we
+    // believe we're connected) = a dark sniper. Force a reconnect + health alert.
+    const staleMs = Math.max(30, config.SNIPER_FEED_STALE_SEC) * 1000;
+    this.watchdog = setInterval(() => {
+      if (!this.connected || this.lastDataAt === 0) return;
+      if (Date.now() - this.lastDataAt > staleMs) {
+        logger.warn({ staleSec: config.SNIPER_FEED_STALE_SEC }, 'sniper feed: stale — forcing reconnect');
+        if (!this.feedDead) {
+          this.feedDead = true;
+          notifyBotState('feed-dead', `no feed data for ${config.SNIPER_FEED_STALE_SEC}s — reconnecting (sniper is blind until it recovers)`);
+        }
+        this.connected = false;
+        this.abort?.abort(); // breaks consume(), loop() reconnects with backoff
+      }
+    }, 60_000);
     logger.info({ url: this.baseUrl }, 'sniper feed: subscribing to swarm feed');
   }
 
   stop(): void {
     this.stopped = true;
+    if (this.watchdog) clearInterval(this.watchdog);
+    this.watchdog = null;
     this.abort?.abort();
   }
 
@@ -84,8 +110,15 @@ export class FeedSubscriber {
         if (!res.ok || !res.body) throw new Error(`feed /events HTTP ${res.status}`);
         logger.info({ url: this.baseUrl }, 'sniper feed: connected');
         this.reconnectMs = 1000;
+        this.connected = true;
+        this.lastDataAt = Date.now();
+        if (this.feedDead) {
+          this.feedDead = false;
+          notifyBotState('feed-recovered', 'feed reconnected — sniper is live again');
+        }
         await this.consume(res.body);
       } catch (err) {
+        this.connected = false;
         if (this.stopped) return;
         logger.warn(
           { err: String(err instanceof Error ? err.message : err), retryMs: this.reconnectMs },
@@ -106,6 +139,7 @@ export class FeedSubscriber {
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
+      this.lastDataAt = Date.now(); // any byte (incl. SSE heartbeat/comment) = alive
       buf += decoder.decode(value, { stream: true });
       let idx: number;
       while ((idx = buf.search(/\r?\n\r?\n/)) !== -1) {

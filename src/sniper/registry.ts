@@ -6,6 +6,7 @@ import type { PriceOracle } from '../chain/price.js';
 import type { Swarm } from '../types.js';
 import { SniperEngine } from './engine.js';
 import { SniperStateStore } from './state.js';
+import { notifyBotState } from '../notify/state.js';
 
 /**
  * Multi-tenant sniper: one {@link SniperEngine} per admin (keyed by their cipherfi
@@ -159,6 +160,34 @@ export class SniperRegistry {
     if (legacyOwner && !owners.includes(legacyOwner)) owners.push(legacyOwner);
     for (const owner of owners) await this.get(owner);
     logger.info({ engines: this.engines.size }, 'sniper: restored engines');
+  }
+
+  /**
+   * Boot resume: for every restored engine that is ON (mode 'live'), auto-unlock
+   * the enrolled wallet when the owner is in SNIPER_AUTO_UNLOCK_OWNERS — so the
+   * sniper resumes trading immediately after a restart/deploy instead of sitting
+   * dark until a manual unlock (the biggest measured uptime leak). An owner that
+   * is ON but not auto-unlockable (or whose unlock fails) fires a 'wallet-locked'
+   * health alert so the operator knows it's dark. Call AFTER loadAll().
+   */
+  resumeAll(): void {
+    for (const engine of this.engines.values()) {
+      if (engine.executionMode !== 'live') continue; // OFF by choice → nothing to resume
+      const auto = config.autoUnlockOwners.has(engine.owner.trim().toLowerCase());
+      if (auto && engine.keyEnrolled) {
+        try {
+          const addr = engine.unlockPrivateKey();
+          logger.info({ owner: engine.owner, addr }, 'sniper: auto-unlocked wallet on boot');
+          notifyBotState('resumed', `resumed after restart · wallet ${addr.slice(0, 8)}… unlocked · trading live`);
+        } catch (err) {
+          logger.error({ owner: engine.owner, err: String(err) }, 'sniper: auto-unlock failed on boot');
+          notifyBotState('wallet-locked', `auto-unlock FAILED on boot — ${String(err).slice(0, 80)}`, engine.owner);
+        }
+      } else if (auto) {
+        notifyBotState('wallet-locked', 'sniper is ON but no wallet is enrolled to auto-unlock', engine.owner);
+      }
+      // Non-auto owners (customers) intentionally stay locked-at-rest; no alert.
+    }
   }
 
   start(): void {

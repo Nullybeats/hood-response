@@ -147,7 +147,10 @@ function delivery(
 export async function dispatch(s: Swarm): Promise<NotificationDelivery[]> {
   const jobs: Promise<NotificationDelivery>[] = [];
   if (config.notifications.discord) jobs.push(sendDiscord(config.notifications.discord, s));
-  if (config.notifications.telegram) {
+  // Telegram alert cards are gated to PRIME only — the loud, backtested-good tier
+  // (ENTRY/SOLO @ high conviction). The old channel fired a card on EVERY alert,
+  // which is the noise the operator asked to kill. Discord/webhook still get all.
+  if (config.notifications.telegram && s.prime) {
     jobs.push(
       sendTelegram(config.notifications.telegram.token, config.notifications.telegram.chatId, s),
     );
@@ -252,6 +255,10 @@ export async function dispatchMilestone(
   milestonePct: number,
   dexUrl: string,
 ): Promise<NotificationDelivery[]> {
+  // Only genuine runners notify: the +50/+100/+150 crossings are pure spam (they
+  // fire on every tracked call, most of which the operator never bought). Below
+  // the floor we record the milestone silently and send nothing.
+  if (config.PERF_MILESTONE_MIN_PCT > 0 && milestonePct < config.PERF_MILESTONE_MIN_PCT) return [];
   const jobs: Promise<NotificationDelivery>[] = [];
   if (config.notifications.discord) {
     jobs.push(sendMilestoneDiscord(config.notifications.discord, call, milestonePct, dexUrl));

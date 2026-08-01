@@ -9,10 +9,17 @@ import type { Swarm } from '../types.js';
 import { SwapExecutor } from './executor.js';
 import { SafetyChecker } from '../chain/safety.js';
 import { type SniperMode, type SniperStateStore, type StoredSniperState } from './state.js';
+import { notifyBotState } from '../notify/state.js';
 
 /** Absolute floor on any single buy, regardless of the configured amount. */
 export const MIN_BUY_ETH = 0.0005;
 const SAMPLE_MS = 60_000;
+
+/** Current durable settings-schema version. Bump this whenever a data-driven
+ *  default change must be forced onto existing operators (whose durable settings
+ *  otherwise shadow the new env defaults). The migration in load() runs once per
+ *  bump. v2 (2026-08): kinds → ENTRY,SOLO · conviction ungated · roundtrip cap 5. */
+const SETTINGS_SCHEMA_VERSION = 2;
 
 export interface Position {
   id: string;
@@ -246,6 +253,18 @@ export class SniperEngine {
     gasReserveEth: config.SNIPER_GAS_RESERVE_ETH,
   };
   private day: { date: string; startingEquityEth: number; realizedLossEth: number } | undefined;
+  /** Durable settings-schema version this engine's state was last migrated to.
+   *  0 until load() runs; the migration bumps it to SETTINGS_SCHEMA_VERSION. */
+  private settingsSchemaVersion = 0;
+  /** UTC-day key on which we last sent the daily-loss health alert, so it fires
+   *  at most once per day. */
+  private dailyLossAlertedDay: string | undefined;
+
+  /** True when this engine's owner is a primary operator (auto-unlock list): the
+   *  one whose trades + health fire the sniper Telegram bot. Customers don't. */
+  private get notifies(): boolean {
+    return config.autoUnlockOwners.has(this.owner.trim().toLowerCase());
+  }
 
   constructor(
     private readonly price: PriceOracle,
@@ -305,6 +324,10 @@ export class SniperEngine {
     this.mode = mode;
     this.settings.enabled = mode !== 'off';
     this.state?.audit(this.owner, 'mode-changed', { mode });
+    if (this.notifies) {
+      if (mode === 'off') notifyBotState('disabled', 'sniper turned OFF');
+      else notifyBotState('enabled', 'sniper turned ON · live');
+    }
     void this.persist();
     return { mode };
   }
@@ -518,6 +541,13 @@ export class SniperEngine {
       this.positions.set(pos.id, pos);
       this.state?.audit(this.owner, 'buy-confirmed', { positionId: pos.id, tx: res.txHash, eth: res.ethSpent });
       this.decide(swarm, 'bought', `bought ${size} Ξ · tx ${res.txHash.slice(0, 10)}`);
+      if (this.notifies) {
+        notifyBotState(
+          'bought',
+          `🎯 <b>${swarm.tokenSymbol}</b> (${swarm.kind}) · ${res.ethSpent.toFixed(4)} Ξ in · conv ${swarm.conviction}`,
+          pos.id,
+        );
+      }
       logger.info(
         { token: swarm.tokenSymbol, eth: size, conviction: swarm.conviction, tx: res.txHash },
         'sniper: opened position',
@@ -665,6 +695,25 @@ export class SniperEngine {
       const equity = await this.accountEquityEth();
       if (equity != null) this.syncRiskDay(equity + p.exitValueEth);
       if (this.day) this.day.realizedLossEth += p.ethIn - totalOutEth + (p.buyGasEth ?? 0) + (p.sellGasEth ?? 0);
+      // Informational daily-loss alert once per UTC day when realized loss crosses
+      // the configured threshold. This does NOT halt trading (a hard halt would
+      // fight the always-on mandate on a small bankroll) — it just tells you.
+      if (this.notifies && this.dailyLossLocked() && this.dailyLossAlertedDay !== this.day?.date) {
+        this.dailyLossAlertedDay = this.day?.date;
+        notifyBotState('daily-loss', `daily loss threshold (${this.risk.dailyLossPct}%) reached — still ON, watch the tape`);
+      }
+    }
+    // Sold alert: the honest net after gas + any recouped ETH, with the reason.
+    if (this.notifies) {
+      const netEth = totalOutEth - p.ethIn - (p.buyGasEth ?? 0) - (p.sellGasEth ?? 0);
+      const netPct = p.ethIn > 0 ? (netEth / p.ethIn) * 100 : 0;
+      const sign = netPct >= 0 ? '+' : '';
+      const face = netPct >= 0 ? '🟢' : '🔴';
+      notifyBotState(
+        'sold',
+        `${face} <b>${p.tokenSymbol}</b> ${reason} · ${sign}${netPct.toFixed(1)}% (${sign}${netEth.toFixed(4)} Ξ net)`,
+        p.id,
+      );
     }
     logger.info(
       { token: p.tokenSymbol, tx: res.txHash, ethOut: res.ethReceived, quoted: res.quotedEthOut, exitSlipPct: p.exitSlippagePct, reason },
@@ -1133,6 +1182,29 @@ export class SniperEngine {
     return pos;
   }
 
+  /** Force data-driven default changes onto an existing operator whose durable
+   *  settings would otherwise shadow the new env defaults. Runs once per schema
+   *  bump (guarded by settingsSchemaVersion). Only the fields a version changes
+   *  are overwritten; everything else the operator set is preserved. */
+  private migrateSettings(): void {
+    if (this.settingsSchemaVersion >= SETTINGS_SCHEMA_VERSION) return;
+    // v2: the losing defaults (BUY-kind, conviction gating, loose 10% roundtrip)
+    // are replaced by the backtested set. primeOnly off so ENTRY+SOLO both pass.
+    if (this.settingsSchemaVersion < 2) {
+      this.settings.kinds = 'ENTRY,SOLO';
+      this.settings.primeOnly = false;
+      this.settings.minConviction = 0;
+      this.settings.maxConviction = 100;
+      this.settings.maxRoundtripPct = 5;
+      logger.info(
+        { owner: this.owner },
+        'sniper: applied settings migration v2 (ENTRY,SOLO · conviction ungated · roundtrip cap 5)',
+      );
+    }
+    this.settingsSchemaVersion = SETTINGS_SCHEMA_VERSION;
+    void this.persist();
+  }
+
   updateSettings(patch: Partial<SniperSettings>): SniperSettings {
     // Legacy callers cannot arm execution through the settings endpoint.
     if (typeof patch.enabled === 'boolean') {
@@ -1240,10 +1312,16 @@ export class SniperEngine {
       if (durable.day && typeof durable.day.date === 'string' && Number.isFinite(durable.day.startingEquityEth) && Number.isFinite(durable.day.realizedLossEth)) this.day = durable.day;
       for (const d of durable.decisions ?? []) this.decisions.push(d as typeof this.decisions[number]);
       for (const p of durable.removedLog ?? []) this.removedLog.push(p as typeof this.removedLog[number]);
+      this.settingsSchemaVersion = durable.settingsSchemaVersion ?? 1; // pre-migration state is v1
+      this.migrateSettings();
       const removed = this.dedupePhantoms();
-      logger.info({ owner: this.owner, loaded: this.positions.size, removedPhantoms: removed }, 'sniper: restored durable state');
+      logger.info({ owner: this.owner, loaded: this.positions.size, removedPhantoms: removed, mode: this.mode, settingsVersion: this.settingsSchemaVersion }, 'sniper: restored durable state');
       return;
     }
+    // No durable SQLite record for this owner yet. Any settings come straight from
+    // the (already-current) env defaults, so mark as migrated — the migration must
+    // not re-stamp a fresh install.
+    this.settingsSchemaVersion = SETTINGS_SCHEMA_VERSION;
     if (!this.storePath) return;
     try {
       const raw = await readFile(this.storePath, 'utf8');
@@ -1301,6 +1379,7 @@ export class SniperEngine {
     const durable: StoredSniperState = {
       version: 1,
       mode: this.mode, // sticky per owner: their on/off choice survives restarts
+      settingsSchemaVersion: this.settingsSchemaVersion,
       positions: [...this.positions.values()],
       settings: this.settings,
       buys: this.buys,

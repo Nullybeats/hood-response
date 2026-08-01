@@ -82,7 +82,9 @@ function stubExecutor(
 function swarm(over: Partial<Swarm> = {}): Swarm {
   return {
     id: 's-' + Math.random().toString(36).slice(2),
-    kind: 'BUY',
+    // ENTRY is in the default buy list (ENTRY,SOLO). The old default 'BUY' was
+    // dropped from the defaults (worst-performing kind), so a BUY swarm now skips.
+    kind: 'ENTRY',
     token: '0xtok',
     tokenSymbol: 'GEM',
     walletCount: 3,

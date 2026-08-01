@@ -148,6 +148,11 @@ const schema = z.object({
   // announces every interval it passed through, not just the top one.
   PERF_MILESTONES_ENABLED: bool(true),
   PERF_MILESTONE_STEP_PCT: num(50),
+  // Floor for which milestone crossings actually notify. The tracker still steps
+  // every PERF_MILESTONE_STEP_PCT internally, but only crossings at or above this
+  // % reach the channels — kills the +50/+100/+150 rocket spam, keeps the genuine
+  // runners (≥+200%). 0 = notify every step (legacy behaviour).
+  PERF_MILESTONE_MIN_PCT: num(200),
   IGNORE_DUST_USD: num(25),
   IGNORE_STABLECOINS: bool(true),
   // Symbols never treated as gems: settlement/quote tokens (so a "buy with WETH"
@@ -234,7 +239,11 @@ const schema = z.object({
   SNIPER_RUG_GUARD: bool(true),
   SNIPER_RUG_DROP_PCT: num(50),
   // (peak starts at entry). The validated edge: tight ~15% on non-SOLO swarms. 0 = off.
-  SNIPER_KINDS: z.string().default('BUY,ENTRY'), // alert kinds to snipe — non-SOLO by default (SOLO was −EV in backtest)
+  // Alert kinds to snipe. Default ENTRY,SOLO: on 50 real closed trades SOLO won
+  // 36% (median peak +47%) and ENTRY 12%, while BUY won 13% with a +2.8% median
+  // peak — so BUY is dropped from the default buy list (still selectable via the
+  // knob). Case-insensitive, comma-separated.
+  SNIPER_KINDS: z.string().default('ENTRY,SOLO'),
   // Depth gate: refuse a buy when a round-trip (buy then immediately sell the tokens
   // back) would lose more than this % at our size — price impact both ways + LP fees +
   // hook tax. The direct measure of "can we even exit this pool cleanly." 0 = off.
@@ -250,6 +259,18 @@ const schema = z.object({
   // this box engine's own local alert generation (that divergence bought PIPEDOG,
   // a coin the feed never surfaced). Blank = sniper receives no alerts.
   SNIPER_FEED_URL: z.string().default('https://hood-response-production.up.railway.app'),
+  // Watchdog: if the feed delivers no bytes for this many seconds while we believe
+  // we're connected, force a reconnect and fire a 'feed-dead' health alert (a
+  // silently-dead feed = a dark bot). Recovery fires 'feed-recovered'.
+  SNIPER_FEED_STALE_SEC: num(300),
+  // Owners (cipherfi emails, comma-separated) whose enrolled wallet is AUTO-UNLOCKED
+  // on boot, so their sniper resumes trading immediately after a restart/deploy
+  // instead of sitting dark until a manual unlock. The decryption key
+  // (SNIPER_KEY_ENCRYPTION_KEY) already lives in this box's env, so on a single-box
+  // deployment this adds little at-rest risk for the listed operator while closing
+  // the biggest live-uptime gap. Owners NOT listed stay locked-at-rest (customers).
+  // These owners are also the ones whose trades/health fire Telegram state alerts.
+  SNIPER_AUTO_UNLOCK_OWNERS: z.string().default(''),
   SNIPER_JOURNAL_PATH: z.string().default(''), // append-only JSONL trade journal for offline analysis
   WALLET_OVERRIDES_PATH: z.string().default(''), // persist manual wallet add/remove/retier across restarts
   SNIPER_STORE_PATH: z.string().default(''), // persist positions across redeploys
@@ -264,8 +285,15 @@ const schema = z.object({
   SNIPER_FEE_EXEMPT_OWNERS: z.string().default(''), // comma-separated admin emails, charged nothing
 
   DISCORD_WEBHOOK_URL: z.string().default(''),
+  // The FEED alert-card bot (swarm alerts + big milestones). Railway sets this;
+  // the box leaves it unset so the box never double-posts alert cards.
   TELEGRAM_BOT_TOKEN: z.string().default(''),
   TELEGRAM_CHAT_ID: z.string().default(''),
+  // The dedicated SNIPER bot (@CipherFi_Sniper_Bot): health + the operator's own
+  // trades only, on its own channel. The box sets this; Railway leaves it unset.
+  // Kept separate from TELEGRAM_* so the two bots never cross-post.
+  SNIPER_TELEGRAM_BOT_TOKEN: z.string().default(''),
+  SNIPER_TELEGRAM_CHAT_ID: z.string().default(''),
   GENERIC_WEBHOOK_URL: z.string().default(''),
 
   DATABASE_URL: z.string().default(''),
@@ -354,8 +382,20 @@ export const config = {
       env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID
         ? { token: env.TELEGRAM_BOT_TOKEN, chatId: env.TELEGRAM_CHAT_ID }
         : null,
+    // Dedicated sniper health/trade bot; independent of the feed alert bot above.
+    sniperTelegram:
+      env.SNIPER_TELEGRAM_BOT_TOKEN && env.SNIPER_TELEGRAM_CHAT_ID
+        ? { token: env.SNIPER_TELEGRAM_BOT_TOKEN, chatId: env.SNIPER_TELEGRAM_CHAT_ID }
+        : null,
     webhook: env.GENERIC_WEBHOOK_URL || null,
   },
+  // Operators whose enrolled wallet auto-unlocks on boot AND whose trades/health
+  // fire sniper Telegram state alerts (lower-cased for case-insensitive match).
+  autoUnlockOwners: new Set(
+    env.SNIPER_AUTO_UNLOCK_OWNERS.split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  ),
 } as const;
 
 export type AppConfig = typeof config;
