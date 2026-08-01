@@ -10,7 +10,8 @@ import { buildServer } from './api/server.js';
 import { configuredChannels, dispatchMilestone } from './notify/index.js';
 import { SafetyChecker } from './chain/safety.js';
 import { PerformanceTracker, type TrackedCall } from './engine/performance.js';
-import { SniperEngine } from './sniper/engine.js';
+import { SniperRegistry } from './sniper/registry.js';
+import { FeedSubscriber, SNIPER_FEED_URL } from './sniper/feed.js';
 import { TelegramCommands } from './telegram/commands.js';
 import type { Swarm, SwapEvent } from './types.js';
 
@@ -42,10 +43,26 @@ async function main(): Promise<void> {
     void dispatchMilestone(call, milestonePct, price.dexUrl(call.token));
   });
 
-  // Sniper: auto-buy qualifying alerts with a server hot wallet (off by default).
-  const sniper = new SniperEngine(price);
-  await sniper.load();
+  // Sniper: one independent hot-wallet engine per admin (off by default). The
+  // registry restores every known operator's engine on boot so their positions
+  // survive redeploys and stay viewable; the live alert stream fans out to all.
+  const sniper = new SniperRegistry(price);
+  await sniper.loadAll();
   sniper.start();
+  // The sniper buys ONLY from the canonical swarm feed (the source of truth the
+  // operator watches), never from this box engine's own local alerts. This
+  // subscribes to the feed's SSE stream and drives every operator's engine.
+  const feed = new FeedSubscriber(sniper, price, SNIPER_FEED_URL);
+  feed.start();
+  // New heads drive the exit monitor. The engines collapse concurrent samples,
+  // so an RPC latency metric update can never create duplicate sell attempts.
+  let lastSniperBlock = 0;
+  store.on('metrics', (m) => {
+    if (m.lastBlock > lastSniperBlock) {
+      lastSniperBlock = m.lastBlock;
+      for (const e of sniper.all()) e.onBlock();
+    }
+  });
 
   // Inbound Telegram commands (/t5, /t10, /l5) answered from live performance data.
   const telegramCommands = new TelegramCommands(performance);
@@ -54,7 +71,9 @@ async function main(): Promise<void> {
   store.on('alert', (a) => {
     performance.track(a.swarm);
     performance.sampleSoon();
-    void sniper.onAlert(a.swarm);
+    // NOTE: the sniper is NOT driven from this box engine's own alerts. It buys
+    // exclusively from the canonical swarm feed (see FeedSubscriber above), so it
+    // can never act on a coin the operator's Signals Feed didn't call.
   });
 
   const detachPersistence = await attachPersistence(store);
@@ -250,10 +269,11 @@ async function main(): Promise<void> {
     listener.stop();
     price.stop();
     performance.stop();
+    feed.stop();
     sniper.stop();
     telegramCommands.stop();
     await performance.flush().catch(() => undefined);
-    await sniper.flush().catch(() => undefined);
+    await sniper.flushAll().catch(() => undefined);
     await app.close().catch(() => undefined);
     await detachPersistence();
     process.exit(0);

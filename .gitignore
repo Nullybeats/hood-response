@@ -1,9 +1,28 @@
 node_modules/
 dist/
-.env
-.env.local
-*.log
 coverage/
 .DS_Store
+
+# secrets — NEVER commit (real keys live here)
+.env
+.env.local
+.env.bak*
+.env.*.bak*
+*.predeploy.*
+
+# local source backups (junk from the pre-git scp workflow)
+*.bak
+.bak-*/
+.fee-backup/
+
+# runtime state — per-tenant positions, journals, sqlite, overrides
+data/
+sniper-store*.json
+sniper-owners.json
+*.jsonl
+*.log
 prisma/*.db
 prisma/migrations/dev/
+
+# stray artifact from a bad scp of a full local path
+Users/

@@ -91,6 +91,7 @@ export async function fetchTokenMetadata(
   }
   if (rawSupply != null && decimals != null && decimals >= 0 && decimals <= 36) {
     meta.totalSupply = rawSupply / 10 ** decimals;
+    meta.decimals = decimals;
   }
   return Object.keys(meta).length ? meta : null;
 }

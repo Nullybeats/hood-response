@@ -187,7 +187,22 @@ const schema = z.object({
   // lose, never your main wallet. It won't trade unless the key + router + WETH
   // are set. Per-trade + daily caps and the off switch are the safety rails.
   SNIPER_ENABLED: bool(false), // master on/off — ON = real buys
+  /** Execution is deliberately opt-in; live requires an explicit operator action. */
+  SNIPER_MODE: z.enum(['off', 'live']).default('off'),
+  SNIPER_GLOBAL_KILL: bool(false),
+  SNIPER_STATE_PATH: z.string().default('data/sniper-state.sqlite'),
+  /** 32-byte base64 secret, supplied by deployment only. Empty disables key enrolment. */
+  SNIPER_KEY_ENCRYPTION_KEY: z.string().default(''),
+  SNIPER_MAX_OPEN_POSITIONS: num(3),
+  SNIPER_MAX_NOTIONAL_PCT: num(1),
+  SNIPER_MAX_LOSS_PCT: num(0.5),
+  SNIPER_DAILY_LOSS_PCT: num(2),
+  SNIPER_GAS_RESERVE_ETH: num(0.002),
   SNIPER_PRIVATE_KEY: z.string().default(''), // burner hot-wallet key (env OR entered in-app)
+  // Dedicated RPC for the EXECUTOR only (tx sends + its reads). Lets the continuous chain LISTENER
+  // stay on the free/unmetered public node (CHAIN_HTTP_URL) while sends use a reliable metered node —
+  // the public RPC 429s on execution but is fine for polling. Empty = fall back to CHAIN_HTTP_URL.
+  SNIPER_EXECUTOR_RPC: z.string().default(''),
   // Robinhood Chain Uniswap-v4 addresses (verified from official docs). The
   // UniversalRouter is Robinhood's MODIFIED fork — only this address works.
   SNIPER_ROUTER: z.string().default('0x8876789976deCbfCbBbe364623c63652db8C0904'),
@@ -205,10 +220,48 @@ const schema = z.object({
   SNIPER_MAX_SELL_SLIPPAGE_PCT: num(50),
   SNIPER_TAKE_PROFIT_PCT: num(0), // auto-sell a position at +this% (0 = off)
   SNIPER_REQUIRE_SAFE: bool(true), // never buy a token that fails the honeypot/sellability check (−100% trap)
+  // PRIME-only: buy ONLY alerts flagged prime (PRIME_KINDS × conviction ≥ PRIME_MIN_CONVICTION —
+  // the ENTRY@80+ combo that backtested well). ON collapses the buy set to just those, ignoring the
+  // broader kinds/conviction gates. This is the intended default — the wide filter over-buys.
+  SNIPER_PRIME_ONLY: bool(true),
   SNIPER_TRAILING_STOP_PCT: num(15), // trailing stop % off the high-water mark; doubles as the stop-loss
+  SNIPER_RECOUP_AT_PCT: num(0), // "sell initials": at +this% sell the stake back out (0 = off)
+  SNIPER_MOONBAG_TRAIL_PCT: num(0), // trailing % on the post-recoup moonbag (0 = no stop, ride free)
+  // Rug guard: each block, watch the live on-chain sell value (ETH out for the whole position). If it
+  // collapses more than SNIPER_RUG_DROP_PCT below its since-entry peak, dump immediately — liquidity is
+  // leaving the pool. Fires faster than the price-based trailing stop and gets out while a sellable pool
+  // still exists (the PIPEDOG −100% trap was a post-buy pull the trailing stop couldn't escape). 0 = off.
+  SNIPER_RUG_GUARD: bool(true),
+  SNIPER_RUG_DROP_PCT: num(50),
   // (peak starts at entry). The validated edge: tight ~15% on non-SOLO swarms. 0 = off.
   SNIPER_KINDS: z.string().default('BUY,ENTRY'), // alert kinds to snipe — non-SOLO by default (SOLO was −EV in backtest)
+  // Depth gate: refuse a buy when a round-trip (buy then immediately sell the tokens
+  // back) would lose more than this % at our size — price impact both ways + LP fees +
+  // hook tax. The direct measure of "can we even exit this pool cleanly." 0 = off.
+  SNIPER_MAX_ROUNDTRIP_PCT: num(35),
+  // After a token stops us out at a loss, don't re-buy it for this many minutes (0 = off).
+  SNIPER_LOSS_COOLDOWN_MIN: num(90),
+  // Only act on the first time a token appears in the global Signals feed.
+  // This is intentionally independent of whether this operator bought it.
+  SNIPER_NEW_COINS_ONLY: bool(false),
+  // The swarm feed the sniper buys FROM — the canonical "swarm the fly" engine
+  // that also drives cipherfi's Signals Feed. The sniper subscribes to its SSE
+  // /events and acts ONLY on the coins it calls; it never originates a buy from
+  // this box engine's own local alert generation (that divergence bought PIPEDOG,
+  // a coin the feed never surfaced). Blank = sniper receives no alerts.
+  SNIPER_FEED_URL: z.string().default('https://hood-response-production.up.railway.app'),
+  SNIPER_JOURNAL_PATH: z.string().default(''), // append-only JSONL trade journal for offline analysis
+  WALLET_OVERRIDES_PATH: z.string().default(''), // persist manual wallet add/remove/retier across restarts
   SNIPER_STORE_PATH: z.string().default(''), // persist positions across redeploys
+
+  // ── Platform close-fee ────────────────────────────────────────────────────────
+  // Skim a fee off each customer SELL and send it to SNIPER_FEE_WALLET. OFF unless
+  // BOTH a positive bps and a fee wallet are set. bps is hard-capped at 300 (3%) in
+  // code. The two admin operators (SNIPER_FEE_EXEMPT_OWNERS) and the 'default' engine
+  // are never charged. Fee is taken on sells only — buys are never charged.
+  SNIPER_FEE_BPS: num(0), // 100 = 1%
+  SNIPER_FEE_WALLET: z.string().default(''), // public receive address; never a private key
+  SNIPER_FEE_EXEMPT_OWNERS: z.string().default(''), // comma-separated admin emails, charged nothing
 
   DISCORD_WEBHOOK_URL: z.string().default(''),
   TELEGRAM_BOT_TOKEN: z.string().default(''),
@@ -287,6 +340,14 @@ export const config = {
   // rejects a mixed-case address whose checksum doesn't match).
   SNIPER_ROUTER: normAddr(env.SNIPER_ROUTER),
   SNIPER_WETH: normAddr(env.SNIPER_WETH),
+  // Fee receive address, checksum-normalised (empty = fee disabled). The exempt
+  // roster is lower-cased for a case-insensitive email match against engine owners.
+  SNIPER_FEE_WALLET: env.SNIPER_FEE_WALLET ? normAddr(env.SNIPER_FEE_WALLET) : '',
+  feeExemptOwners: new Set(
+    env.SNIPER_FEE_EXEMPT_OWNERS.split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  ),
   notifications: {
     discord: env.DISCORD_WEBHOOK_URL || null,
     telegram:

@@ -13,6 +13,7 @@ import {
   type EthLog,
 } from './decoder.js';
 import { fetchTokenMetadata } from './metadata.js';
+import { receiptConfirmsSwap, receiptDiagnostic } from './receipt.js';
 
 export type SwapHandler = (e: SwapEvent) => void;
 
@@ -26,12 +27,12 @@ export interface ChainListener {
  * HTTP listeners. Registers brand-new tokens in discovery mode (invoking
  * `onNewToken`); returns null for anything not involving a tracked wallet.
  */
-function buildSwapFromLog(
+async function buildSwapFromLog(
   store: MemoryStore,
   price: PriceOracle,
   log: EthLog,
   onNewToken?: (addr: string) => void,
-): SwapEvent | null {
+): Promise<SwapEvent | null> {
   const transfer = decodeTransfer(log);
   if (!transfer) return null;
   const match = directionFor(transfer, (a) => store.isTracked(a));
@@ -44,7 +45,18 @@ function buildSwapFromLog(
     onNewToken?.(transfer.token);
   }
 
-  const amount = toHuman(transfer.rawValue, 18);
+  if (!(await receiptConfirmsSwap(log, transfer))) {
+    receiptDiagnostic(log);
+    return null;
+  }
+  if (token.decimals == null) {
+    const meta = await fetchTokenMetadata(config.CHAIN_HTTP_URL, transfer.token).catch(() => null);
+    if (!meta || meta.decimals == null) return null;
+    store.updateTokenMeta(transfer.token, meta);
+    token = store.tokensByAddress.get(transfer.token) ?? token;
+  }
+
+  const amount = toHuman(transfer.rawValue, token.decimals);
   return {
     txHash: transfer.txHash,
     wallet: match.wallet,
@@ -200,11 +212,11 @@ export class LiveChainListener implements ChainListener {
       return;
     }
 
-    this.handleLog(result as EthLog);
+    void this.handleLog(result as EthLog);
   }
 
-  private handleLog(log: EthLog): void {
-    const swap = buildSwapFromLog(this.store, this.price, log, (a) =>
+  private async handleLog(log: EthLog): Promise<void> {
+    const swap = await buildSwapFromLog(this.store, this.price, log, (a) =>
       enrichToken(this.store, a, this.enriching),
     );
     if (swap) this.onSwap(swap);
@@ -445,7 +457,7 @@ export class HttpPollingChainListener implements ChainListener {
         const key = `${log.transactionHash}:${(log as { logIndex?: string }).logIndex}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        const swap = buildSwapFromLog(this.store, this.price, log, (a) =>
+        const swap = await buildSwapFromLog(this.store, this.price, log, (a) =>
           enrichToken(this.store, a, this.enriching),
         );
         if (swap) {

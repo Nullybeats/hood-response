@@ -8,6 +8,8 @@ export interface TrackedToken {
   symbol: string;
   name: string;
   totalSupply: number;
+  /** Contract decimals, populated from an on-chain metadata read for discovered tokens. */
+  decimals?: number;
   /** True for stablecoins so they can be filtered when IGNORE_STABLECOINS. */
   stable?: boolean;
   /** True when the token was auto-registered by discovery (not in the seed set).
@@ -180,6 +182,10 @@ export interface Swarm {
   /** True when this repeat is driven by a NEW distinct wallet (a different top
    *  holder joining), not the same wallet re-buying — the strongest repeat. */
   repeatNewWallet?: boolean;
+  /** Set once at alert emission from the durable global Signals-feed history.
+   *  Every operator receives the same value for the alert; New coins only
+   *  snipers may act only when this is true. */
+  firstSignal?: boolean;
   /** The rolling repeat window in minutes (for display, e.g. "2nd in 35m"). */
   repeatWindowMinutes?: number;
   /** True when this alert hits the PRIME bar (kind + conviction combo backed by
