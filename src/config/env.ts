@@ -259,6 +259,11 @@ const schema = z.object({
   SNIPER_MAX_ROUNDTRIP_PCT: num(35),
   // After a token stops us out at a loss, don't re-buy it for this many minutes (0 = off).
   SNIPER_LOSS_COOLDOWN_MIN: num(90),
+  // Freshness gate: skip an alert already older than this many seconds by the time the sniper evaluates
+  // it — the alert's edge decays fast (every >50%-peak winner filled <2s; a 38s-late fill bought the
+  // PIPEDOG top). Lenient default (15s) while the blocking price-enrich latency remains; tighten toward
+  // ~5s after Wave 2 gets fills sub-2s. 0 = off. Measured breakdown is journaled per buy (gateTimingsMs).
+  SNIPER_STALE_MAX_SEC: num(15),
   // Only act on the first time a token appears in the global Signals feed.
   // This is intentionally independent of whether this operator bought it.
   SNIPER_NEW_COINS_ONLY: bool(false),

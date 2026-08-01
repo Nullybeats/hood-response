@@ -173,6 +173,8 @@ export class FeedSubscriber {
    *  the feed's own conviction/prime/kind as the source of truth, then hand to the
    *  sniper registry (which claims first-signal and fans out to each operator). */
   private async handle(swarm: Swarm): Promise<void> {
+    const receivedAt = Date.now();
+    swarm.receivedAt = receivedAt;
     try {
       await this.price.refreshNow(swarm.token);
       swarm.priceLive = this.price.isLive(swarm.token);
@@ -183,6 +185,7 @@ export class FeedSubscriber {
     } catch {
       /* leave feed price as-is — the sniper fails closed on a missing live price */
     }
+    swarm.enrichMs = Date.now() - receivedAt; // measured: is the blocking Dexscreener enrich the bottleneck?
     this.registry.onAlert(swarm);
   }
 }

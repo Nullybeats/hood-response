@@ -104,6 +104,10 @@ export interface Position {
   poolLiquidityEntry?: number | null;
   /** Alert-timestamp → buy-confirmed latency, ms (how late we entered the swarm). */
   buyLatencyMs?: number;
+  /** Breakdown of where the entry latency went (ms), so we can see WHICH stage is the bottleneck
+   *  instead of guessing: sse = Railway→box hop, enrich = blocking Dexscreener price refresh,
+   *  safety = honeypot probe, preview = round-trip depth quote, submit = buy tx build+confirm. */
+  gateTimingsMs?: { sse?: number; enrich?: number; safety?: number; preview?: number; submit?: number };
 }
 
 /** One rung of the scale-out take-profit ladder: at `mult`× entry, sell `sellFraction` of the ORIGINAL
@@ -493,6 +497,16 @@ export class SniperEngine {
       if (swarm.conviction < this.settings.minConviction || swarm.conviction > this.settings.maxConviction)
         return this.decide(swarm, 'skipped', `conviction ${swarm.conviction} outside ${this.settings.minConviction}-${this.settings.maxConviction}`);
     }
+    // Freshness gate (before any network call): the alert's edge decays fast — on real trades every
+    // >50%-peak winner filled in <2s, while a 38s-late fill bought the top (PIPEDOG). Skip an alert
+    // already older than staleMaxSec by the time we see it. Lenient default while we still carry the
+    // blocking enrich latency; tighten toward ~5s once Wave 2 gets fills sub-2s.
+    if (config.SNIPER_STALE_MAX_SEC > 0 && swarm.firstSeen) {
+      const ageMs = Date.now() - swarm.firstSeen;
+      if (ageMs > config.SNIPER_STALE_MAX_SEC * 1000) {
+        return this.decide(swarm, 'skipped', `stale: alert ${Math.round(ageMs / 1000)}s old > ${config.SNIPER_STALE_MAX_SEC}s`);
+      }
+    }
     if (this.holdsOpen(swarm.token)) return this.decide(swarm, 'skipped', 'already holding this token');
     // portfolio position cap removed — concurrent positions are bounded only by wallet balance + gas reserve
     // Per-token in-flight lock: two alerts for the same token can both clear holdsOpen before either
@@ -537,28 +551,44 @@ export class SniperEngine {
       return this.decide(swarm, 'skipped', 'daily spend cap reached');
     }
 
-    // Honeypot / sellability gate — never buy something we can't sell (the −100% trap). Cached, cheap.
+    // Honeypot gate + depth gate run CONCURRENTLY (independent, both fail-closed): the honeypot sim and
+    // the round-trip route quote don't depend on each other, so awaiting them together shaves a network
+    // round-trip off the entry path. Timings recorded so we can see which stage dominates.
+    const gateStart = Date.now();
+    const [safe, roundTrip] = await Promise.all([
+      this.settings.requireSafe
+        ? this.safety.check(swarm.token, this.price.liquidityOf(swarm.token)).catch(() => null)
+        : Promise.resolve('skip' as const),
+      this.executor.previewRoundTrip(swarm.token, size, this.price.pairIdOf(swarm.token)).catch(() => null),
+    ]);
+    const gateMs = Date.now() - gateStart; // combined safety+preview wall time (they ran in parallel)
+    // Honeypot / sellability — never buy what we can't sell (the −100% trap).
     if (this.settings.requireSafe) {
-      const safe = await this.safety.check(swarm.token, this.price.liquidityOf(swarm.token)).catch(() => null);
-      if (!safe) return this.decide(swarm, 'skipped', 'safety check unavailable (fail closed)');
+      if (!safe || safe === 'skip') return this.decide(swarm, 'skipped', 'safety check unavailable (fail closed)');
       if (!safe.ok) return this.decide(swarm, 'skipped', `unsafe: ${(safe.hardFails ?? []).join(', ')}`);
     }
-
-    // Depth gate (Track 1): a round-trip preview measures the true floor cost of a
-    // trade at our size — price impact both ways + LP fees + hook tax — BEFORE any
-    // ETH moves. Refuse pools we couldn't exit cleanly (the BURN −22.8% failure mode).
-    const roundTrip = await this.executor.previewRoundTrip(swarm.token, size, this.price.pairIdOf(swarm.token)).catch(() => null);
+    // Depth gate: the true floor cost at our size (impact both ways + LP fees + hook tax) BEFORE any ETH
+    // moves. Refuse pools we couldn't exit cleanly (the BURN −22.8% failure mode).
     if (!roundTrip) return this.decide(swarm, 'skipped', 'on-chain route quote unavailable (fail closed)');
     if (this.settings.maxRoundtripPct > 0 && roundTrip.lossPct > this.settings.maxRoundtripPct) {
       return this.decide(swarm, 'skipped', `too thin: round-trip −${roundTrip.lossPct.toFixed(0)}% > ${this.settings.maxRoundtripPct}% cap`);
     }
-    // per-trade loss-budget rail removed — the operator's Max exit cost % (above) and trailing stop govern
 
     try {
       const ethUsd = this.price.ethUsdPrice();
       const expectedPriceEth = ethUsd && ethUsd > 0 ? entryPrice / ethUsd : null;
+      const submitStart = Date.now();
       const res = await this.executor.buy(swarm.token, size, this.price.pairIdOf(swarm.token), expectedPriceEth);
       const filledAt = Date.now();
+      const submitMs = filledAt - submitStart;
+      const gateTimingsMs = {
+        sse: swarm.receivedAt && swarm.firstSeen ? Math.max(0, swarm.receivedAt - swarm.firstSeen) : undefined,
+        enrich: swarm.enrichMs,
+        // safety+preview ran in parallel — attribute the combined wall time to both for visibility.
+        safety: this.settings.requireSafe ? gateMs : undefined,
+        preview: gateMs,
+        submit: submitMs,
+      };
       this.buys.push({ at: now, eth: res.ethSpent });
       const [tax, protocolFeePctPerSwap] = await Promise.all([
         this.lookupTax(swarm.token),
@@ -594,7 +624,9 @@ export class SniperEngine {
         entryRoundTripPct: roundTrip?.lossPct,
         poolLiquidityEntry: roundTrip?.poolLiquidity ?? null,
         buyLatencyMs: filledAt - alertTs,
+        gateTimingsMs,
       };
+      logger.info({ token: swarm.tokenSymbol, buyLatencyMs: pos.buyLatencyMs, timings: gateTimingsMs }, 'sniper: entry latency breakdown');
       this.positions.set(pos.id, pos);
       this.state?.audit(this.owner, 'buy-confirmed', { positionId: pos.id, tx: res.txHash, eth: res.ethSpent });
       this.decide(swarm, 'bought', `bought ${size} Ξ · tx ${res.txHash.slice(0, 10)}`);
@@ -874,6 +906,7 @@ export class SniperEngine {
         platformFeeTx: p.platformFeeTx ?? null,
         poolLiquidityEntry: p.poolLiquidityEntry ?? null,
         buyLatencyMs: p.buyLatencyMs ?? null,
+        gateTimingsMs: p.gateTimingsMs ?? null,
         holdMs: p.closedAt && p.openedAt ? p.closedAt - p.openedAt : null,
         grossPnlEth,
         netPnlEth,

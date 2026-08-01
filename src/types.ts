@@ -197,6 +197,13 @@ export interface Swarm {
   windowSeconds: number;
   firstSeen: number;
   lastSeen: number;
+
+  // ── Sniper entry-latency telemetry (stamped box-side by the FeedSubscriber; not from the feed) ──
+  /** Box wall-clock (ms) when the FeedSubscriber received this alert off the SSE stream — before any
+   *  local enrich. `receivedAt − firstSeen` ≈ the Railway→box hop (subject to clock skew). */
+  receivedAt?: number;
+  /** Duration (ms) of the blocking local price enrich (Dexscreener refreshNow) in the FeedSubscriber. */
+  enrichMs?: number;
 }
 
 export interface AlertRule {
