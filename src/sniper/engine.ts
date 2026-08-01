@@ -1373,7 +1373,15 @@ export class SniperEngine {
     const durable = this.state?.load(this.owner);
     if (durable) {
       for (const p of durable.positions as Position[]) if (p && p.id) this.positions.set(p.id, p);
-      if (durable.settings && typeof durable.settings === 'object') this.settings = { ...this.settings, ...(durable.settings as SniperSettings) };
+      if (durable.settings && typeof durable.settings === 'object') {
+        // Merge ONLY keys the current settings shape knows about, so fields removed from the code
+        // (e.g. the retired tpLadder) don't linger in the durable blob and re-surface in the snapshot.
+        const d = durable.settings as Record<string, unknown>;
+        const cur = this.settings as unknown as Record<string, unknown>;
+        for (const k of Object.keys(cur)) {
+          if (k in d) cur[k] = d[k];
+        }
+      }
       // Restore the owner's on/off choice so it's sticky across restarts. Trading still can't run
       // until the wallet is explicitly unlocked (keys are encrypted at rest, unlocked per session).
       if (durable.mode === 'off' || durable.mode === 'live') this.mode = durable.mode;
