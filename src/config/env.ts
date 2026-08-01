@@ -224,6 +224,10 @@ const schema = z.object({
   // Only applies to sells; buys are never force-executed past normal slippage.
   SNIPER_MAX_SELL_SLIPPAGE_PCT: num(50),
   SNIPER_TAKE_PROFIT_PCT: num(0), // auto-sell a position at +this% (0 = off)
+  // Scale-out take-profit ladder as a JSON array of {mult,sellFraction} rungs, e.g.
+  // '[{"mult":1.35,"sellFraction":0.5},{"mult":3,"sellFraction":0.25}]' = sell 50% at +35%, 25% at 3×.
+  // Empty '[]' = off (the single SNIPER_TAKE_PROFIT_PCT applies instead). Data-gated before enabling.
+  SNIPER_TP_LADDER: z.string().default('[]'),
   SNIPER_REQUIRE_SAFE: bool(true), // never buy a token that fails the honeypot/sellability check (−100% trap)
   // PRIME-only: buy ONLY alerts flagged prime (PRIME_KINDS × conviction ≥ PRIME_MIN_CONVICTION —
   // the ENTRY@80+ combo that backtested well). ON collapses the buy set to just those, ignoring the
@@ -238,6 +242,11 @@ const schema = z.object({
   // still exists (the PIPEDOG −100% trap was a post-buy pull the trailing stop couldn't escape). 0 = off.
   SNIPER_RUG_GUARD: bool(true),
   SNIPER_RUG_DROP_PCT: num(50),
+  // Adaptive fast-poll: between the ~4s block ticks, re-evaluate ONLY "hot" positions (peak ≥ 1.5× or
+  // price within ~10% of its trail/stop line) every this-many ms, so a fast dump on a runner is caught
+  // in ~1s instead of up to 4s (the Socks +183%→−74% giveback). 0 = off (block ticks only). Cheap: it
+  // fires only while a hot position exists, and open positions are capped small.
+  SNIPER_FAST_POLL_MS: num(1000),
   // (peak starts at entry). The validated edge: tight ~15% on non-SOLO swarms. 0 = off.
   // Alert kinds to snipe. Default ENTRY,SOLO: on 50 real closed trades SOLO won
   // 36% (median peak +47%) and ENTRY 12%, while BUY won 13% with a +2.8% median
@@ -318,6 +327,22 @@ const schema = z.object({
   BASED_REF: z.string().default('Rick'),
 });
 
+/** Parse the SNIPER_TP_LADDER JSON string into sorted, sane rungs (mult>1, 0<sellFraction≤1, ≤6). A
+ *  malformed value degrades to [] (ladder off) rather than crashing boot. */
+function parseTpLadder(raw: string): { mult: number; sellFraction: number }[] {
+  try {
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((r) => r && Number.isFinite(r.mult) && Number.isFinite(r.sellFraction) && r.mult > 1 && r.sellFraction > 0)
+      .map((r) => ({ mult: Number(r.mult), sellFraction: Math.min(1, Number(r.sellFraction)) }))
+      .sort((a, b) => a.mult - b.mult)
+      .slice(0, 6);
+  } catch {
+    return [];
+  }
+}
+
 const parsed = schema.safeParse(process.env);
 
 if (!parsed.success) {
@@ -364,6 +389,8 @@ export const config = {
       .map((s) => s.trim().toUpperCase())
       .filter(Boolean),
   ),
+  // Parse + sanitize the TP ladder JSON once at boot (mult>1, 0<sellFraction≤1, sorted, ≤6 rungs).
+  sniperTpLadder: parseTpLadder(env.SNIPER_TP_LADDER),
   // Normalise so any casing of the router/WETH addresses is accepted (ethers
   // rejects a mixed-case address whose checksum doesn't match).
   SNIPER_ROUTER: normAddr(env.SNIPER_ROUTER),

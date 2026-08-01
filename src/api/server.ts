@@ -73,6 +73,9 @@ const sniperSettingsBody = z.object({
   maxConviction: z.number().min(0).max(100).optional(),
   buyEth: z.number().positive().optional(),
   takeProfitPct: z.number().min(0).optional(),
+  // Scale-out ladder: ascending {mult>1, 0<sellFraction≤1} rungs (≤6). [] disables it. The engine
+  // re-normalizes (sort/dedupe/cap cumulative fraction) so a slightly-off client payload is safe.
+  tpLadder: z.array(z.object({ mult: z.number().gt(1), sellFraction: z.number().gt(0).lte(1) })).max(6).optional(),
   trailingStopPct: z.number().min(0).max(100).optional(),
   maxRoundtripPct: z.number().min(0).max(100).optional(),
   lossCooldownMin: z.number().min(0).max(10_080).optional(),

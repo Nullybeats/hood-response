@@ -60,6 +60,11 @@ export interface Position {
   /** Per-position trailing-stop % override (pre-recoup). undefined = use the global trailingStopPct.
    *  After recoup the moonbag still trails on the global moonbagTrailPct, as before. */
   trailingStopPct?: number | null;
+  /** Exact base-unit lot at ENTRY (before any recoup/ladder/partial shrinks tokensReceivedRaw). Ladder
+   *  rung sizes are a fraction of THIS, so rungs don't compound as the lot shrinks. Set at buy time. */
+  origTokensRaw?: string;
+  /** TP-ladder rung mults already taken on this position (so each rung fires at most once). */
+  tpRungsHit?: number[];
   /** "Sell initials": true once we've sold ~the stake back out, leaving a risk-free moonbag. */
   recoupDone?: boolean;
   /** ETH banked by the recoup partial sell (added to the moonbag's final proceeds for total PnL). */
@@ -101,6 +106,13 @@ export interface Position {
   buyLatencyMs?: number;
 }
 
+/** One rung of the scale-out take-profit ladder: at `mult`× entry, sell `sellFraction` of the ORIGINAL
+ *  lot. Rungs fire once each, low→high, independently of recoup and the legacy single takeProfitPct. */
+export interface TpRung {
+  mult: number; // e.g. 1.35 = +35%
+  sellFraction: number; // 0<..≤1 of the original lot
+}
+
 /** Runtime-adjustable knobs (seeded from env, editable via the API). */
 export interface SniperSettings {
   enabled: boolean;
@@ -108,6 +120,10 @@ export interface SniperSettings {
   maxConviction: number;
   buyEth: number;
   takeProfitPct: number;
+  /** Scale-out take-profit ladder: sell a fraction of the ORIGINAL lot at each rung on the way up,
+   *  banking the common-case winners that otherwise round-trip to a loss while still riding a moonbag.
+   *  Empty = off (legacy single takeProfitPct applies). When non-empty, takeProfitPct is ignored. */
+  tpLadder: TpRung[];
   /** Trailing stop % off the high-water mark. Because the high-water starts at entry, this doubles
    *  as the stop-loss: a coin that never runs exits at −trailingStopPct; a runner exits that far
    *  below its peak. 0 = off. This is the validated edge (tight ~15% on non-SOLO swarms). */
@@ -203,6 +219,7 @@ export class SniperEngine {
     reason: string;
   }[] = [];
   private timer: NodeJS.Timeout | null = null;
+  private fastTimer: NodeJS.Timeout | null = null;
   private sampling = false;
   private warnedUnconfigured = false;
   readonly executor: SwapExecutor;
@@ -214,6 +231,7 @@ export class SniperEngine {
     maxConviction: config.SNIPER_MAX_CONVICTION,
     buyEth: config.SNIPER_BUY_ETH,
     takeProfitPct: config.SNIPER_TAKE_PROFIT_PCT,
+    tpLadder: config.sniperTpLadder,
     trailingStopPct: config.SNIPER_TRAILING_STOP_PCT,
     requireSafe: config.SNIPER_REQUIRE_SAFE,
     primeOnly: config.SNIPER_PRIME_ONLY,
@@ -304,10 +322,47 @@ export class SniperEngine {
 
   start(): void {
     this.timer = setInterval(() => void this.sample(), SAMPLE_MS);
+    // Adaptive fast-poll: a light 1s timer that runs a full sample ONLY when a position is "hot"
+    // (a runner near its peak, or a position hovering just above its trail/stop). Between block ticks
+    // this catches a fast dump in ~1s instead of up to 4s. The hotness check uses stored values (no
+    // RPC); the actual sample() re-quotes on-chain as usual.
+    if (config.SNIPER_FAST_POLL_MS > 0) {
+      this.fastTimer = setInterval(() => {
+        if (!this.sampling && this.anyHotPosition()) void this.sample();
+      }, config.SNIPER_FAST_POLL_MS);
+    }
   }
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    if (this.fastTimer) clearInterval(this.fastTimer);
+    this.fastTimer = null;
+  }
+
+  /** Cheap (no-RPC) hotness check for the fast-poll gate: is any open position a runner (peak ≥ 1.5×)
+   *  or hovering within 10% above its trail/stop line, using values stored by the last sample? */
+  private anyHotPosition(): boolean {
+    for (const p of this.positions.values()) {
+      if (p.status !== 'open') continue;
+      const entry = p.entryPriceUsd;
+      const last = p.lastPriceUsd;
+      const peak = p.peakPriceUsd ?? entry;
+      if (!(entry > 0) || !(last > 0)) continue;
+      if (peak / entry >= 1.5) return true; // a runner — protect the tail tightly
+      // near the active trail line (from above): within 10% of peak·(1−trail)
+      const trailPct = p.recoupDone ? this.settings.moonbagTrailPct : (p.trailingStopPct ?? this.settings.trailingStopPct);
+      if (trailPct > 0) {
+        const line = peak * (1 - trailPct / 100);
+        if (line > 0 && last <= line * 1.1) return true;
+      }
+      // near a fixed stop-loss line (from above)
+      const stopPct = p.stopLossPct ?? 0;
+      if (stopPct > 0) {
+        const line = entry * (1 - stopPct / 100);
+        if (line > 0 && last <= line * 1.1) return true;
+      }
+    }
+    return false;
   }
 
   /** New block hook; exits are evaluated immediately rather than waiting for a
@@ -523,6 +578,8 @@ export class SniperEngine {
         entryMarketCap: swarm.marketCap,
         tokensReceived: res.tokensReceived,
         tokensReceivedRaw: res.tokensReceivedRaw,
+        origTokensRaw: res.tokensReceivedRaw, // frozen entry lot — ladder rungs size off this
+        tpRungsHit: [],
         buyTx: res.txHash,
         openedAt: now,
         lastPriceUsd: entryPrice,
@@ -627,8 +684,23 @@ export class SniperEngine {
           await this.recoupInitials(p, quote.ethOut);
           return;
         }
-        const tp = p.takeProfitPct !== undefined ? (p.takeProfitPct ?? 0) : this.settings.takeProfitPct;
-        if (tp > 0 && p.entryPriceUsd > 0 && (px / p.entryPriceUsd - 1) * 100 >= tp) await this.takeProfit(p);
+        // Scale-out TP ladder: sell a fraction of the ORIGINAL lot at each un-hit rung, low→high (one
+        // rung per tick). Banks the +30–50% cohort that otherwise round-trips to a loss, while the
+        // remainder keeps riding under the trail/moonbag. Fires independently of recoup; when a ladder
+        // is set the legacy single takeProfitPct is ignored (they'd double-fire).
+        const ladder = this.settings.tpLadder;
+        if (ladder.length > 0 && p.entryPriceUsd > 0) {
+          const mult = px / p.entryPriceUsd;
+          const hit = p.tpRungsHit ?? [];
+          const rung = ladder.find((r) => !hit.includes(r.mult) && mult >= r.mult);
+          if (rung) {
+            await this.sellLadderRung(p, rung);
+            return;
+          }
+        } else {
+          const tp = p.takeProfitPct !== undefined ? (p.takeProfitPct ?? 0) : this.settings.takeProfitPct;
+          if (tp > 0 && p.entryPriceUsd > 0 && (px / p.entryPriceUsd - 1) * 100 >= tp) await this.takeProfit(p);
+        }
       } catch (err) {
         p.lastExecutionError = `exit quote: ${String(err).slice(0, 160)}`;
         this.state?.audit(this.owner, 'exit-quote-failed', { positionId: p.id, error: p.lastExecutionError });
@@ -863,6 +935,64 @@ export class SniperEngine {
 
   private async takeProfit(p: Position): Promise<void> {
     await this.closeOut(p, 'take-profit');
+  }
+
+  /** Take one scale-out ladder rung: sell `rung.sellFraction` of the ORIGINAL lot (capped to what's
+   *  left), bank the proceeds, mark the rung hit, and shrink the tracked lot — mirroring recoup's
+   *  partial-sell accounting so view()/netPnl stay correct. If the rung would consume ~all that remains,
+   *  do a full take-profit close instead. Marks the rung only AFTER the sell confirms (a failed sell
+   *  leaves it un-hit so the next tick retries). Leaves the position OPEN with the remainder riding. */
+  private async sellLadderRung(p: Position, rung: TpRung): Promise<void> {
+    if (p.status !== 'open') return;
+    const origRaw = p.origTokensRaw ?? p.tokensReceivedRaw;
+    if (!origRaw || !p.tokensReceivedRaw) { p.tpRungsHit = [...(p.tpRungsHit ?? []), rung.mult]; return; }
+    let heldRaw: bigint; let origBig: bigint;
+    try { heldRaw = BigInt(p.tokensReceivedRaw); origBig = BigInt(origRaw); } catch { return; }
+    if (heldRaw <= 0n || origBig <= 0n) { p.tpRungsHit = [...(p.tpRungsHit ?? []), rung.mult]; return; }
+    const scale = 1_000_000n;
+    const fracBig = BigInt(Math.round(Math.min(1, Math.max(0, rung.sellFraction)) * 1e6));
+    let sellRaw = (origBig * fracBig) / scale; // fraction OF ORIGINAL
+    // If the rung's share of the original exceeds ~all that's left, just close the remainder out.
+    if (sellRaw >= (heldRaw * 995n) / 1000n) {
+      p.tpRungsHit = [...(p.tpRungsHit ?? []), rung.mult];
+      await this.closeOut(p, 'take-profit');
+      return;
+    }
+    if (sellRaw <= 0n) { p.tpRungsHit = [...(p.tpRungsHit ?? []), rung.mult]; return; }
+    const sellTokens = p.tokensReceived * (Number(sellRaw) / Number(heldRaw));
+    p.status = 'close_pending';
+    p.closeAttemptedAt = Date.now();
+    p.lastExecutionError = undefined;
+    await this.persist();
+    const ethUsd = this.price.ethUsdPrice();
+    const expectedPriceEth = p.lastPriceUsd > 0 && ethUsd && ethUsd > 0 ? p.lastPriceUsd / ethUsd : null;
+    let res;
+    try {
+      res = await this.executor.sell(p.token, this.price.pairIdOf(p.token), expectedPriceEth, sellTokens, sellRaw.toString());
+    } catch (err) {
+      p.status = 'open'; // rung sell failed — stay open, rung stays un-hit, retry next tick
+      p.lastExecutionError = `ladder ${rung.mult}x: ${String(err).slice(0, 140)}`;
+      this.state?.audit(this.owner, 'ladder-rung-failed', { positionId: p.id, mult: rung.mult, error: p.lastExecutionError });
+      await this.persist();
+      return;
+    }
+    const remainingBefore = 1 - (p.recoupSoldFrac ?? 0);
+    const fracOfCurrent = Number(sellRaw) / Number(heldRaw);
+    p.recoupedEth = (p.recoupedEth ?? 0) + res.ethReceived;
+    p.recoupSoldFrac = Math.min(1, (p.recoupSoldFrac ?? 0) + remainingBefore * fracOfCurrent);
+    p.tokensReceived = Math.max(0, p.tokensReceived - sellTokens);
+    p.tokensReceivedRaw = (heldRaw - sellRaw).toString();
+    p.tpRungsHit = [...(p.tpRungsHit ?? []), rung.mult];
+    p.sellGasEth = (p.sellGasEth ?? 0) + res.gasEth;
+    p.status = 'open';
+    p.updatedAt = Date.now();
+    if (res.venue) p.venue = res.venue;
+    logger.info({ token: p.tokenSymbol, tx: res.txHash, mult: rung.mult, sellFraction: rung.sellFraction, ethOut: res.ethReceived }, 'sniper: ladder rung taken');
+    this.state?.audit(this.owner, 'ladder-rung', { positionId: p.id, mult: rung.mult, ethOut: res.ethReceived });
+    if (this.notifies) {
+      notifyBotState('sold', `📈 <b>${p.tokenSymbol}</b> TP rung ${rung.mult}× · sold ${Math.round(rung.sellFraction * 100)}% · +${res.ethReceived.toFixed(4)} Ξ banked`, `${p.id}:${rung.mult}`);
+    }
+    void this.persist();
   }
 
   /** Close a position for a rules-driven reason (take-profit / trailing-stop), logging on failure.
@@ -1219,6 +1349,7 @@ export class SniperEngine {
     if (typeof patch.maxConviction === 'number') this.settings.maxConviction = clamp(patch.maxConviction, 0, 100);
     if (typeof patch.buyEth === 'number') this.settings.buyEth = Math.max(MIN_BUY_ETH, patch.buyEth);
     if (typeof patch.takeProfitPct === 'number') this.settings.takeProfitPct = Math.max(0, patch.takeProfitPct);
+    if (Array.isArray(patch.tpLadder)) this.settings.tpLadder = normalizeLadder(patch.tpLadder);
     if (typeof patch.trailingStopPct === 'number') this.settings.trailingStopPct = Math.max(0, patch.trailingStopPct);
     if (typeof patch.maxRoundtripPct === 'number') this.settings.maxRoundtripPct = Math.max(0, patch.maxRoundtripPct);
     if (typeof patch.lossCooldownMin === 'number') this.settings.lossCooldownMin = Math.max(0, patch.lossCooldownMin);
@@ -1409,4 +1540,25 @@ export class SniperEngine {
 }
 
 const clamp = (n: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, n));
+
+/** Sanitize a TP ladder: keep rungs with mult>1 and 0<sellFraction≤1, sort ascending by mult, dedupe
+ *  mults, cap at 6 rungs, and clamp cumulative sellFraction to ≤1 (can't sell more than the whole lot). */
+export function normalizeLadder(rungs: TpRung[]): TpRung[] {
+  const clean = rungs
+    .filter((r) => r && Number.isFinite(r.mult) && Number.isFinite(r.sellFraction) && r.mult > 1 && r.sellFraction > 0)
+    .map((r) => ({ mult: r.mult, sellFraction: Math.min(1, r.sellFraction) }))
+    .sort((a, b) => a.mult - b.mult);
+  const out: TpRung[] = [];
+  let cum = 0;
+  const seen = new Set<number>();
+  for (const r of clean) {
+    if (seen.has(r.mult) || out.length >= 6) continue;
+    seen.add(r.mult);
+    const frac = Math.min(r.sellFraction, 1 - cum);
+    if (frac <= 0) break; // whole lot already allocated
+    out.push({ mult: r.mult, sellFraction: frac });
+    cum += frac;
+  }
+  return out;
+}
 const round6 = (n: number): number => Math.round(n * 1e6) / 1e6;
