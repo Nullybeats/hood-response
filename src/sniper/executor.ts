@@ -94,6 +94,16 @@ const V3_ROUTER = '0xCaf681a66D020601342297493863E78C959E5cb2'; // SwapRouter02
 const V3_QUOTER = '0x33e885eD0Ec9bF04EcfB19341582aADCb4c8A9E7'; // QuoterV2
 const V3_FEE_TIERS = [500, 3000, 10000, 100]; // 0.05% / 0.3% / 1% / 0.01%
 
+/** How long a token's discovered VENUE SET stays valid.
+ *
+ *  These sets were cached for the whole process lifetime, which is backwards for a sniper: we first
+ *  resolve a token seconds after launch, and the pool that ends up carrying its liquidity is often
+ *  created LATER (migration off a bonding curve, a second fee tier opening). A pool that appears
+ *  after the first resolution was invisible forever — bestVenue() can only quote what enumeration
+ *  hands it, so a stale set silently caps routing quality no matter how good the quoting is.
+ *  5 minutes keeps the all-history log scan off the hot path while letting a new pool be seen. */
+const VENUE_CACHE_TTL_MS = 5 * 60_000;
+
 const V3_FACTORY_ABI = ['function getPool(address, address, uint24) view returns (address)'];
 const V3_POOL_ABI = ['function liquidity() view returns (uint128)'];
 const V3_QUOTER_ABI = [
@@ -297,9 +307,9 @@ export class SwapExecutor {
   /** token → EVERY eth-paired v4 pool it has. The candidate SET, cached because
    *  the Initialize log scan walks all history; the pick is never cached, since
    *  which pool wins depends on size and on current state. */
-  private readonly v4Candidates = new Map<string, ResolvedPool[]>();
+  private readonly v4Candidates = new Map<string, { at: number; val: ResolvedPool[] }>();
   /** token → every v3 fee tier with a live pool. Same reasoning as above. */
-  private readonly v3Candidates = new Map<string, number[]>();
+  private readonly v3Candidates = new Map<string, { at: number; val: number[] }>();
   /** token → ERC-20 decimals. Read once; needed on every price-sanity check. */
   private readonly decimals = new Map<string, number>();
 
@@ -388,7 +398,7 @@ export class SwapExecutor {
   private async enumerateV4Pools(token: string): Promise<ResolvedPool[]> {
     const cacheKey = token.toLowerCase();
     const memo = this.v4Candidates.get(cacheKey);
-    if (memo) return memo;
+    if (memo && Date.now() - memo.at < VENUE_CACHE_TTL_MS) return memo.val;
     if (!this.provider) return [];
     const t = getAddress(token);
     const padded = zeroPadValue(t, 32);
@@ -437,7 +447,7 @@ export class SwapExecutor {
         `token has a pool but it's not ETH/WETH-paired (vs ${found[0]!.ethCurrency.slice(0, 10)}…) — can't buy with ETH`,
       );
     }
-    this.v4Candidates.set(cacheKey, ethPaired);
+    this.v4Candidates.set(cacheKey, { at: Date.now(), val: ethPaired });
     return ethPaired;
   }
 
@@ -522,7 +532,7 @@ export class SwapExecutor {
   private async enumerateV3Fees(token: string): Promise<number[]> {
     const cacheKey = token.toLowerCase();
     const memo = this.v3Candidates.get(cacheKey);
-    if (memo) return memo;
+    if (memo && Date.now() - memo.at < VENUE_CACHE_TTL_MS) return memo.val;
     const weth = getAddress(config.SNIPER_WETH);
     const t = getAddress(token);
     const factory = new Contract(V3_FACTORY, V3_FACTORY_ABI, this.provider!);
@@ -539,7 +549,7 @@ export class SwapExecutor {
       }),
     );
     const fees = live.filter((f): f is number => f !== null);
-    this.v3Candidates.set(cacheKey, fees);
+    this.v3Candidates.set(cacheKey, { at: Date.now(), val: fees });
     return fees;
   }
 
