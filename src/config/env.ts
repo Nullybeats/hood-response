@@ -232,6 +232,12 @@ const schema = z.object({
   // the button for that bot.
   SIGMA_REF: z.string().default('450463357'),
   BASED_REF: z.string().default('Rick'),
+
+  // Secret salt for the opaque wallet ids exposed on alerts and /api/wallets (see walletId.ts).
+  // Addresses are public and enumerable, so an unsalted hash is reversible by brute force.
+  // Set this once to a long random string and NEVER rotate it — rotating renames every wallet
+  // and orphans any track record downstream consumers have built up.
+  WALLET_ID_SALT: z.string().default(''),
 });
 
 const parsed = schema.safeParse(process.env);

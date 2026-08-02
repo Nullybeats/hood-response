@@ -20,8 +20,12 @@ export interface TrackedCall {
   conviction: number;
   walletCount: number;
   walletSummary: string;
-  /** Labels of the tracked wallets behind this call (e.g. ["tendies", "hmm"]). */
+  /** Labels of the tracked wallets behind this call (e.g. ["tendies", "hmm"]).
+   *  Display only — labels mutate and collide, so never key a record on them. */
   walletLabels: string[];
+  /** Stable opaque wallet ids, index-aligned with `walletLabels` — the key the per-wallet
+   *  track record is grouped by. Absent on calls persisted before walletIds existed. */
+  walletIds: string[];
   /** Distinct-wallet repeat signal at alert time (from the repeat counter). */
   repeatCount: number;
   repeatWallets: number;
@@ -60,6 +64,11 @@ interface Bucket {
   bestMaxGainPct: number;
   /** Share that reached the win threshold (%). */
   winRatePct: number;
+}
+
+/** A per-wallet bucket. `label` is display-only and drifts; `walletId` is the stable key. */
+interface WalletBucket extends Bucket {
+  walletId: string;
 }
 
 const gainPct = (entry: number, now: number): number =>
@@ -181,6 +190,7 @@ export class PerformanceTracker extends EventEmitter {
       walletCount: swarm.walletCount,
       walletSummary: swarm.walletSummary,
       walletLabels: swarm.walletLabels,
+      walletIds: swarm.walletIds,
       repeatCount: swarm.repeatCount ?? 1,
       repeatWallets: swarm.repeatWallets ?? swarm.walletCount,
       newHolder: swarm.repeatNewWallet ?? false,
@@ -371,7 +381,7 @@ export class PerformanceTracker extends EventEmitter {
     byConviction: Bucket[];
     byMarketCap: Bucket[];
     byTokenAge: Bucket[];
-    byWallet: Bucket[];
+    byWallet: WalletBucket[];
   } {
     const all = [...this.calls.values()];
     const win = config.PERF_WIN_THRESHOLD_PCT;
@@ -384,10 +394,34 @@ export class PerformanceTracker extends EventEmitter {
     // Not mutually exclusive: a call with 2+ wallets counts in EACH of its
     // wallets' buckets, so "which named wallet actually calls winners" is
     // visible per-wallet rather than only as an aggregate wallet-count stat.
-    const wallets = new Set<string>();
-    for (const c of all) for (const w of c.walletLabels) wallets.add(w);
-    const byWallet = [...wallets]
-      .map((w) => bucket(w, all.filter((c) => c.walletLabels.includes(w)), win))
+    //
+    // Grouped by walletId, NOT by label. Labels are derived from holdings, so keying on them
+    // merged two wallets that happened to share a label and split one wallet's record in half
+    // the moment it bought another coin — either way the per-wallet win rate was wrong.
+    // Calls tracked before walletIds existed have none and are skipped here (their labels can't
+    // be resolved back to a wallet); every other bucket still counts them.
+    const byId = new Map<string, { label: string; labelAt: number; calls: TrackedCall[] }>();
+    for (const c of all) {
+      const ids = c.walletIds ?? [];
+      for (const [i, id] of ids.entries()) {
+        const entry = byId.get(id);
+        const label = c.walletLabels[i] ?? id.slice(0, 6);
+        if (!entry) {
+          byId.set(id, { label, labelAt: c.entryAt, calls: [c] });
+          continue;
+        }
+        entry.calls.push(c);
+        // Labels drift; show the most recent one so the wallet reads as it looks today.
+        // `>=` not `>`: two calls can land in the same millisecond, and on a tie the
+        // later-processed call is the newer one (`calls` iterates in insertion order).
+        if (c.entryAt >= entry.labelAt) {
+          entry.label = label;
+          entry.labelAt = c.entryAt;
+        }
+      }
+    }
+    const byWallet: WalletBucket[] = [...byId.entries()]
+      .map(([walletId, { label, calls }]) => ({ walletId, ...bucket(label, calls, win) }))
       .sort((a, b) => b.count - a.count);
 
     return {

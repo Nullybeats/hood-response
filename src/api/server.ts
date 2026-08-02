@@ -9,6 +9,7 @@ import type { Aggregator } from '../engine/aggregator.js';
 import type { PerformanceTracker } from '../engine/performance.js';
 import type { SniperEngine } from '../sniper/engine.js';
 import { configuredChannels, dispatch } from '../notify/index.js';
+import { walletId } from '../walletId.js';
 import type { Alert, AlertRule, Swarm, SwapEvent, WalletCategory } from '../types.js';
 import { DASHBOARD_HTML } from './dashboard.js';
 
@@ -137,6 +138,9 @@ export async function buildServer(
     // Omit the raw address from the public list; keep label/category/stats.
     return wallets.map(({ address, ...w }) => ({
       ...w,
+      // Opaque stable handle — lets a consumer track one wallet across alerts without the
+      // address. `label` cannot do this: it mutates with holdings and collides across wallets.
+      walletId: walletId(address),
       stats: store.walletStats.get(address) ?? null,
     }));
   });
@@ -426,6 +430,7 @@ export async function buildServer(
       wallets: [],
       walletSummary: '2 alpha · 1 beta',
       walletLabels: ['tendies', 'hmm'],
+      walletIds: ['0000000000000001', '0000000000000002'],
       totalUsd: 4200,
       marketCap: 68_000,
       newToken: false,
@@ -465,6 +470,7 @@ export async function buildServer(
       .map(([address, s]) => {
         const w = store.wallets.get(address);
         return {
+          walletId: walletId(address),
           label: w?.label ?? 'tracked wallet',
           category: w?.category ?? 'unknown',
           ...s,
