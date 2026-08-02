@@ -15,8 +15,11 @@ coverage/
 .bak-*/
 .fee-backup/
 
-# runtime state — per-tenant positions, journals, sqlite, overrides
-data/
+# runtime state — per-tenant positions, journals, sqlite, overrides.
+# Anchored to the repo ROOT: a bare `data/` also matches `src/data/`, which holds the tracked
+# seed + generated holders. `railway up` honours .gitignore, so the bare pattern silently stripped
+# src/data from the feed's build context and broke it with "Cannot find module '../data/seed.js'".
+/data/
 sniper-store*.json
 sniper-owners.json
 *.jsonl
