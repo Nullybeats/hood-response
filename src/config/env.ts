@@ -343,6 +343,43 @@ if (!parsed.success) {
 
 const env = parsed.data;
 
+/**
+ * Metered-RPC guard for the LISTENER lanes.
+ *
+ * The chain listener runs forever. The WS variant subscribes to `newHeads`, which bills one
+ * delivery per block — ~36k blocks/hour on this 0.1s chain — and the HTTP variant polls
+ * `eth_getLogs` on a loop. Pointing either at a metered provider silently turns a background loop
+ * into a monthly bill: on 2026-08-01 a 16-minute run with CHAIN_WS_URL on Alchemy burned 627,535
+ * compute units, a ~$200/month run-rate. Only SNIPER_EXECUTOR_RPC may be metered — tx SENDS need a
+ * reliable node because the public one 429s under execution.
+ *
+ * So a listener URL on a known metered host is dropped and replaced with the free public node.
+ * Loud, never fatal: an RPC misconfiguration must not stop the sniper from booting.
+ */
+const PUBLIC_CHAIN_RPC = 'https://rpc.mainnet.chain.robinhood.com';
+const METERED_RPC_HOST =
+  /(^|\.)(alchemy\.com|alchemyapi\.io|quiknode\.pro|quicknode\.com|infura\.io|ankr\.com|chainstack\.com|blastapi\.io|nodereal\.io)$/i;
+/** Host only — never log the full URL, it carries the API key. */
+const rpcHost = (url: string): string => {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return '<unparseable>';
+  }
+};
+const rejectMeteredListenerRpc = (url: string, name: string, fallback: string): string => {
+  if (!url || !METERED_RPC_HOST.test(rpcHost(url))) return url;
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[env] ${name}=${rpcHost(url)} is a METERED RPC — ignoring it. The chain listener runs forever ` +
+      `and would bill every block/log. Falling back to ${fallback || '(no ws listener)'}. ` +
+      `Put the metered node in SNIPER_EXECUTOR_RPC instead — only tx sends belong on the meter.`,
+  );
+  return fallback;
+};
+env.CHAIN_WS_URL = rejectMeteredListenerRpc(env.CHAIN_WS_URL, 'CHAIN_WS_URL', '');
+env.CHAIN_HTTP_URL = rejectMeteredListenerRpc(env.CHAIN_HTTP_URL, 'CHAIN_HTTP_URL', PUBLIC_CHAIN_RPC);
+
 /** Resolve the effective data source once, so the rest of the app is simple. */
 const hasLiveSource = env.CHAIN_WS_URL.length > 0 || env.CHAIN_HTTP_URL.length > 0;
 const chainMode: 'live' | 'simulator' =
