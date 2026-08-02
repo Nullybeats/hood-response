@@ -142,13 +142,29 @@ export interface RoundTrip {
   poolLiquidity: number | null;
 }
 
+/** The venue that won the quote race, and the quote that won it. Both the gate
+ *  and the trade consume THIS — one routing decision per trade, so the pool we
+ *  price can never differ from the pool we execute against. */
+export interface VenueQuote {
+  venue: 'v4' | 'v3';
+  /** v4 only: the exact PoolKey to execute against. */
+  pool?: ResolvedPool;
+  /** The winning pool's fee, in hundredths of a bip (v4) or v3 tier units. */
+  fee?: number;
+  /** Tokens out when buying, ETH wei out when selling. */
+  amountOut: bigint;
+  /** Buys only: ETH wei recovered by selling `amountOut` straight back on this
+   *  same venue. This is what a buy is RANKED on — see pickBestQuote. */
+  ethBack?: bigint;
+}
+
 /** gasUsed × effective gas price, in ETH — the real network fee for a tx. */
 function gasCostEth(receipt: { gasUsed: bigint; gasPrice: bigint }): number {
   return Number(formatEther(receipt.gasUsed * receipt.gasPrice));
 }
 
 /** A token's resolved v4 pool: the exact key plus which side the token is. */
-interface ResolvedPool {
+export interface ResolvedPool {
   currency0: string;
   currency1: string;
   fee: number;
@@ -194,6 +210,65 @@ export function checkPriceSanity(
   return `quoted price is ${off} than market — refusing ${action} (likely a bad/decoy pool)`;
 }
 
+/**
+ * Choose between quoted venues. Pure, so the decoy cases that motivated it are
+ * unit-testable without a chain — same reasoning as checkPriceSanity above.
+ *
+ * A BUY is ranked on `ethBack` (what the round trip returns), NOT on tokens
+ * out, and that distinction is the whole point. A decoy pool prices the token
+ * far below market, so its buy quote stays competitive even behind a 95% fee —
+ * IOU's decoy quoted 0.81× the real pool's tokens, so ranking on output alone
+ * it loses by only 19%, and a decoy priced slightly cheaper would have WON and
+ * left us holding tokens we could not sell. Priced on the round trip the same
+ * two pools separate by ~45× (−100% vs −2.19%), because a pool you cannot exit
+ * returns nothing by definition. Rank on the number that encodes tradeability.
+ *
+ * A SELL has no round trip to price — it is ranked on ETH out directly.
+ *
+ * Price sanity is a FILTER, not a veto: buyV4 throws on an insane quote because
+ * it has already committed to one pool, whereas the router just drops that
+ * candidate and keeps looking, so one bad pool cannot sink the trade. If it
+ * rejects everything we fall back to the raw best rather than refusing —
+ * a stale DexScreener price must not be able to ground the sniper.
+ */
+export function pickBestQuote(
+  quotes: VenueQuote[],
+  opts: {
+    amountIn: bigint;
+    decimals: number;
+    direction: 'buy' | 'sell';
+    expectedPriceEth?: number | null;
+  },
+): { pick: VenueQuote | null; rejectedBySanity: number } {
+  const { amountIn, decimals, direction, expectedPriceEth } = opts;
+  const buying = direction === 'buy';
+  if (quotes.length === 0) return { pick: null, rejectedBySanity: 0 };
+
+  const sane =
+    expectedPriceEth != null && expectedPriceEth > 0
+      ? quotes.filter((q) => {
+          const tokens = Number(formatUnits(buying ? q.amountOut : amountIn, decimals));
+          const eth = Number(formatEther(buying ? amountIn : q.amountOut));
+          if (!(tokens > 0) || !(eth > 0)) return false;
+          return checkPriceSanity(eth / tokens, expectedPriceEth, PRICE_SANITY_MULTIPLE, direction) === null;
+        })
+      : quotes;
+
+  const pool = sane.length > 0 ? sane : quotes;
+  const score = (q: VenueQuote): bigint => (buying ? (q.ethBack ?? 0n) : q.amountOut);
+  const pick = pool.reduce<VenueQuote | null>((best, q) => {
+    if (best === null) return q;
+    const [a, b] = [score(q), score(best)];
+    // Ties (e.g. every exit quote failed and scored 0n) fall back to raw output,
+    // so a chain hiccup on the sell leg degrades to the old behaviour, not to
+    // an arbitrary pick.
+    if (a > b) return q;
+    if (a === b && q.amountOut > best.amountOut) return q;
+    return best;
+  }, null);
+  return { pick, rejectedBySanity: quotes.length - sane.length };
+}
+
 const keyTuple = (p: ResolvedPool) =>
   [p.currency0, p.currency1, p.fee, p.tickSpacing, p.hooks] as const;
 
@@ -219,6 +294,14 @@ export class SwapExecutor {
   private readonly pools = new Map<string, ResolvedPool>();
   /** token → its best v3 fee tier, or null when no v3 pool exists at all. */
   private readonly v3Pools = new Map<string, { fee: number } | null>();
+  /** token → EVERY eth-paired v4 pool it has. The candidate SET, cached because
+   *  the Initialize log scan walks all history; the pick is never cached, since
+   *  which pool wins depends on size and on current state. */
+  private readonly v4Candidates = new Map<string, ResolvedPool[]>();
+  /** token → every v3 fee tier with a live pool. Same reasoning as above. */
+  private readonly v3Candidates = new Map<string, number[]>();
+  /** token → ERC-20 decimals. Read once; needed on every price-sanity check. */
+  private readonly decimals = new Map<string, number>();
 
   private key(): string {
     // Server keys must be explicitly unlocked from the encrypted keystore.
@@ -297,11 +380,16 @@ export class SwapExecutor {
 
   // ── Pool discovery ──────────────────────────────────────────────────────────
 
-  /** Resolve a pool from the PoolManager's Initialize event (the definitive
-   *  source — every v4 pool emits its full PoolKey at creation). Prefers a pool
-   *  paired with WETH or native ETH when a token has several. */
-  private async resolveFromInitEvent(token: string): Promise<ResolvedPool | null> {
-    if (!this.provider) return null;
+  /** EVERY eth-paired v4 pool for this token, from the PoolManager's Initialize
+   *  events (the definitive source — every v4 pool emits its full PoolKey at
+   *  creation). Returns the whole candidate SET deliberately: choosing between
+   *  them belongs to the router, which chooses by quoting them, not by ranking
+   *  them on a proxy metric. Cached — the scan walks all history. */
+  private async enumerateV4Pools(token: string): Promise<ResolvedPool[]> {
+    const cacheKey = token.toLowerCase();
+    const memo = this.v4Candidates.get(cacheKey);
+    if (memo) return memo;
+    if (!this.provider) return [];
     const t = getAddress(token);
     const padded = zeroPadValue(t, 32);
     const weth = getAddress(config.SNIPER_WETH);
@@ -341,7 +429,7 @@ export class SwapExecutor {
         }
       }
     }
-    if (found.length === 0) return null;
+    if (found.length === 0) return [];
     // Only ETH/WETH-paired pools are buyable with a single-hop ETH swap.
     const ethPaired = found.filter((p) => p.ethCurrency === weth || p.ethCurrency === ZeroAddress);
     if (ethPaired.length === 0) {
@@ -349,14 +437,20 @@ export class SwapExecutor {
         `token has a pool but it's not ETH/WETH-paired (vs ${found[0]!.ethCurrency.slice(0, 10)}…) — can't buy with ETH`,
       );
     }
-    // A token can have several ETH-paired pools (fee-tier variants, or — seen
-    // in the wild — near-empty decoy pools created after the real one). The
-    // most-recently-initialized pool is NOT a reliable proxy for "the real
-    // one": pick by actual on-chain liquidity instead, so a fresh junk pool
-    // can never outrank the pool that's actually being traded.
+    this.v4Candidates.set(cacheKey, ethPaired);
+    return ethPaired;
+  }
+
+  /** Legacy single-pool resolution, kept for the paths that genuinely need one
+   *  pool and have no amount to quote with (prepareExit's warm-up,
+   *  protocolFeeInfo's fee read). Everything that spends or prices money goes
+   *  through bestVenue() instead — see the note on deepestPool. */
+  private async resolveFromInitEvent(token: string): Promise<ResolvedPool | null> {
+    const ethPaired = await this.enumerateV4Pools(token);
+    if (ethPaired.length === 0) return null;
     const pick = await this.deepestPool(ethPaired);
     logger.info(
-      { token, pool: { fee: pick.fee, tickSpacing: pick.tickSpacing, hooks: pick.hooks, eth: pick.ethCurrency }, pools: found.length, candidates: ethPaired.length },
+      { token, pool: { fee: pick.fee, tickSpacing: pick.tickSpacing, hooks: pick.hooks, eth: pick.ethCurrency }, candidates: ethPaired.length },
       'sniper: pool resolved from Initialize event',
     );
     return pick;
@@ -365,7 +459,16 @@ export class SwapExecutor {
   /** Pick the candidate with the most on-chain liquidity right now (0 for any
    *  that fail to read). Falls back to the last candidate only if every read
    *  fails or ties at zero, so a single flaky RPC call can't wrongly demote
-   *  the real pool. */
+   *  the real pool.
+   *
+   *  NOT a venue-selection metric, and never use it as one. Raw uint128 L is
+   *  depth measured at each pool's OWN current price, so it isn't comparable
+   *  between pools sitting at different prices — and it says nothing at all
+   *  about fee. IOU (2026-08-02) had three eth-paired v4 pools charging 95.01%,
+   *  99.88% and 75%; this function correctly returned the deepest of them and
+   *  the sniper then priced a round trip at −100% and skipped a token that was
+   *  perfectly tradeable at 2.19% on v3. Depth alone cannot see that. Only a
+   *  quote can, which is what bestVenue() does. */
   private async deepestPool(candidates: ResolvedPool[]): Promise<ResolvedPool> {
     if (candidates.length === 1) return candidates[0]!;
     const sv = new Contract(STATE_VIEW, STATE_VIEW_ABI, this.provider!);
@@ -402,6 +505,166 @@ export class SwapExecutor {
     }
   }
 
+  /** ERC-20 decimals, read once per token. Needed on every price-sanity check,
+   *  and it never changes. */
+  private async decimalsOf(token: string): Promise<number> {
+    const key = token.toLowerCase();
+    const memo = this.decimals.get(key);
+    if (memo !== undefined) return memo;
+    const token20 = new Contract(token, ERC20_ABI, this.wallet!);
+    const d = Number((await token20.getFunction('decimals')()) as bigint);
+    this.decimals.set(key, d);
+    return d;
+  }
+
+  /** Every v3 fee tier with a live eth-paired pool. The SET, like
+   *  enumerateV4Pools — the winner is decided by quoting, not by liquidity. */
+  private async enumerateV3Fees(token: string): Promise<number[]> {
+    const cacheKey = token.toLowerCase();
+    const memo = this.v3Candidates.get(cacheKey);
+    if (memo) return memo;
+    const weth = getAddress(config.SNIPER_WETH);
+    const t = getAddress(token);
+    const factory = new Contract(V3_FACTORY, V3_FACTORY_ABI, this.provider!);
+    const live = await Promise.all(
+      V3_FEE_TIERS.map(async (fee) => {
+        try {
+          const addr = (await factory.getFunction('getPool')(t, weth, fee)) as string;
+          if (!addr || addr === ZeroAddress) return null;
+          const liq = (await new Contract(addr, V3_POOL_ABI, this.provider!).getFunction('liquidity')()) as bigint;
+          return liq > 0n ? fee : null;
+        } catch {
+          return null;
+        }
+      }),
+    );
+    const fees = live.filter((f): f is number => f !== null);
+    this.v3Candidates.set(cacheKey, fees);
+    return fees;
+  }
+
+  /**
+   * Smart order routing, the standard way: enumerate every venue the token has
+   * (v4 pools + v3 fee tiers), quote them ALL concurrently at the real trade
+   * size, and take whichever actually returns the most — gated on a price
+   * sanity check against the token's known market price where we have one.
+   *
+   * The point is that the winner is decided by the quote and nothing else. The
+   * previous design picked a pool by a proxy metric (deepest L) and then quoted
+   * only that pool, which is unrecoverable when the proxy is wrong: on
+   * 2026-08-02 IOU resolved to a 95%-fee decoy, priced at −100%, and was
+   * skipped despite trading fine at 2.19% on v3 — and HMN the day before, the
+   * same way. Quoting everything makes a decoy lose on its own numbers, so it
+   * needs no detection, no blacklist, and no market-price feed to beat.
+   *
+   * `amountIn` is ETH wei when buying and token base units when selling.
+   * Returns null when nothing quotes — callers treat that as fail-closed.
+   */
+  async bestVenue(
+    token: string,
+    amountIn: bigint,
+    direction: 'buy' | 'sell',
+    poolIdHint?: string | null,
+    expectedPriceEth?: number | null,
+  ): Promise<VenueQuote | null> {
+    this.init();
+    if (!this.wallet || amountIn <= 0n) return null;
+    const buying = direction === 'buy';
+    const weth = getAddress(config.SNIPER_WETH);
+    const t = getAddress(token);
+
+    const [v4Pools, v3Fees, decimals] = await Promise.all([
+      this.enumerateV4Pools(token).catch(() => [] as ResolvedPool[]),
+      this.enumerateV3Fees(token).catch(() => [] as number[]),
+      this.decimalsOf(token).catch(() => 18),
+    ]);
+    // A hinted pool the log scan somehow missed still deserves a quote.
+    const hinted = await this.hintedV4Pool(token, poolIdHint);
+    const pools = hinted && !v4Pools.some((p) => poolIdOf(p) === poolIdOf(hinted)) ? [...v4Pools, hinted] : v4Pools;
+    if (pools.length === 0 && v3Fees.length === 0) return null;
+
+    const quotes = await Promise.all([
+      ...pools.map(async (pool): Promise<VenueQuote | null> => {
+        try {
+          const out = await this.quoteOut(pool, amountIn, buying);
+          if (out <= 0n) return null;
+          // Buying: also price the exit, concurrently-cheap and decisive (below).
+          const ethBack = buying ? await this.quoteOut(pool, out, false).catch(() => 0n) : undefined;
+          return { venue: 'v4', pool, fee: pool.fee, amountOut: out, ethBack };
+        } catch {
+          return null;
+        }
+      }),
+      ...v3Fees.map(async (fee): Promise<VenueQuote | null> => {
+        try {
+          const out = buying
+            ? await this.quoteV3(weth, t, fee, amountIn)
+            : await this.quoteV3(t, weth, fee, amountIn);
+          if (out <= 0n) return null;
+          const ethBack = buying ? await this.quoteV3(t, weth, fee, out).catch(() => 0n) : undefined;
+          return { venue: 'v3', fee, amountOut: out, ethBack };
+        } catch {
+          return null;
+        }
+      }),
+    ]);
+
+    const priced = quotes.filter((q): q is VenueQuote => q !== null);
+    const { pick, rejectedBySanity } = pickBestQuote(priced, {
+      amountIn,
+      decimals,
+      direction,
+      expectedPriceEth,
+    });
+    if (!pick) return null;
+    if (priced.length > 1) {
+      logger.info(
+        {
+          token,
+          direction,
+          chose: pick.venue,
+          fee: pick.fee,
+          candidates: priced.map((q) => ({
+            venue: q.venue,
+            fee: q.fee,
+            out: q.amountOut.toString(),
+            ethBack: q.ethBack?.toString(),
+          })),
+          rejectedBySanity,
+        },
+        'sniper: venue chosen by quote',
+      );
+    }
+    return pick;
+  }
+
+  /** The DexScreener pool-id hint as a v4 PoolKey, when it is one. A v3 pair is
+   *  a 20-byte address and simply isn't resolvable here — that shape is covered
+   *  by enumerateV3Fees, which is exactly the gap that hid IOU's real pool. */
+  private async hintedV4Pool(token: string, poolIdHint?: string | null): Promise<ResolvedPool | null> {
+    if (!poolIdHint || !/^0x[0-9a-fA-F]{64}$/.test(poolIdHint)) return null;
+    try {
+      const posm = new Contract(POSITION_MANAGER, POSM_ABI, this.provider!);
+      const [c0, c1, fee, tickSpacing, hooks] = (await posm.getFunction('poolKeys')(
+        dataSlice(poolIdHint, 0, 25),
+      )) as [string, string, bigint, bigint, string];
+      const t = getAddress(token);
+      if (getAddress(c0) !== t && getAddress(c1) !== t) return null;
+      const tokenIs0 = getAddress(c0) === t;
+      return {
+        currency0: getAddress(c0),
+        currency1: getAddress(c1),
+        fee: Number(fee),
+        tickSpacing: Number(tickSpacing),
+        hooks: getAddress(hooks),
+        ethCurrency: tokenIs0 ? getAddress(c1) : getAddress(c0),
+        tokenIs0,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Round-trip preview: quote buying `ethAmount` of `token`, then quote selling
    * those exact tokens straight back. The gap is the true floor cost of a trade
@@ -414,50 +677,33 @@ export class SwapExecutor {
     token: string,
     ethAmount: number,
     poolIdHint?: string | null,
+    expectedPriceEth?: number | null,
   ): Promise<RoundTrip | null> {
     this.init();
     if (!this.wallet) return null;
     const amountIn = parseEther(ethAmount.toString());
-    // v4 first (the venue we'll almost always trade), then v3 fallback.
-    try {
-      const pool = await this.resolvePool(token, poolIdHint);
-      const tokensOut = await this.quoteOut(pool, amountIn, true);
-      if (tokensOut <= 0n) throw new Error('zero buy quote');
-      const ethBackWei = await this.quoteOut(pool, tokensOut, false);
-      const liq = await this.readLiquidity(pool);
-      const ethIn = Number(formatEther(amountIn));
-      const ethBack = Number(formatEther(ethBackWei));
-      return {
-        venue: 'v4',
-        ethIn,
-        quotedTokens: Number(tokensOut),
-        ethBack,
-        lossPct: ethIn > 0 ? (1 - ethBack / ethIn) * 100 : 100,
-        poolLiquidity: liq > 0n ? Number(liq) : null,
-      };
-    } catch {
-      const v3 = await this.resolveV3Pool(token).catch(() => null);
-      if (!v3) return null;
-      try {
-        const weth = getAddress(config.SNIPER_WETH);
-        const t = getAddress(token);
-        const tokensOut = await this.quoteV3(weth, t, v3.fee, amountIn);
-        if (tokensOut <= 0n) return null;
-        const ethBackWei = await this.quoteV3(t, weth, v3.fee, tokensOut);
-        const ethIn = Number(formatEther(amountIn));
-        const ethBack = Number(formatEther(ethBackWei));
-        return {
-          venue: 'v3',
-          ethIn,
-          quotedTokens: Number(tokensOut),
-          ethBack,
-          lossPct: ethIn > 0 ? (1 - ethBack / ethIn) * 100 : 100,
-          poolLiquidity: null,
-        };
-      } catch {
-        return null;
-      }
-    }
+    // Route first, THEN price the round trip on whatever won. Previously this
+    // measured a single v4 pool chosen by depth and reported its round trip as
+    // the token's — which is how a 95%-fee decoy got to veto IOU and HMN.
+    const entry = await this.bestVenue(token, amountIn, 'buy', poolIdHint, expectedPriceEth);
+    if (!entry || entry.amountOut <= 0n) return null;
+    const tokensOut = entry.amountOut;
+    // The router already priced the exit on this same venue to rank it, so the
+    // round trip costs no extra call here — and it is by construction the round
+    // trip of the pool we would actually trade, not of some other pool.
+    if (entry.ethBack === undefined) return null;
+    const ethBackWei = entry.ethBack;
+    const liq = entry.venue === 'v4' ? await this.readLiquidity(entry.pool!) : 0n;
+    const ethIn = Number(formatEther(amountIn));
+    const ethBack = Number(formatEther(ethBackWei));
+    return {
+      venue: entry.venue,
+      ethIn,
+      quotedTokens: Number(tokensOut),
+      ethBack,
+      lossPct: ethIn > 0 ? (1 - ethBack / ethIn) * 100 : 100,
+      poolLiquidity: liq > 0n ? Number(liq) : null,
+    };
   }
 
   /** True when this pool id is initialized on the PoolManager. */
@@ -649,6 +895,19 @@ export class SwapExecutor {
   ): Promise<BuyResult> {
     this.init();
     if (!this.wallet) throw new Error('sniper wallet not configured');
+    const amountIn = parseEther(ethAmount.toString());
+    const best = await this.bestVenue(token, amountIn, 'buy', poolIdHint, expectedPriceEth).catch(() => null);
+    if (best) {
+      try {
+        return best.venue === 'v4'
+          ? await this.buyV4(token, ethAmount, poolIdHint, expectedPriceEth, best.pool)
+          : await this.buyV3(token, ethAmount, expectedPriceEth, best.fee!);
+      } catch (err) {
+        // The router's pick failed to execute (reverted, or moved under us).
+        // Fall through to the legacy try-both path rather than abandon the buy.
+        logger.warn({ token, venue: best.venue, err: shortErr(err) }, 'sniper: routed venue failed, retrying both');
+      }
+    }
     try {
       return await this.buyV4(token, ethAmount, poolIdHint, expectedPriceEth);
     } catch (v4Err) {
@@ -664,8 +923,9 @@ export class SwapExecutor {
     ethAmount: number,
     poolIdHint: string | null | undefined,
     expectedPriceEth: number | null | undefined,
+    routed?: ResolvedPool,
   ): Promise<BuyResult> {
-    const pool = await this.resolvePool(token, poolIdHint);
+    const pool = routed ?? (await this.resolvePool(token, poolIdHint));
     const amountIn = parseEther(ethAmount.toString());
     const token20 = new Contract(token, ERC20_ABI, this.wallet!);
     const decimals = Number((await token20.getFunction('decimals')()) as bigint);
@@ -863,6 +1123,18 @@ export class SwapExecutor {
   async valueInEth(token: string, poolIdHint?: string | null): Promise<{ tokens: number; ethOut: number }> {
     this.init();
     if (!this.wallet) throw new Error('sniper wallet not configured');
+    // This is the position MARK — it drives trailing stops, recoup and every
+    // PnL number on the page. Marking against a decoy pool is how a healthy
+    // position gets stopped out on a price that exists nowhere real, so it gets
+    // the same routing as a trade: quote every venue, mark on the best.
+    const token20 = new Contract(token, ERC20_ABI, this.wallet);
+    const bal = (await token20.getFunction('balanceOf')(this.wallet.address)) as bigint;
+    if (bal <= 0n) throw new Error('wallet holds none of this token');
+    const best = await this.bestVenue(token, bal, 'sell', poolIdHint).catch(() => null);
+    if (best && best.amountOut > 0n) {
+      const decimals = await this.decimalsOf(token);
+      return { tokens: Number(formatUnits(bal, decimals)), ethOut: Number(formatEther(best.amountOut)) };
+    }
     try {
       return await this.valueInEthV4(token, poolIdHint);
     } catch (v4Err) {
@@ -944,6 +1216,20 @@ export class SwapExecutor {
   ): Promise<SellResult> {
     this.init();
     if (!this.wallet) throw new Error('sniper wallet not configured');
+    // Route the exit the same way as the entry. Getting this wrong is worse
+    // than a missed buy: a position whose real market is v3 would try v4 first
+    // and only reach v3 after a failed attempt — burning gas, and burning the
+    // seconds that decide what a trailing stop actually realizes.
+    const best = await this.sellVenue(token, expectedPriceEth, maxTokens, maxTokensRaw);
+    if (best) {
+      try {
+        return best.venue === 'v4'
+          ? await this.sellV4(token, poolIdHint, expectedPriceEth, maxTokens, maxTokensRaw, best.pool)
+          : await this.sellV3(token, expectedPriceEth, best.fee!, maxTokens, maxTokensRaw);
+      } catch (err) {
+        logger.warn({ token, venue: best.venue, err: shortErr(err) }, 'sniper: routed sell venue failed, retrying both');
+      }
+    }
     try {
       return await this.sellV4(token, poolIdHint, expectedPriceEth, maxTokens, maxTokensRaw);
     } catch (v4Err) {
@@ -951,6 +1237,27 @@ export class SwapExecutor {
       if (!v3) throw v4Err;
       logger.warn({ token, v4Err: shortErr(v4Err), fee: v3.fee }, 'sniper: v4 sell unavailable, trying v3');
       return await this.sellV3(token, expectedPriceEth, v3.fee, maxTokens, maxTokensRaw);
+    }
+  }
+
+  /** Route an exit: quote every venue for the exact size we're about to sell.
+   *  Best-effort — a null just means the caller uses the legacy try-both path. */
+  private async sellVenue(
+    token: string,
+    expectedPriceEth?: number | null,
+    maxTokens?: number,
+    maxTokensRaw?: string,
+  ): Promise<VenueQuote | null> {
+    try {
+      const token20 = new Contract(token, ERC20_ABI, this.wallet!);
+      const held = (await token20.getFunction('balanceOf')(this.wallet!.address)) as bigint;
+      if (held <= 0n) return null;
+      const decimals = await this.decimalsOf(token);
+      const amount = this.cappedSellAmount(held, decimals, maxTokens, maxTokensRaw);
+      if (amount <= 0n) return null;
+      return await this.bestVenue(token, amount, 'sell', null, expectedPriceEth);
+    } catch {
+      return null;
     }
   }
 
@@ -1011,8 +1318,9 @@ export class SwapExecutor {
     expectedPriceEth: number | null | undefined,
     maxTokens: number | undefined,
     maxTokensRaw: string | undefined,
+    routed?: ResolvedPool,
   ): Promise<SellResult> {
-    const pool = await this.resolvePool(token, poolIdHint);
+    const pool = routed ?? (await this.resolvePool(token, poolIdHint));
     const token20 = new Contract(token, ERC20_ABI, this.wallet!);
     const bal = (await token20.getFunction('balanceOf')(this.wallet!.address)) as bigint;
     if (bal <= 0n) throw new Error('no token balance to sell');

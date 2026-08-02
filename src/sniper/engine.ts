@@ -534,6 +534,12 @@ export class SniperEngine {
       return this.decide(swarm, 'skipped', 'daily spend cap reached');
     }
 
+    // The alert's own market price, in ETH. Derived HERE rather than after the gate (where it used to
+    // live) so the depth gate can hand it to the router as a sanity reference — a preview measured on
+    // a pool priced nowhere near the real market is measuring the wrong pool, not a thin token.
+    const ethUsd = this.price.ethUsdPrice();
+    const expectedPriceEth = ethUsd && ethUsd > 0 ? entryPrice / ethUsd : null;
+
     // Honeypot gate + depth gate run CONCURRENTLY (independent, both fail-closed): the honeypot sim and
     // the round-trip route quote don't depend on each other, so awaiting them together shaves a network
     // round-trip off the entry path. Timings recorded so we can see which stage dominates.
@@ -542,7 +548,9 @@ export class SniperEngine {
       this.settings.requireSafe
         ? this.safety.check(swarm.token, this.price.liquidityOf(swarm.token)).catch(() => null)
         : Promise.resolve('skip' as const),
-      this.executor.previewRoundTrip(swarm.token, size, this.price.pairIdOf(swarm.token)).catch(() => null),
+      this.executor
+        .previewRoundTrip(swarm.token, size, this.price.pairIdOf(swarm.token), expectedPriceEth)
+        .catch(() => null),
     ]);
     const gateMs = Date.now() - gateStart; // combined safety+preview wall time (they ran in parallel)
     // Honeypot / sellability — never buy what we can't sell (the −100% trap).
@@ -554,12 +562,16 @@ export class SniperEngine {
     // moves. Refuse pools we couldn't exit cleanly (the BURN −22.8% failure mode).
     if (!roundTrip) return this.decide(swarm, 'skipped', 'on-chain route quote unavailable (fail closed)');
     if (this.settings.maxRoundtripPct > 0 && roundTrip.lossPct > this.settings.maxRoundtripPct) {
-      return this.decide(swarm, 'skipped', `too thin: round-trip −${roundTrip.lossPct.toFixed(0)}% > ${this.settings.maxRoundtripPct}% cap`);
+      // Name the venue. A bare "round-trip −100%" reads as "toxic token" when it can equally mean
+      // "measured the wrong pool" — which is exactly what it meant for IOU and HMN on 2026-08-01/02.
+      return this.decide(
+        swarm,
+        'skipped',
+        `too thin: round-trip −${roundTrip.lossPct.toFixed(0)}% on ${roundTrip.venue} > ${this.settings.maxRoundtripPct}% cap`,
+      );
     }
 
     try {
-      const ethUsd = this.price.ethUsdPrice();
-      const expectedPriceEth = ethUsd && ethUsd > 0 ? entryPrice / ethUsd : null;
       const submitStart = Date.now();
       const res = await this.executor.buy(swarm.token, size, this.price.pairIdOf(swarm.token), expectedPriceEth);
       const filledAt = Date.now();
