@@ -268,7 +268,13 @@ const schema = z.object({
   // /events and acts ONLY on the coins it calls; it never originates a buy from
   // this box engine's own local alert generation (that divergence bought PIPEDOG,
   // a coin the feed never surfaced). Blank = sniper receives no alerts.
-  SNIPER_FEED_URL: z.string().default('https://hood-response-production.up.railway.app'),
+  // NO default. A hardcoded fallback here pointed at a DEAD Railway instance
+  // (hood-response-production.up.railway.app, the expired-trial one) long after the feed moved to
+  // …-7a7e. Any deployment that didn't set it explicitly silently subscribed to a corpse and
+  // reconnect-looped on 404 every 30s — and would have consumed a stale instance's alerts if that
+  // host ever answered. Empty means "no feed", which FeedSubscriber.start() handles by no-oping;
+  // the box sets this explicitly in its .env.
+  SNIPER_FEED_URL: z.string().default(''),
   // Watchdog: if the feed delivers no bytes for this many seconds while we believe
   // we're connected, force a reconnect and fire a 'feed-dead' health alert (a
   // silently-dead feed = a dark bot). Recovery fires 'feed-recovered'.
