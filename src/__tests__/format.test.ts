@@ -7,6 +7,8 @@ import {
   milestoneHeadline,
   milestoneTextBody,
   milestoneTelegramHtml,
+  resultFooter,
+  telegramHtmlWithResult,
 } from '../notify/format.js';
 import type { Swarm } from '../types.js';
 import type { TrackedCall } from '../engine/performance.js';
@@ -160,5 +162,38 @@ describe('PnL milestone cards', () => {
   it('omits the "called by" line when there are no wallet labels', () => {
     const call = trackedCall({ walletLabels: [] });
     expect(milestoneTextBody(call, 50, 'x')).not.toContain('Called by');
+  });
+});
+
+describe('result footer (the running result edited onto the alert card)', () => {
+  const now = Date.now();
+
+  it('shows the current return, the market cap move, and how long it has run', () => {
+    const call = trackedCall({ entryAt: now - 2 * 3_600_000 });
+    const footer = resultFooter(call, now);
+    expect(footer).toContain('Now +50%');
+    expect(footer).toContain('$60.0k → $90.0k');
+    expect(footer).toContain('2h');
+  });
+
+  it('adds the peak only once the call has come off it', () => {
+    // At its peak: repeating the same number twice reads as noise.
+    expect(resultFooter(trackedCall(), now)).not.toContain('peak');
+    // Pulled back from +120% to +30%: the peak is now the interesting part.
+    const off = trackedCall({ lastGainPct: 30, maxGainPct: 120 });
+    expect(resultFooter(off, now)).toContain('peak +120%');
+  });
+
+  it('reads as final once tracking has closed, and signs a loss', () => {
+    const done = trackedCall({ closed: true, lastGainPct: -22, maxGainPct: -22 });
+    const footer = resultFooter(done, now);
+    expect(footer).toContain('Final -22%');
+    expect(footer).not.toContain('Now');
+  });
+
+  it('appends to the original card rather than replacing it', () => {
+    const html = telegramHtmlWithResult('<b>SWARM THE FLY</b>', trackedCall(), now);
+    expect(html.startsWith('<b>SWARM THE FLY</b>')).toBe(true);
+    expect(html).toContain('Now +50%');
   });
 });

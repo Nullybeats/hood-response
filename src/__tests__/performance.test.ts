@@ -70,6 +70,47 @@ describe('PerformanceTracker', () => {
     expect(call.lastGainPct).toBe(50);
   });
 
+  it('only emits a card refresh once a call has an alert card bound to it', async () => {
+    const prices: Record<string, number> = { '0xtok': 1 };
+    const perf = new PerformanceTracker(stubPrice(prices));
+    const s = swarm({ token: '0xtok', priceUsd: 1 });
+    perf.track(s);
+    const seen: number[] = [];
+    perf.on('card', ({ call }: { call: { lastGainPct: number } }) => seen.push(call.lastGainPct));
+
+    // No message id yet — nothing to edit, so a big move must stay silent.
+    // @ts-expect-error exercise the private sampler directly.
+    prices['0xtok'] = 2; await perf.sample();
+    expect(seen).toEqual([]);
+
+    perf.attachTelegramCard(s.id, 4242, '<b>card</b>');
+    // @ts-expect-error
+    prices['0xtok'] = 3; await perf.sample(); // +200%
+    expect(seen).toEqual([200]);
+  });
+
+  it('spends an edit only when the number a reader sees actually moves', async () => {
+    const prices: Record<string, number> = { '0xtok': 1 };
+    const perf = new PerformanceTracker(stubPrice(prices));
+    const s = swarm({ token: '0xtok', priceUsd: 1 });
+    perf.track(s);
+    perf.attachTelegramCard(s.id, 1, '<b>card</b>');
+    const seen: number[] = [];
+    perf.on('card', ({ call }: { call: { lastGainPct: number } }) => seen.push(call.lastGainPct));
+
+    // @ts-expect-error exercise the private sampler directly.
+    prices['0xtok'] = 1.5; await perf.sample(); // +50% — worth showing
+    expect(seen).toEqual([50]);
+
+    // @ts-expect-error
+    prices['0xtok'] = 1.53; await perf.sample(); // +53% — 3 points, below the threshold
+    expect(seen).toEqual([50]);
+
+    // @ts-expect-error
+    prices['0xtok'] = 1.65; await perf.sample(); // +65% — 15 points on, edit again
+    expect(seen).toEqual([50, 65]);
+  });
+
   it('emits a milestone event the first time peak crosses each 50% interval', async () => {
     const prices: Record<string, number> = { '0xtok': 1 };
     const perf = new PerformanceTracker(stubPrice(prices));

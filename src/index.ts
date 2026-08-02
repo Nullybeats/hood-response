@@ -7,7 +7,12 @@ import { Aggregator } from './engine/aggregator.js';
 import { AlertEngine } from './engine/alertEngine.js';
 import { attachPersistence } from './store/persistence.js';
 import { buildServer } from './api/server.js';
-import { configuredChannels, dispatchMilestone } from './notify/index.js';
+import {
+  configuredChannels,
+  dispatchMilestone,
+  editAlertResult,
+  onAlertCardSent,
+} from './notify/index.js';
 import { SafetyChecker } from './chain/safety.js';
 import { PerformanceTracker, type TrackedCall } from './engine/performance.js';
 import { SniperRegistry } from './sniper/registry.js';
@@ -49,6 +54,16 @@ async function main(): Promise<void> {
   performance.start();
   performance.on('milestone', ({ call, milestonePct }: { call: TrackedCall; milestonePct: number }) => {
     void dispatchMilestone(call, milestonePct, price.dexUrl(call.token));
+  });
+  // The Telegram channel is alerts only: a call's result is edited onto its own
+  // alert card rather than posted as a separate milestone message. These two
+  // hooks are the round trip — remember the message we sent, then update it.
+  onAlertCardSent((swarmId, messageId, cardHtml) => {
+    performance.attachTelegramCard(swarmId, messageId, cardHtml);
+  });
+  performance.on('card', ({ call }: { call: TrackedCall }) => {
+    if (call.telegramMessageId == null || !call.telegramCardHtml) return;
+    void editAlertResult(call, call.telegramMessageId, call.telegramCardHtml);
   });
 
   // Sniper: one independent hot-wallet engine per admin (off by default). The

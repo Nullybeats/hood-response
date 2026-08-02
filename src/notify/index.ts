@@ -8,8 +8,8 @@ import {
   textBody,
   usd,
   milestoneHeadline,
-  milestoneTelegramHtml,
   milestoneTextBody,
+  telegramHtmlWithResult,
 } from './format.js';
 import { explorerUrl, sigmaBuyUrl, basedBuyUrl } from '../links.js';
 
@@ -97,19 +97,37 @@ async function sendDiscord(url: string, s: Swarm): Promise<NotificationDelivery>
   }
 }
 
+/** Called with the Telegram message id of each alert card as it lands, so the
+ *  performance tracker can later edit that same message with the call's result
+ *  instead of posting a separate milestone card. Wired in index.ts. */
+let onCardSent: ((swarmId: string, messageId: number, cardHtml: string) => void) | null = null;
+export function onAlertCardSent(fn: typeof onCardSent): void {
+  onCardSent = fn;
+}
+
 async function sendTelegram(
   token: string,
   chatId: string,
   s: Swarm,
 ): Promise<NotificationDelivery> {
   try {
+    const cardHtml = telegramHtml(s);
     const res = await postJson(`https://api.telegram.org/bot${token}/sendMessage`, {
       chat_id: chatId,
-      text: telegramHtml(s),
+      text: cardHtml,
       parse_mode: 'HTML',
       disable_web_page_preview: true,
     });
-    if (res.ok) return delivery('telegram', true);
+    if (res.ok) {
+      // Remember which message this call owns. Failing to read the id only costs
+      // the running result footer — the alert itself has already been delivered.
+      const messageId = await res
+        .json()
+        .then((b) => (b as { result?: { message_id?: number } }).result?.message_id)
+        .catch(() => undefined);
+      if (messageId != null && onCardSent) onCardSent(s.id, messageId, cardHtml);
+      return delivery('telegram', true);
+    }
     // Surface Telegram's own reason (e.g. "chat not found", "not enough rights
     // to send text messages") — the common failures when posting to a channel
     // the bot hasn't been made an admin of yet.
@@ -120,6 +138,45 @@ async function sendTelegram(
     return delivery('telegram', false, reason);
   } catch (err) {
     return delivery('telegram', false, (err as Error).message);
+  }
+}
+
+/**
+ * Re-render a call's alert card with its current result and edit it in place.
+ * One message per call, updated as it runs — no separate milestone posts.
+ * Telegram rejects an edit whose text is byte-identical ("message is not
+ * modified"); the caller only edits on a material move, so that is a no-op we
+ * log at debug rather than a failure.
+ */
+export async function editAlertResult(
+  call: TrackedCall,
+  messageId: number,
+  cardHtml: string,
+): Promise<boolean> {
+  const tg = config.notifications.telegram;
+  if (!tg) return false;
+  try {
+    const res = await postJson(`https://api.telegram.org/bot${tg.token}/editMessageText`, {
+      chat_id: tg.chatId,
+      message_id: messageId,
+      text: telegramHtmlWithResult(cardHtml, call, Date.now()),
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    });
+    if (res.ok) return true;
+    const reason = await res
+      .json()
+      .then((b) => (b as { description?: string }).description ?? `HTTP ${res.status}`)
+      .catch(() => `HTTP ${res.status}`);
+    if (reason.includes('not modified')) {
+      logger.debug({ token: call.tokenSymbol }, 'result footer unchanged');
+      return true;
+    }
+    logger.warn({ token: call.tokenSymbol, messageId, detail: reason }, 'result edit failed');
+    return false;
+  } catch (err) {
+    logger.warn({ token: call.tokenSymbol, detail: (err as Error).message }, 'result edit failed');
+    return false;
   }
 }
 
@@ -202,30 +259,10 @@ async function sendMilestoneDiscord(
   }
 }
 
-async function sendMilestoneTelegram(
-  token: string,
-  chatId: string,
-  call: TrackedCall,
-  milestonePct: number,
-  dexUrl: string,
-): Promise<NotificationDelivery> {
-  try {
-    const res = await postJson(`https://api.telegram.org/bot${token}/sendMessage`, {
-      chat_id: chatId,
-      text: milestoneTelegramHtml(call, milestonePct, dexUrl),
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-    });
-    if (res.ok) return delivery('telegram', true);
-    const reason = await res
-      .json()
-      .then((b) => (b as { description?: string }).description ?? `HTTP ${res.status}`)
-      .catch(() => `HTTP ${res.status}`);
-    return delivery('telegram', false, reason);
-  } catch (err) {
-    return delivery('telegram', false, (err as Error).message);
-  }
-}
+// Telegram gets NO milestone message. The channel is alerts only — a call's
+// result is edited onto its own alert card by editAlertResult() above, so one
+// message per call carries both the call and how it went. Discord and generic
+// webhooks are unchanged and still receive milestone events as their own posts.
 
 async function sendMilestoneWebhook(
   url: string,
@@ -263,17 +300,6 @@ export async function dispatchMilestone(
   const jobs: Promise<NotificationDelivery>[] = [];
   if (config.notifications.discord) {
     jobs.push(sendMilestoneDiscord(config.notifications.discord, call, milestonePct, dexUrl));
-  }
-  if (config.notifications.telegram) {
-    jobs.push(
-      sendMilestoneTelegram(
-        config.notifications.telegram.token,
-        config.notifications.telegram.chatId,
-        call,
-        milestonePct,
-        dexUrl,
-      ),
-    );
   }
   if (config.notifications.webhook) {
     jobs.push(sendMilestoneWebhook(config.notifications.webhook, call, milestonePct, dexUrl));

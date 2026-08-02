@@ -51,6 +51,16 @@ export interface TrackedCall {
   gain1hPct: number | null;
   gain6hPct: number | null;
   gain24hPct: number | null;
+  /** The Telegram message this call's alert card was posted as, and the card's
+   *  body at the time — so the running result can be edited onto that same
+   *  message instead of posting a separate milestone card. Persisted, so a
+   *  redeploy keeps updating cards that are already in the channel. */
+  telegramMessageId?: number;
+  telegramCardHtml?: string;
+  /** The `lastGainPct` / `maxGainPct` the card currently displays, so we only
+   *  spend an edit when the number a reader sees would actually change. */
+  shownGainPct?: number;
+  shownMaxGainPct?: number;
   updatedAt: number;
   /** True once tracking has run its course (past PERF_TRACK_HOURS). */
   closed: boolean;
@@ -73,6 +83,11 @@ interface WalletBucket extends Bucket {
 
 const gainPct = (entry: number, now: number): number =>
   entry > 0 ? Math.round(((now - entry) / entry) * 1000) / 10 : 0;
+
+/** How far a call's return must move (percentage points) before its alert card
+ *  is edited again. Samples run every PERF_SAMPLE_MINUTES; without a threshold a
+ *  coin drifting a fraction of a percent would rewrite the message all day. */
+const CARD_REFRESH_DELTA_PCT = 10;
 
 function convictionBand(c: number): string {
   if (c < 60) return '<60';
@@ -302,10 +317,35 @@ export class PerformanceTracker extends EventEmitter {
       if (c.gain1hPct == null && age >= 3_600_000) c.gain1hPct = c.lastGainPct;
       if (c.gain6hPct == null && age >= 6 * 3_600_000) c.gain6hPct = c.lastGainPct;
       if (c.gain24hPct == null && age >= 24 * 3_600_000) c.gain24hPct = c.lastGainPct;
-      if (age >= trackMs) c.closed = true;
+      const justClosed = age >= trackMs && !c.closed;
+      if (justClosed) c.closed = true;
+      this.refreshCard(c, justClosed);
       c.updatedAt = now;
     }
     void this.persist();
+  }
+
+  /** Bind a call to the Telegram message its alert card was posted as. */
+  attachTelegramCard(swarmId: string, messageId: number, cardHtml: string): void {
+    const c = this.calls.get(swarmId);
+    if (!c) return;
+    c.telegramMessageId = messageId;
+    c.telegramCardHtml = cardHtml;
+    void this.persist();
+  }
+
+  /** Emit `'card'` when the result a reader would see has moved enough to be
+   *  worth an edit — or when the call closes, so every card ends on its final
+   *  number rather than whatever it happened to be at the last sample. */
+  private refreshCard(c: TrackedCall, justClosed: boolean): void {
+    if (c.telegramMessageId == null || !c.telegramCardHtml) return;
+    const moved =
+      Math.abs(c.lastGainPct - (c.shownGainPct ?? 0)) >= CARD_REFRESH_DELTA_PCT ||
+      Math.abs(c.maxGainPct - (c.shownMaxGainPct ?? 0)) >= CARD_REFRESH_DELTA_PCT;
+    if (!moved && !justClosed) return;
+    c.shownGainPct = c.lastGainPct;
+    c.shownMaxGainPct = c.maxGainPct;
+    this.emit('card', { call: { ...c } });
   }
 
   /** Emit one `'milestone'` event per PERF_MILESTONE_STEP_PCT interval newly
@@ -368,7 +408,12 @@ export class PerformanceTracker extends EventEmitter {
 
   /** All tracked calls, best peak gain first. */
   list(): TrackedCall[] {
-    return [...this.calls.values()].sort((a, b) => b.maxGainPct - a.maxGainPct);
+    // Drop the Telegram bookkeeping: telegramCardHtml is a rendered copy of the
+    // card, and /api/performance feeds the browser's Call Record page — shipping
+    // a few hundred bytes of duplicate HTML per call would dwarf the actual data.
+    return [...this.calls.values()]
+      .sort((a, b) => b.maxGainPct - a.maxGainPct)
+      .map(({ telegramCardHtml: _html, telegramMessageId: _id, ...rest }) => rest);
   }
 
   /** Aggregate outcomes by the dimensions that matter for catching runners. */

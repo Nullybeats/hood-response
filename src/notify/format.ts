@@ -199,6 +199,40 @@ export function telegramHtml(s: Swarm): string {
   );
 }
 
+// ── the live result footer, edited onto the alert card itself ────────────────
+// The alert is the only message a call ever gets: rather than posting a separate
+// milestone card each time it runs, we edit this footer onto the original card so
+// one message carries the call AND how it went. Kept to a single line so a card
+// that has been updated a dozen times still reads like an alert, not a log.
+
+const signed = (pct: number): string => `${pct >= 0 ? '+' : ''}${Math.round(pct)}%`;
+
+/** "18min" / "4h" / "2d" — how long the call has been running. */
+function since(ms: number): string {
+  const min = Math.max(0, Math.floor(ms / 60_000));
+  if (min < 60) return `${min}min`;
+  const hr = Math.floor(min / 60);
+  return hr < 24 ? `${hr}h` : `${Math.floor(hr / 24)}d`;
+}
+
+export function resultFooter(call: TrackedCall, now: number): string {
+  const age = since(Math.max(0, now - call.entryAt));
+  const mc = `${usd(call.entryMarketCap)} → ${usd(call.lastMarketCap)}`;
+  // Peak is the whole point of a call record, but repeating it when the call IS
+  // at its peak just doubles the same number — so only show it once it has come off.
+  const peak =
+    Math.round(call.maxGainPct) > Math.round(call.lastGainPct)
+      ? ` · peak ${signed(call.maxGainPct)}`
+      : '';
+  const head = call.closed ? `🏁 <b>Final ${signed(call.lastGainPct)}</b>` : `📈 <b>Now ${signed(call.lastGainPct)}</b>`;
+  return `${head}${peak} · ${mc} · ${age}`;
+}
+
+/** The alert card with its running result appended — what an edit re-sends. */
+export function telegramHtmlWithResult(cardHtml: string, call: TrackedCall, now: number): string {
+  return `${cardHtml}\n\n${resultFooter(call, now)}`;
+}
+
 // ── PnL milestone cards ─────────────────────────────────────────────────────
 // Fired by PerformanceTracker every time a tracked call's peak crosses a new
 // interval (default 50%: +50%, +100%, +150%, …) — a running celebration of
