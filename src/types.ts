@@ -35,7 +35,7 @@ export type WalletCategory =
 export type WalletTier = 'alpha' | 'beta' | 'chroma' | 'delta';
 
 export interface TrackedWallet {
-  /** Address (lowercased). */
+  /** Address (lowercased). Never leaves the server — see walletId.ts for the public handle. */
   address: string;
   label: string;
   category: WalletCategory;
@@ -133,8 +133,14 @@ export interface Swarm {
   walletSummary: string;
   /** Labels (operator-assigned nicknames — never addresses) of the tracked
    *  wallets behind this specific alert, e.g. ["tendies", "hmm"]. Safe to
-   *  surface: identifies which named wallet called it without exposing PII. */
+   *  surface: identifies which named wallet called it without exposing PII.
+   *  NOT an identity: labels are derived from holdings, so they change as a
+   *  wallet buys and two wallets can share one. Key on `walletIds` instead. */
   walletLabels: string[];
+  /** Opaque, stable per-wallet ids, index-aligned with `walletLabels` — the
+   *  handle a consumer keys a per-wallet track record on. Salted hashes of the
+   *  address (see walletId.ts), so they expose no PII. */
+  walletIds: string[];
   totalUsd: number;
   /** Token market cap (USD) at the moment of the swarm — the cap the wallets
    *  bought or sold into. */
