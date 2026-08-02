@@ -21,6 +21,7 @@ function swarm(over: Partial<Swarm> = {}): Swarm {
     wallets: [],
     walletSummary: '2 alpha · 1 beta',
     walletLabels: [],
+    walletIds: [],
     totalUsd: 3000,
     marketCap: 60_000,
     newToken: false,
@@ -180,18 +181,33 @@ describe('PerformanceTracker', () => {
     expect(mc2mPlus.count).toBe(1);
   });
 
-  it('summary buckets by wallet label (not mutually exclusive) and token age', () => {
+  it('summary buckets by wallet (not mutually exclusive) and token age', () => {
     const perf = new PerformanceTracker(stubPrice({ '0xa': 1, '0xb': 1 }));
     perf.track(
-      swarm({ id: 'a', token: '0xa', walletLabels: ['tendies', 'hmm'], pairAgeHours: 0.5 }),
+      swarm({
+        id: 'a',
+        token: '0xa',
+        walletLabels: ['tendies', 'hmm'],
+        walletIds: ['id-tendies', 'id-hmm'],
+        pairAgeHours: 0.5,
+      }),
     );
-    perf.track(swarm({ id: 'b', token: '0xb', walletLabels: ['tendies'], pairAgeHours: 30 }));
+    perf.track(
+      swarm({
+        id: 'b',
+        token: '0xb',
+        walletLabels: ['tendies'],
+        walletIds: ['id-tendies'],
+        pairAgeHours: 30,
+      }),
+    );
 
     const s = perf.summary();
-    const tendies = s.byWallet.find((b) => b.label === 'tendies')!;
-    const hmm = s.byWallet.find((b) => b.label === 'hmm')!;
+    const tendies = s.byWallet.find((b) => b.walletId === 'id-tendies')!;
+    const hmm = s.byWallet.find((b) => b.walletId === 'id-hmm')!;
     expect(tendies.count).toBe(2);
     expect(hmm.count).toBe(1);
+    expect(tendies.label).toBe('tendies'); // label still carried for display
     const under1h = s.byTokenAge.find((b) => b.label === '<1h')!;
     const oneToSevenDays = s.byTokenAge.find((b) => b.label === '1-7d')!;
     expect(under1h.count).toBe(1);
@@ -218,5 +234,54 @@ describe('PerformanceTracker', () => {
     const perf = new PerformanceTracker(stubPrice({}));
     const info = perf.resetInfo();
     expect(info).toEqual({ enabled: true, hour: 8, tz: 'America/New_York' });
+  });
+
+  // byWallet is the "which wallet actually calls winners" record. It used to key on the label,
+  // which both merged distinct wallets and split a single wallet's history — these pin the fix.
+  describe('byWallet groups on the stable id, not the label', () => {
+    it('keeps two wallets that share a label apart', () => {
+      const perf = new PerformanceTracker(stubPrice({}));
+      perf.track(swarm({ walletLabels: ['alpha · 3 coins'], walletIds: ['aaaa'], priceUsd: 1 }));
+      perf.track(swarm({ walletLabels: ['alpha · 3 coins'], walletIds: ['bbbb'], priceUsd: 1 }));
+
+      const byWallet = perf.summary().byWallet;
+      expect(byWallet).toHaveLength(2);
+      expect(new Set(byWallet.map((b) => b.walletId))).toEqual(new Set(['aaaa', 'bbbb']));
+      // Both are labelled identically — the label alone could never have told them apart.
+      expect(byWallet.every((b) => b.label === 'alpha · 3 coins')).toBe(true);
+      expect(byWallet.every((b) => b.count === 1)).toBe(true);
+    });
+
+    it('keeps one wallet whole when its label changes', () => {
+      const perf = new PerformanceTracker(stubPrice({}));
+      perf.track(swarm({ walletLabels: ['alpha · 3 coins'], walletIds: ['aaaa'], priceUsd: 1 }));
+      perf.track(swarm({ walletLabels: ['alpha · 4 coins'], walletIds: ['aaaa'], priceUsd: 1 }));
+
+      const byWallet = perf.summary().byWallet;
+      expect(byWallet).toHaveLength(1);
+      expect(byWallet[0]!.walletId).toBe('aaaa');
+      expect(byWallet[0]!.count).toBe(2);
+      // Display follows the newest label so the wallet reads as it looks today.
+      expect(byWallet[0]!.label).toBe('alpha · 4 coins');
+    });
+
+    it('counts a multi-wallet call once for each participating wallet', () => {
+      const perf = new PerformanceTracker(stubPrice({}));
+      perf.track(
+        swarm({ walletLabels: ['alpha · 1', 'beta · 2'], walletIds: ['aaaa', 'bbbb'], priceUsd: 1 }),
+      );
+
+      const byWallet = perf.summary().byWallet;
+      expect(byWallet).toHaveLength(2);
+      expect(byWallet.every((b) => b.count === 1)).toBe(true);
+    });
+
+    it('skips calls tracked before walletIds existed without dropping them elsewhere', () => {
+      const perf = new PerformanceTracker(stubPrice({}));
+      perf.track(swarm({ walletLabels: ['alpha · 3 coins'], walletIds: [], priceUsd: 1 }));
+
+      expect(perf.summary().byWallet).toHaveLength(0);
+      expect(perf.summary().total).toBe(1); // still counted in every other bucket
+    });
   });
 });
