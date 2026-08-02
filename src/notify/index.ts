@@ -147,10 +147,11 @@ function delivery(
 export async function dispatch(s: Swarm): Promise<NotificationDelivery[]> {
   const jobs: Promise<NotificationDelivery>[] = [];
   if (config.notifications.discord) jobs.push(sendDiscord(config.notifications.discord, s));
-  // Telegram alert cards are gated to PRIME only — the loud, backtested-good tier
-  // (ENTRY/SOLO @ high conviction). The old channel fired a card on EVERY alert,
-  // which is the noise the operator asked to kill. Discord/webhook still get all.
-  if (config.notifications.telegram && s.prime) {
+  // The channel mirrors the alerts feed: every alert AlertEngine fires posts a card,
+  // so what you see in /api/alerts is what lands in Telegram. This was PRIME-only from
+  // 8838e01, but PRIME_KINDS is ENTRY-only while SOLO is what actually fires — so the
+  // channel went silent for a day. s.prime is left alone; it still gates the sniper.
+  if (config.notifications.telegram) {
     jobs.push(
       sendTelegram(config.notifications.telegram.token, config.notifications.telegram.chatId, s),
     );
