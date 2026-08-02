@@ -3,6 +3,7 @@ import { config } from '../config/env.js';
 import type { MemoryStore } from '../store/memory.js';
 import type { PriceOracle } from '../chain/price.js';
 import type { Swarm, SwapEvent } from '../types.js';
+import { walletId } from '../walletId.js';
 import { computeConviction } from './conviction.js';
 
 interface WindowState {
@@ -204,6 +205,8 @@ export class Aggregator {
       wallets,
       walletSummary: summarizeWallets(walletObjs, wallets.length),
       walletLabels: walletObjs.map((w) => w.label),
+      // Index-aligned with walletLabels (same source array) so a consumer can pair label→id.
+      walletIds: walletObjs.map((w) => walletId(w.address)),
       alsoHold: crossHoldings(walletObjs, token.symbol),
       totalUsd,
       marketCap,

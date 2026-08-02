@@ -14,6 +14,7 @@ import { SniperRegistry } from './sniper/registry.js';
 import { FeedSubscriber, SNIPER_FEED_URL } from './sniper/feed.js';
 import { TelegramCommands } from './telegram/commands.js';
 import type { Swarm, SwapEvent } from './types.js';
+import { walletIdSaltMissing } from './walletId.js';
 
 async function main(): Promise<void> {
   logger.info(
@@ -25,6 +26,13 @@ async function main(): Promise<void> {
     },
     'starting Swarm the Fly',
   );
+
+  if (walletIdSaltMissing) {
+    logger.warn(
+      'WALLET_ID_SALT is unset — public wallet ids use a built-in salt and can be reversed to ' +
+        'addresses by brute force. Set it to a long random string, once, and never rotate it.',
+    );
+  }
 
   const store = new MemoryStore();
   await store.loadSettings();
