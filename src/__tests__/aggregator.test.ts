@@ -45,9 +45,14 @@ describe('Aggregator', () => {
     expect(detected[0]!.kind).toBe('BUY');
     expect(detected[0]!.walletCount).toBe(3);
     expect(detected[0]!.tokenSymbol).toBe('CASHCAT');
-    // Privacy-preserving makeup + market cap are populated for display.
+    // Privacy-preserving makeup is populated for display.
     expect(detected[0]!.walletSummary).toMatch(/\d+\s\w/);
-    expect(detected[0]!.marketCap).toBeGreaterThan(0);
+    // With no price source reachable, the market cap is UNKNOWN — not a number.
+    // This assertion used to read `toBeGreaterThan(0)` and passed only because
+    // the oracle fabricated a cap from a hash of the token address.
+    expect(detected[0]!.marketCap).toBeNull();
+    expect(detected[0]!.priceLive).toBe(false);
+    expect(detected[0]!.priceSource).toBeNull();
   });
 
   it('does not re-emit for the same wallet set', () => {

@@ -19,7 +19,9 @@ function primeIcon(s: Swarm): string {
 }
 
 // ── formatting helpers ────────────────────────────────────────────────────────
-export function usd(n: number): string {
+/** Unknown reads as unknown — never "$0.00", which looks like a measurement. */
+export function usd(n: number | null | undefined): string {
+  if (n == null) return 'unknown';
   if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}k`;
   return `$${n.toFixed(2)}`;
@@ -126,9 +128,24 @@ function primeBanner(s: Swarm): string[] {
 function athLabel(s: Swarm): string {
   const ath = s.athMarketCap;
   if (ath == null) return '';
+  const mc = s.marketCap;
   const down =
-    ath > 0 && s.marketCap > 0 ? Math.round(((s.marketCap - ath) / ath) * 1000) / 10 : null;
+    ath > 0 && mc != null && mc > 0 ? Math.round(((mc - ath) / ath) * 1000) / 10 : null;
   return `  ·  🏔️ ATH ${compact(ath)}${down != null ? ` (${down}%)` : ''}`;
+}
+
+/**
+ * Say where the numbers came from whenever they are not the full DexScreener
+ * picture, so a "?" on the card reads as "nobody knows yet" rather than as a
+ * rendering glitch. A card that quietly shows a figure it could not measure is
+ * how ANOA's fabricated $13.1M cap passed for a real one.
+ */
+function sourceNote(s: Swarm): string[] {
+  if (!s.priceLive) return ['❔ No verified price — cap, liquidity and volume unknown'];
+  if (s.priceSource === 'pool') {
+    return ['⛓️ Price read on-chain (pair not indexed yet) — cap/liq/volume unknown'];
+  }
+  return [];
 }
 
 /** The card's stacked display lines (no links; shared by plain + HTML). */
@@ -146,7 +163,8 @@ function cardLines(s: Swarm): string[] {
     `${marker} ${sym} [${compact(s.marketCap)}] $${sym}`,
     `⛓️ Robinhood · ${s.dex ?? 'dex'}`,
     `💰 $${fmtPrice(s.priceUsd)}`,
-    `💎 MC ${compact(s.marketCap)}${s.priceLive ? '' : ' (est)'}${athLabel(s)}  ·  💧 Liq ${compact(s.liquidityUsd)}`,
+    `💎 MC ${compact(s.marketCap)}${athLabel(s)}  ·  💧 Liq ${compact(s.liquidityUsd)}`,
+    ...sourceNote(s),
     `📊 Vol ${compact(s.momentum?.volumeUsd)}  ·  ⏳ Age ${fmtAge(s.pairAgeHours)}`,
     `📈 24h ${pct(s.momentum?.priceChange24h)}  ·  1h ${pct(s.momentum?.priceChange1h)}  ·  🅑 ${buys ?? '?'} 🅢 ${sells ?? '?'}`,
     ``,

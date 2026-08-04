@@ -323,6 +323,19 @@ const schema = z.object({
   DEXSCREENER_CHAIN: z.string().default('robinhood'),
   // How often (ms) to refresh live prices from DexScreener.
   PRICE_REFRESH_MS: num(15000),
+  // When DexScreener has not indexed a token's pair yet, read the price straight
+  // off its deepest ETH-paired Uniswap v4/v3 pool (chain/poolPrice.ts). This is
+  // the honest answer for a brand-new coin — exactly the window a sniper trades.
+  POOL_PRICE_FALLBACK: bool(true),
+  // DEVELOPMENT ONLY. Fabricates a price by hashing the token address when no
+  // real source has one, so a chainless dev run still produces numbers.
+  //
+  // NEVER enable in production. This flag exists because it used to be the
+  // unconditional behaviour: ANOA (2026-08-04) alerted eight times at a
+  // "$13.1M" market cap that was hash(address) * 1e9, while its real cap was
+  // $2,598 — clearing the $25k ALERT_MIN_MARKETCAP floor that was supposed to
+  // suppress exactly that coin. Unknown must read as unknown.
+  PRICE_SYNTHETIC_FALLBACK: bool(false),
   // Block explorer base for Explorer links in alerts (Robinhood Chain Blockscout).
   EXPLORER_BASE: z.string().default('https://robinhoodchain.blockscout.com'),
 

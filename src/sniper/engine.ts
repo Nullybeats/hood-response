@@ -29,7 +29,9 @@ export interface Position {
   conviction: number;
   ethIn: number;
   entryPriceUsd: number;
-  entryMarketCap: number;
+  /** Market cap at entry, or null when it could not be established. Never a
+   *  placeholder — position sizing and exits key off price, not cap. */
+  entryMarketCap: number | null;
   tokensReceived: number;
   /** Exact base-unit buy fill, used to cap this position's sell independently of wallet balance. */
   tokensReceivedRaw?: string;
@@ -664,7 +666,7 @@ export class SniperEngine {
         // back to an off-chain display price for an exit decision.
         if (!(px > 0) && config.NODE_ENV === 'test') {
           await this.price.refreshNow(p.token);
-          px = this.price.isLive(p.token) ? this.price.priceOf(p.token) : 0;
+          px = this.price.priceOf(p.token) ?? 0;
         }
         if (!(px > 0)) throw new Error('on-chain exit quote unavailable');
         p.lastPriceUsd = px;
@@ -1101,7 +1103,7 @@ export class SniperEngine {
     if (!this.executor.ready) throw new Error('wallet not configured');
     const size = Math.min(config.SNIPER_MAX_ETH_PER_TRADE, Math.max(MIN_BUY_ETH, ethAmount));
     const now = Date.now();
-    const px = this.price.isLive(token) ? this.price.priceOf(token) : 0;
+    const px = this.price.priceOf(token) ?? 0;
     const ethUsd = this.price.ethUsdPrice();
     const expectedPriceEth = px > 0 && ethUsd && ethUsd > 0 ? px / ethUsd : null;
     const res = await this.executor.buy(token, size, this.price.pairIdOf(token), expectedPriceEth);
@@ -1118,7 +1120,7 @@ export class SniperEngine {
       conviction: 0,
       ethIn: res.ethSpent,
       entryPriceUsd: px > 0 ? px : 0,
-      entryMarketCap: 0,
+      entryMarketCap: null, // manual test buy — no alert, no cap established
       tokensReceived: res.tokensReceived,
       tokensReceivedRaw: res.tokensReceivedRaw,
       buyTx: res.txHash,
@@ -1168,7 +1170,7 @@ export class SniperEngine {
     // Force a fresh price fetch — this token may never have been priced before
     // (bought directly via the sniper, bypassing normal discovery).
     await this.price.refreshNow(token).catch(() => undefined);
-    const px = this.price.isLive(token) ? this.price.priceOf(token) : 0;
+    const px = this.price.priceOf(token) ?? 0;
     if (px <= 0) {
       throw new Error('no live price available for this token yet — try again in a few seconds');
     }
@@ -1227,7 +1229,7 @@ export class SniperEngine {
         this.lookupProtocolFee(token),
       ]);
     await this.price.refreshNow(token).catch(() => undefined);
-    const currentPx = this.price.isLive(token) ? this.price.priceOf(token) : 0;
+    const currentPx = this.price.priceOf(token) ?? 0;
     const ethUsd = this.price.ethUsdPrice();
     let entryPriceUsd = 0;
     if (ethUsd && ethUsd > 0 && tokensReceived > 0) {
@@ -1333,7 +1335,7 @@ export class SniperEngine {
     const now = Date.now();
     for (const p of this.positions.values()) {
       if (p.status !== 'open' && p.status !== 'close_pending') continue;
-      const px = this.price.isLive(p.token) ? this.price.priceOf(p.token) : 0;
+      const px = this.price.priceOf(p.token) ?? 0;
       if (px > 0) {
         p.lastPriceUsd = px;
         p.updatedAt = now;

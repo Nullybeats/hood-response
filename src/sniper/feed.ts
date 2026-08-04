@@ -178,6 +178,10 @@ export class FeedSubscriber {
     try {
       await this.price.refreshNow(swarm.token);
       swarm.priceLive = this.price.isLive(swarm.token);
+      swarm.priceSource = this.price.sourceOf(swarm.token);
+      // priceOf() is null when no real source has a price — never overwrite the
+      // feed's own price with a placeholder. The entry gate below fails closed
+      // on a missing price, which is the behaviour we want either way.
       const p = this.price.priceOf(swarm.token);
       if (p && p > 0) swarm.priceUsd = p;
       swarm.liquidityUsd = this.price.liquidityOf(swarm.token);

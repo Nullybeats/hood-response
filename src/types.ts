@@ -7,7 +7,13 @@ export interface TrackedToken {
   address: string;
   symbol: string;
   name: string;
+  /** Human-unit total supply. For a discovered token this starts as a PLACEHOLDER
+   *  (1e9) and only becomes real once `supplyVerified` is true — never multiply
+   *  it by a price before then. */
   totalSupply: number;
+  /** True only when `totalSupply` was read from the contract (seed set, or an
+   *  on-chain metadata enrich). Market cap is unknown while this is false. */
+  supplyVerified?: boolean;
   /** Contract decimals, populated from an on-chain metadata read for discovered tokens. */
   decimals?: number;
   /** True for stablecoins so they can be filtered when IGNORE_STABLECOINS. */
@@ -61,8 +67,9 @@ export interface SwapEvent {
   direction: Direction;
   /** Token amount (human units). */
   amount: number;
-  /** Notional USD value of the swap. */
-  usdValue: number;
+  /** Notional USD value of the swap, or **null** when the token has no price we
+   *  can verify. Null is not 0: an unvalued swap is unknown, not dust. */
+  usdValue: number | null;
   blockNumber: number;
   /** Unix ms. */
   timestamp: number;
@@ -145,8 +152,9 @@ export interface Swarm {
   walletIds: string[];
   totalUsd: number;
   /** Token market cap (USD) at the moment of the swarm — the cap the wallets
-   *  bought or sold into. */
-  marketCap: number;
+   *  bought or sold into. **Null when unknown**, which is not the same as small:
+   *  every cap gate must reject null rather than let it through. */
+  marketCap: number | null;
   /** Highest market cap seen for this token since the bot started tracking it
    *  (not a true lifetime ATH — DexScreener doesn't expose one). Null when
    *  unknown (no live pair yet). Always >= marketCap. */
@@ -156,8 +164,13 @@ export interface Swarm {
   newToken: boolean;
   /** DexScreener link for the token (precise pair page when known). */
   dexUrl: string;
-  /** True when price/market cap came from a live DexScreener pair (vs synthetic). */
+  /** True when the price came from a REAL source — a live DexScreener pair or a
+   *  direct read of the token's pool. False means we have no price at all. */
   priceLive: boolean;
+  /** Which real source priced this swarm: 'dexscreener' (has cap/liquidity/
+   *  volume) or 'pool' (price only, straight off chain — a pair too new to be
+   *  indexed). Null when unpriced. */
+  priceSource?: 'dexscreener' | 'pool' | null;
   /** Token safety screen result, when the safety filter is enabled. */
   safety?: SafetyReport;
   /** Volume / momentum confirmation for the token. */

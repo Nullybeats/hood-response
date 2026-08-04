@@ -202,7 +202,11 @@ export class MemoryStore extends EventEmitter {
       address: key,
       symbol: symbol || `TKN-${key.slice(2, 6).toUpperCase()}`,
       name: symbol || `Discovered ${key.slice(0, 10)}`,
-      totalSupply: 1_000_000_000, // estimated until enriched from chain
+      // PLACEHOLDER until the on-chain metadata read lands (see chain/metadata.ts).
+      // supplyVerified stays false meanwhile, which is what stops the oracle
+      // reporting `price * 1e9` as a market cap.
+      totalSupply: 1_000_000_000,
+      supplyVerified: false,
       stable: false,
       discovered: true,
       firstSeen: Date.now(),
@@ -245,16 +249,19 @@ export class MemoryStore extends EventEmitter {
       usdOut: 0,
       swarms: 0,
     };
+    // Counts include every swap; the USD totals only the ones we could price,
+    // so an unpriced token adds nothing rather than adding a made-up figure.
+    const usd = e.usdValue ?? 0;
     if (e.direction === 'BUY') {
       ws.buys += 1;
-      ws.usdIn += e.usdValue;
+      ws.usdIn += usd;
       ts.buys += 1;
-      ts.usdIn += e.usdValue;
+      ts.usdIn += usd;
     } else {
       ws.sells += 1;
-      ws.usdOut += e.usdValue;
+      ws.usdOut += usd;
       ts.sells += 1;
-      ts.usdOut += e.usdValue;
+      ts.usdOut += usd;
     }
     this.walletStats.set(e.wallet, ws);
     this.tokenStats.set(e.token, ts);

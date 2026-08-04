@@ -31,13 +31,17 @@ export interface TrackedCall {
   repeatWallets: number;
   newHolder: boolean;
   entryPrice: number;
-  entryMarketCap: number;
+  /** Market cap at entry, or null when it was never established (a pair too new
+   *  to be indexed, or a token whose supply we had not read). Gain % is measured
+   *  off the PRICE, so an unknown cap costs the record nothing but the label. */
+  entryMarketCap: number | null;
   /** Age of the token's DEX pair (hours) at alert time, or null if unknown. */
   pairAgeHours: number | null;
   entryAt: number;
   lastPrice: number;
-  /** Live market cap now (derived from the price move), for display. */
-  lastMarketCap: number;
+  /** Live market cap now (derived from the price move), for display. Null
+   *  whenever `entryMarketCap` is — there is nothing to scale. */
+  lastMarketCap: number | null;
   /** Current return vs entry (%). */
   lastGainPct: number;
   maxPrice: number;
@@ -98,7 +102,8 @@ function convictionBand(c: number): string {
 }
 const CONVICTION_BANDS = ['<60', '60-69', '70-79', '80-89', '90-100'];
 
-function marketCapBand(mc: number): string {
+function marketCapBand(mc: number | null): string {
+  if (mc == null) return 'unknown';
   if (mc < 50_000) return '<50K';
   if (mc < 150_000) return '50K-150K';
   if (mc < 500_000) return '150K-500K';
@@ -188,8 +193,8 @@ export class PerformanceTracker extends EventEmitter {
     super();
   }
 
-  /** Register a fired alert for follow-up. No-op unless we have a live entry
-   *  price (synthetic prices can't be measured against the market). */
+  /** Register a fired alert for follow-up. No-op unless we have a REAL entry
+   *  price — a call with no price cannot be measured against the market. */
   track(swarm: Swarm): void {
     if (!config.PERFORMANCE_TRACKING) return;
     const entryPrice = swarm.priceUsd ?? 0;
@@ -297,15 +302,16 @@ export class PerformanceTracker extends EventEmitter {
       } catch {
         /* ignore transient fetch errors */
       }
-      // Only sample a LIVE price. When DexScreener momentarily has no pair,
-      // priceOf() falls back to a synthetic placeholder unrelated to the real
-      // price — which would spike the peak to a garbage number that then sticks.
-      // Skip those ticks and keep the last good values.
-      const p = this.price.isLive(c.token) ? this.price.priceOf(c.token) : 0;
+      // Only sample a REAL price; a tick with no price is skipped so the last
+      // good values stand, rather than a garbage peak sticking forever.
+      const p = this.price.priceOf(c.token) ?? 0;
       if (p > 0) {
         c.lastPrice = p;
         c.lastGainPct = gainPct(c.entryPrice, p);
-        c.lastMarketCap = c.entryPrice > 0 ? Math.round(c.entryMarketCap * (p / c.entryPrice)) : c.entryMarketCap;
+        c.lastMarketCap =
+          c.entryMarketCap != null && c.entryPrice > 0
+            ? Math.round(c.entryMarketCap * (p / c.entryPrice))
+            : c.entryMarketCap;
         if (p > c.maxPrice) {
           c.maxPrice = p;
           c.maxGainPct = gainPct(c.entryPrice, p);

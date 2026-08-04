@@ -48,7 +48,9 @@ export function convictionTenth(c: number): number {
 export function formatLine(rank: number, call: TrackedCall, peak: boolean, now = Date.now()): string {
   const endPrice = peak ? call.maxPrice : call.lastPrice;
   const endMc = peak
-    ? call.entryMarketCap * (call.entryPrice > 0 ? call.maxPrice / call.entryPrice : 1)
+    ? call.entryMarketCap != null && call.entryPrice > 0
+      ? call.entryMarketCap * (call.maxPrice / call.entryPrice)
+      : call.entryMarketCap
     : call.lastMarketCap;
   const mult = multiplierStr(call.entryPrice, endPrice);
   const age = ageStr(now - call.entryAt);

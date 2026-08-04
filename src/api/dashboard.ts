@@ -189,7 +189,9 @@ export const DASHBOARD_HTML = /* html */ `<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 const short = (a) => a ? a.slice(0,6)+'…'+a.slice(-4) : '';
-const usd = (n) => n>=1e6 ? '$'+(n/1e6).toFixed(2)+'M' : n>=1e3 ? '$'+(n/1e3).toFixed(1)+'k' : '$'+(n||0).toFixed(2);
+// null/undefined = unknown, and must not render as "$0.00" — an unmeasured
+// figure that looks measured is the whole bug class this guards against.
+const usd = (n) => n==null ? '?' : n>=1e6 ? '$'+(n/1e6).toFixed(2)+'M' : n>=1e3 ? '$'+(n/1e3).toFixed(1)+'k' : '$'+n.toFixed(2);
 const convClass = (c) => c>=70?'hi':c>=40?'mid':'lo';
 const time = (t) => new Date(t).toLocaleTimeString();
 let DEX_CHAIN=null;
@@ -213,10 +215,11 @@ const buyLinks = (addr) => {
 function cap(el, max){ while(el.children.length>max) el.removeChild(el.lastChild); }
 function clearEmpty(el){ const e=el.querySelector('.empty'); if(e) e.remove(); }
 
-const mcLabel = (s) => (s.kind==='SELL' ? 'sold @ ' : 'bought @ ') + usd(s.marketCap) + ' MC' + (s.priceLive ? '' : ' (est)') + athLabel(s);
+const mcLabel = (s) => (s.kind==='SELL' ? 'sold @ ' : 'bought @ ') + usd(s.marketCap) + ' MC' + srcLabel(s) + athLabel(s);
+const srcLabel = (s) => !s.priceLive ? ' (no price)' : s.priceSource==='pool' ? ' (on-chain px)' : '';
 const athLabel = (s) => {
   if(s.athMarketCap==null) return '';
-  const down = s.athMarketCap>0 && s.marketCap>0 ? Math.round(((s.marketCap-s.athMarketCap)/s.athMarketCap)*1000)/10 : null;
+  const down = s.athMarketCap>0 && s.marketCap!=null && s.marketCap>0 ? Math.round(((s.marketCap-s.athMarketCap)/s.athMarketCap)*1000)/10 : null;
   return ' · 🏔️ ATH '+usd(s.athMarketCap)+(down!=null?' ('+down+'%)':'');
 };
 

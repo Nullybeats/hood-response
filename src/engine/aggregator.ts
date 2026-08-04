@@ -66,8 +66,11 @@ export class Aggregator {
 
   /** Should this swap be considered for swarm detection? */
   private eligible(swap: SwapEvent): boolean {
-    if (config.IGNORE_DUST_USD > 0 && swap.usdValue < config.IGNORE_DUST_USD) {
-      return false;
+    // An unvalued swap cannot clear a USD floor — we have no idea what it is
+    // worth. Fails closed: detection would otherwise be sized in fabricated
+    // dollars, which is what the synthetic price used to supply.
+    if (config.IGNORE_DUST_USD > 0) {
+      if (swap.usdValue == null || swap.usdValue < config.IGNORE_DUST_USD) return false;
     }
     // Skip settlement/quote tokens and tokenised equities — never gems, and the
     // quote-token leg of a real buy would otherwise fire a spurious sell.
@@ -180,7 +183,9 @@ export class Aggregator {
     const walletObjs = wallets
       .map((a) => this.store.wallets.get(a))
       .filter((w): w is NonNullable<typeof w> => Boolean(w));
-    const totalUsd = events.reduce((s, e) => s + e.usdValue, 0);
+    // Only priced legs contribute. `eligible()` already drops unvalued swaps
+    // when a dust floor is set; this keeps the sum honest when it is not.
+    const totalUsd = events.reduce((s, e) => s + (e.usdValue ?? 0), 0);
     const timestamps = events.map((e) => e.timestamp);
     const firstSeen = Math.min(...timestamps);
     const lastSeen = Math.max(...timestamps);
@@ -213,6 +218,7 @@ export class Aggregator {
       newToken: token.discovered === true,
       dexUrl: this.price.dexUrl(token.address),
       priceLive: this.price.isLive(token.address),
+      priceSource: this.price.sourceOf(token.address),
       conviction: score,
       convictionBreakdown: breakdown,
       windowSeconds: Number(windowSeconds.toFixed(2)),

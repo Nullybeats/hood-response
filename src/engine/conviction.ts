@@ -11,14 +11,16 @@ export interface ConvictionInput {
   token: TrackedToken;
   windowSeconds: number;
   totalUsd: number;
-  marketCap: number;
+  /** Null when the market cap is unknown — see the note on UNKNOWN_CAP_FACTORS. */
+  marketCap: number | null;
 }
 
 /**
  * Weights sum to 1. Wallet quality (tier) and directional purity dominate; the
- * synthetic token-side factors (liquidity/market cap here) are intentionally
- * light because the pipeline refines conviction with the *real* market cap,
- * liquidity and momentum once the DexScreener data is fetched at alert time.
+ * token-side factors (liquidity/market cap here) are intentionally light because
+ * the pipeline refines conviction with the *real* market cap, liquidity and
+ * momentum once the price data is fetched at alert time — and because they are
+ * the two that go unknown on a coin too new to be indexed.
  */
 const WEIGHTS: Record<keyof ConvictionBreakdown, number> = {
   walletQuality: 0.3,
@@ -30,6 +32,13 @@ const WEIGHTS: Record<keyof ConvictionBreakdown, number> = {
   historicalAccuracy: 0.06,
   buySellRatio: 0.1,
 };
+
+/** The two factors that are derived from the market cap, and are therefore
+ *  unknowable when the cap is. When it is null they score 0 AND their weight is
+ *  removed from the denominator, so the remaining factors decide the score on
+ *  their own. Zeroing them without renormalising would score an unknown cap as
+ *  the worst possible cap — a different fiction from the one this replaced. */
+const UNKNOWN_CAP_FACTORS = ['liquidity', 'marketCap'] as const;
 
 const clamp100 = (n: number): number => Math.max(0, Math.min(100, n));
 
@@ -65,11 +74,15 @@ export function computeConviction(input: ConvictionInput): {
   const span = Math.max(windowSeconds, 1);
   const velocity = clamp100((n / span) * 60);
 
+  // Both of these are functions of the market cap; unknown cap → 0, and the
+  // weights below are renormalised so the zero is not read as a low score.
+  const capKnown = marketCap != null && marketCap > 0;
+
   // Liquidity proxy: swap notional relative to market cap.
-  const liquidity = clamp100(marketCap > 0 ? (totalUsd / marketCap) * 100_000 : 0);
+  const liquidity = capKnown ? clamp100((totalUsd / marketCap!) * 100_000) : 0;
 
   // Smaller caps move faster — inverse of log market cap.
-  const marketCapScore = clamp100(100 - (Math.log10(marketCap + 10) / 9) * 100);
+  const marketCapScore = capKnown ? clamp100(100 - (Math.log10(marketCap! + 10) / 9) * 100) : 0;
 
   const historicalAccuracy = clamp100(avgConfidence * 100);
 
@@ -90,11 +103,14 @@ export function computeConviction(input: ConvictionInput): {
     buySellRatio: Math.round(buySellRatio),
   };
 
+  const scored = (Object.keys(WEIGHTS) as (keyof ConvictionBreakdown)[]).filter(
+    (k) => capKnown || !(UNKNOWN_CAP_FACTORS as readonly string[]).includes(k),
+  );
+  const totalWeight = scored.reduce((sum, k) => sum + WEIGHTS[k], 0);
   const score = clamp100(
-    (Object.keys(WEIGHTS) as (keyof ConvictionBreakdown)[]).reduce(
-      (sum, k) => sum + breakdown[k] * WEIGHTS[k],
-      0,
-    ),
+    totalWeight > 0
+      ? scored.reduce((sum, k) => sum + breakdown[k] * WEIGHTS[k], 0) / totalWeight
+      : 0,
   );
 
   return { score: Math.round(score), breakdown };

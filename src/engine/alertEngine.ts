@@ -128,11 +128,14 @@ export class AlertEngine {
     if (effective.length < rule.minWallets) return false;
     if (swarm.totalUsd < rule.minUsd) return false;
     if (swarm.conviction < rule.minConviction) return false;
-    // Market-cap band rules (solo buys): require a known cap within the band.
-    if (rule.maxMarketCap != null) {
-      if (swarm.marketCap <= 0 || swarm.marketCap > rule.maxMarketCap) return false;
+    // Market-cap band rules (solo buys): require a KNOWN cap within the band.
+    // Null is unknown, not "passes" — a rule that targets low caps must not fire
+    // on a coin whose cap nobody can establish.
+    if (rule.maxMarketCap != null || rule.minMarketCap != null) {
+      if (swarm.marketCap == null || swarm.marketCap <= 0) return false;
+      if (rule.maxMarketCap != null && swarm.marketCap > rule.maxMarketCap) return false;
+      if (rule.minMarketCap != null && swarm.marketCap < rule.minMarketCap) return false;
     }
-    if (rule.minMarketCap != null && swarm.marketCap < rule.minMarketCap) return false;
     return true;
   }
 

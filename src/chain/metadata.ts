@@ -92,6 +92,9 @@ export async function fetchTokenMetadata(
   if (rawSupply != null && decimals != null && decimals >= 0 && decimals <= 36) {
     meta.totalSupply = rawSupply / 10 ** decimals;
     meta.decimals = decimals;
+    // The supply is now the contract's own, not ensureToken's 1e9 placeholder —
+    // which is the only condition under which price * supply is a market cap.
+    meta.supplyVerified = true;
   }
   return Object.keys(meta).length ? meta : null;
 }

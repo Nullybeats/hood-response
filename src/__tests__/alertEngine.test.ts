@@ -15,7 +15,7 @@ function makeEngine(): { store: MemoryStore; agg: Aggregator; engine: AlertEngin
 
 function soloSwarm(
   token: string,
-  marketCap: number,
+  marketCap: number | null,
   opts: { wallet?: string; price?: number } = {},
 ): Swarm {
   return {
@@ -77,6 +77,14 @@ describe('AlertEngine', () => {
     // Below the market-cap floor (dust) → no solo alert.
     const dust = await ctx.engine.evaluate(soloSwarm('0xdust', 5_000));
     expect(dust).toHaveLength(0);
+  });
+
+  it('fails closed on an UNKNOWN market cap — the ANOA case', async () => {
+    // A cap-banded rule cannot establish band membership without a cap. Null
+    // used to sail through `swarm.marketCap <= 0` because the oracle guaranteed
+    // a (fabricated) positive number, so the branch was never exercised.
+    const unknown = await ctx.engine.evaluate(soloSwarm('0xunknown', null));
+    expect(unknown).toHaveLength(0);
   });
 
   it('does not match a solo swarm against the multi-wallet default rule', async () => {

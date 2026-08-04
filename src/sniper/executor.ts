@@ -17,20 +17,29 @@ import {
 } from 'ethers';
 import { config } from '../config/env.js';
 import { logger } from '../logger.js';
+// Addresses/ABIs shared with the price oracle, which reads the same pools when
+// DexScreener has not indexed a pair yet — see chain/uniswap.ts.
+import {
+  PERMIT2,
+  V4_QUOTER,
+  POSITION_MANAGER,
+  POOL_MANAGER,
+  STATE_VIEW,
+  STATE_VIEW_ABI,
+  INIT_TOPIC,
+  V3_FACTORY,
+  V3_FACTORY_ABI,
+  V3_POOL_ABI,
+  V3_ROUTER,
+  V3_QUOTER,
+  V3_FEE_TIERS,
+} from '../chain/uniswap.js';
 
-// ── Robinhood Chain Uniswap-v4 constants (verified from official + Bags docs) ──
+// ── Trade-path constants (the shared addresses live in chain/uniswap.ts) ──────
 // The UniversalRouter is Robinhood's MODIFIED fork: its v4 swap struct carries
 // an extra `minHopPriceX36` field (always 0), so stock Uniswap SDK calldata
 // reverts. Pool params VARY per token, so the executor resolves each token's
 // real PoolKey on-chain instead of assuming one shape.
-const PERMIT2 = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
-const V4_QUOTER = '0x8dc178efb8111bb0973dd9d722ebeff267c98f94';
-const POSITION_MANAGER = '0x58daec3116aae6d93017baaea7749052e8a04fa7';
-const POOL_MANAGER = '0x8366a39cc670b4001a1121b8f6a443a643e40951';
-const STATE_VIEW = '0xf3334192d15450cdd385c8b70e03f9a6bd9e673b';
-// PoolManager.Initialize(id, currency0, currency1, fee, tickSpacing, hooks, sqrtPriceX96, tick)
-// topics: [sig, id, currency0, currency1]; data: fee,tickSpacing,hooks,sqrtPriceX96,tick
-const INIT_TOPIC = '0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438';
 // ERC-20 Transfer(address indexed from, address indexed to, uint256 value)
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const BAGS_HOOK = '0x2380aBf72C17aABAb76480244759AC7E2932EEcC';
@@ -72,27 +81,12 @@ const PERMIT2_ABI = [
 const POSM_ABI = [
   'function poolKeys(bytes25 poolId) view returns (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks)',
 ];
-const STATE_VIEW_ABI = [
-  'function getSlot0(bytes32 poolId) view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)',
-  'function getLiquidity(bytes32 poolId) view returns (uint128 liquidity)',
-];
 
 // ── Uniswap V3 (genuine, unmodified Uniswap deployment) ────────────────────────
 // Some tokens' real liquidity lives on V3, not V4 — V4-only routing can silently
 // resolve a near-empty V4 pool (see PRICE_SANITY_MULTIPLE below) while missing
-// the actual deep pool entirely. These three addresses are verified on-chain,
-// not assumed: the factory is read directly from a known-liquid V3 pool's own
-// factory() getter; the router/quoter are matched by calling factory() /
-// WETH9() on every "SwapRouter02"/"QuoterV2" contract on this chain and keeping
-// only the one whose factory() equals that same address (this chain has many
-// unrelated token-specific clones of both names, so name matching alone is not
-// safe) — then cross-checked by confirming Factory.getPool() for a known pool
-// returns that pool's real address, and the quote it gives is in the right
-// ballpark of the token's live DexScreener price.
-const V3_FACTORY = '0x1f7d7550B1b028f7571E69A784071F0205FD2EfA';
-const V3_ROUTER = '0xCaf681a66D020601342297493863E78C959E5cb2'; // SwapRouter02
-const V3_QUOTER = '0x33e885eD0Ec9bF04EcfB19341582aADCb4c8A9E7'; // QuoterV2
-const V3_FEE_TIERS = [500, 3000, 10000, 100]; // 0.05% / 0.3% / 1% / 0.01%
+// the actual deep pool entirely. How the V3 addresses were verified on-chain is
+// documented alongside them in chain/uniswap.ts.
 
 /** How long a token's discovered VENUE SET stays valid.
  *
@@ -104,8 +98,6 @@ const V3_FEE_TIERS = [500, 3000, 10000, 100]; // 0.05% / 0.3% / 1% / 0.01%
  *  5 minutes keeps the all-history log scan off the hot path while letting a new pool be seen. */
 const VENUE_CACHE_TTL_MS = 5 * 60_000;
 
-const V3_FACTORY_ABI = ['function getPool(address, address, uint24) view returns (address)'];
-const V3_POOL_ABI = ['function liquidity() view returns (uint128)'];
 const V3_QUOTER_ABI = [
   'function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96) params) returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)',
 ];

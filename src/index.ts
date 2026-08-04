@@ -118,6 +118,7 @@ async function main(): Promise<void> {
       swarm.tokenSymbol = token.symbol;
       swarm.marketCap = price.marketCap(token);
       swarm.priceLive = price.isLive(swarm.token);
+      swarm.priceSource = price.sourceOf(swarm.token);
       swarm.dexUrl = price.dexUrl(swarm.token);
       swarm.priceUsd = price.priceOf(swarm.token);
       swarm.liquidityUsd = price.liquidityOf(swarm.token);
@@ -141,7 +142,7 @@ async function main(): Promise<void> {
     // penalise dangerously thin liquidity.
     let adj = 0;
     const mc = swarm.marketCap;
-    if (mc > 0) {
+    if (mc != null && mc > 0) {
       if (mc < 50_000) adj += 10;
       else if (mc < 150_000) adj += 7;
       else if (mc < 500_000) adj += 4;
@@ -194,16 +195,27 @@ async function main(): Promise<void> {
       return;
     }
     // Global market-cap floor — no alerts on tokens below this cap.
-    if (
-      config.ALERT_MIN_MARKETCAP > 0 &&
-      swarm.marketCap > 0 &&
-      swarm.marketCap < config.ALERT_MIN_MARKETCAP
-    ) {
-      logger.info(
-        { token: swarm.tokenSymbol, mc: Math.round(swarm.marketCap) },
-        'alert suppressed: below minimum market cap',
-      );
-      return;
+    //
+    // FAILS CLOSED on an unknown cap. This gate used to require `marketCap > 0`
+    // to apply, so an unpriced token skipped it entirely; the synthetic oracle
+    // then made sure the cap was never 0, so nothing was ever skipped and
+    // everything was measured against a fabricated number. A cap we cannot
+    // verify is not a cap above the floor.
+    if (config.ALERT_MIN_MARKETCAP > 0) {
+      if (swarm.marketCap == null) {
+        logger.info(
+          { token: swarm.tokenSymbol, priceSource: swarm.priceSource },
+          'alert suppressed: market cap unknown (fail closed)',
+        );
+        return;
+      }
+      if (swarm.marketCap < config.ALERT_MIN_MARKETCAP) {
+        logger.info(
+          { token: swarm.tokenSymbol, mc: Math.round(swarm.marketCap) },
+          'alert suppressed: below minimum market cap',
+        );
+        return;
+      }
     }
     // Global minimum pair age — no alerts on pairs younger than this.
     if (
@@ -241,9 +253,9 @@ async function main(): Promise<void> {
     store.ensureToken(swap.token, swap.tokenSymbol);
     // Log only meaningful (non-dust) live buys/sells — these wallets can be very
     // active in low-value tokenised assets, which would otherwise flood the log.
-    if (config.chainMode === 'live' && swap.usdValue >= config.IGNORE_DUST_USD) {
+    if (config.chainMode === 'live' && (swap.usdValue ?? 0) >= config.IGNORE_DUST_USD) {
       logger.info(
-        { dir: swap.direction, token: swap.tokenSymbol, usd: Math.round(swap.usdValue) },
+        { dir: swap.direction, token: swap.tokenSymbol, usd: Math.round(swap.usdValue ?? 0) },
         'tracked-wallet swap',
       );
     }
@@ -259,7 +271,9 @@ async function main(): Promise<void> {
     const solo = aggregator.soloCandidate(swap);
     if (solo) {
       await enrichSwarm(solo);
+      // Band membership is unprovable without a cap — an unknown one is out.
       if (
+        solo.marketCap != null &&
         solo.marketCap >= config.SOLO_MIN_MARKETCAP &&
         solo.marketCap <= config.SOLO_MAX_MARKETCAP
       ) {

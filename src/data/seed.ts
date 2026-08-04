@@ -58,6 +58,8 @@ function build(): { tokens: TrackedToken[]; wallets: TrackedWallet[] } {
     symbol: t.symbol,
     name: t.name,
     totalSupply: t.totalSupply,
+    // Seed supplies were read from the contracts when the catalog was generated.
+    supplyVerified: true,
     stable: t.stable ?? false,
   }));
 

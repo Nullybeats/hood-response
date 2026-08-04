@@ -66,7 +66,7 @@ async function sendDiscord(url: string, s: Swarm): Promise<NotificationDelivery>
       { name: 'Notional', value: usd(s.totalUsd), inline: true },
       {
         name: s.kind === 'SELL' ? 'Sold at MC' : 'Bought at MC',
-        value: `${usd(s.marketCap)}${s.priceLive ? '' : ' (est)'}`,
+        value: usd(s.marketCap),
         inline: true,
       },
       { name: 'Window', value: `${s.windowSeconds}s`, inline: true },
@@ -75,7 +75,7 @@ async function sendDiscord(url: string, s: Swarm): Promise<NotificationDelivery>
         ? [
             {
               name: '🏔️ ATH MC',
-              value: `${usd(s.athMarketCap)}${s.athMarketCap > 0 && s.marketCap > 0 ? ` (${Math.round(((s.marketCap - s.athMarketCap) / s.athMarketCap) * 1000) / 10}%)` : ''}`,
+              value: `${usd(s.athMarketCap)}${s.athMarketCap > 0 && s.marketCap != null && s.marketCap > 0 ? ` (${Math.round(((s.marketCap - s.athMarketCap) / s.athMarketCap) * 1000) / 10}%)` : ''}`,
               inline: true,
             },
           ]

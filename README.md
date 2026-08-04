@@ -26,8 +26,8 @@ cross-coin conviction wallets. Refresh/expand the list any time with
 | **Solo low-cap alerts** | a *single* tracked wallet buying a coin fires an alert too — but only when the token's market cap is inside the band `SOLO_MIN_MARKETCAP`–`SOLO_MAX_MARKETCAP` (default $25k–$120k), to catch early low-cap entries without dust or large caps |
 | **Fresh-pair first entry** | fires when a qualifying-tier wallet (`FRESH_ENTRY_TIERS`, default alpha+beta) makes its *first-ever* buy of a token whose DEX pair is younger than `FRESH_PAIR_MAX_AGE_HOURS` (default 48h) — the purest "ground floor" signal |
 | **PRIME tier** | the loudest alert — flagged when the swarm's kind + conviction hit the combo that actually backtested well (`PRIME_KINDS` default `ENTRY` @ `PRIME_MIN_CONVICTION` default 80, derived from real tracked-call outcomes). PRIME alerts get a 👑 crown headline, a multiplied 🪰 fly banner, and the kind icon itself repeats 3x — same treatment on Telegram, webhooks, Discord (gold embed), and the dashboard (👑 PRIME badge). Toggle with `PRIME_ALERTS` |
-| **Global alert floors** | *every* alert type is gated by `ALERT_MIN_MARKETCAP` (default $25k) and `PAIR_MIN_AGE_MINUTES` (default 30 min) — nothing below the cap floor or on a pair younger than the age floor ever fires |
-| **Real market cap** | market cap is fetched live from DexScreener at alert time (not just the cached/synthetic value), so every alert reports the true cap it was bought/sold into |
+| **Global alert floors** | *every* alert type is gated by `ALERT_MIN_MARKETCAP` (default $25k) and `PAIR_MIN_AGE_MINUTES` (default 30 min) — nothing below the cap floor or on a pair younger than the age floor ever fires. Both **fail closed on an unknown value**: a token whose market cap cannot be established is suppressed, not waved through |
+| **Real market cap** | market cap is fetched live at alert time, so every alert reports the true cap it was bought/sold into — or reports it as **unknown**. It is never estimated: a cap requires a real price AND a total supply read from the contract |
 | **ATH market cap** | every card also shows the highest market cap seen for that token since the bot started tracking it, and how far the current cap is off that peak (e.g. "🏔️ ATH 2.1M (-64%)") — DexScreener doesn't expose a true lifetime ATH, so this is a running high-water mark, not the coin's all-time record |
 | **One-tap buy links** | alert cards, Discord embeds, and the dashboard include clickable buy buttons for Sigma bot (🎯 SGM) and Based bot (🎲 BSD), pre-filled with the token contract via your own referral id. Configure with `SIGMA_REF` / `BASED_REF`; blank hides that bot's button |
 | **Volume + momentum** | alerts show 24h volume, recent price change, and buy pressure; when volume + direction confirm momentum the alert is flagged 🔥 and conviction is boosted (up to +15). Optional `MOMENTUM_MIN_VOLUME_USD` gate suppresses dead tokens |
@@ -45,7 +45,7 @@ cross-coin conviction wallets. Refresh/expand the list any time with
 | **Settings survive redeploys** | Wallet Groups mutes and the Blue Chip buy/sell toggles are written to disk on every change and restored on boot, so a redeploy doesn't reset them back to the `MUTE_WALLET_TOKENS`/`BLUE_CHIP_*` env defaults. Point `STORE_SETTINGS_PATH` at a mounted Railway Volume (e.g. `/data/settings.json`); empty (default) keeps them in-memory only, same as before |
 | **Wallet tiers** | each wallet is tiered by its best top-10 holder rank across the tracked coins — **alpha** (rank 1–3), **beta** (4–6), **chroma** (7–9), **delta** (10) — which anchors its confidence and feeds the conviction score; alert makeup reads e.g. "2 alpha · 1 beta" |
 | **Conviction score** | 0–100 from wallet quality (tier), count, capital, velocity, liquidity, market cap, historical accuracy, buy/sell ratio |
-| **Live prices & market cap** | real USD price / market cap / pair link from DexScreener (cached, background-refreshed, chain-filtered) when `DEXSCREENER_CHAIN` is set; deterministic synthetic fallback (marked `est`) otherwise |
+| **Live prices & market cap** | real USD price / market cap / pair link from DexScreener (cached, background-refreshed, chain-filtered) when `DEXSCREENER_CHAIN` is set; when DexScreener has not indexed a pair yet, the price is read straight off the token's deepest ETH-paired Uniswap v4/v3 pool. No real source → the price is **null**, shown as `?`, never a placeholder |
 | **Market cap context** | every swarm/alert reports the token market cap it was bought/sold into |
 | **Address privacy** | wallet addresses are never surfaced in alerts, the dashboard, or the API feeds/SSE — only wallet counts and a category makeup (e.g. "3 smart-money · 1 whale") are shown |
 | **Stable wallet ids** | alerts (`walletIds`, index-aligned with `walletLabels`) and `/api/wallets` (`walletId`) carry an opaque salted hash of each wallet, so a consumer can build a per-wallet track record without ever seeing an address. Labels can't do this — they're derived from holdings, so they change as a wallet buys and two wallets can share one. Set `WALLET_ID_SALT` to a long random string once and never rotate it (rotating renames every wallet and orphans downstream history) |
@@ -97,7 +97,10 @@ including brand-new coins, which are auto-registered and priced. Set
 Set `CHAIN_MODE=simulator` to run without the chain — it replays synthetic
 coordinated swaps (including periodic new-coin swarms) so the whole pipeline
 (detection → conviction → alerts → dashboard) is exercised with zero external
-dependencies.
+dependencies. Pair it with `PRICE_SYNTHETIC_FALLBACK=true`: simulated tokens
+have no pool and no DexScreener pair, so without a fabricated price they are
+correctly unvalued and the dust filter drops every swap. That flag is for this
+case and no other.
 
 ## Quick start
 
@@ -124,9 +127,16 @@ RPC latency to the dashboard.
 
 > **Prices:** `DEXSCREENER_CHAIN` (default `robinhood`) pulls real USD price,
 > market cap, and pair links from DexScreener. The slug selects the pair on the
-> right chain rather than a same-address token elsewhere. Clear it to fall back
-> to a deterministic synthetic placeholder (market cap shown as `est`). See
-> `src/chain/price.ts`.
+> right chain rather than a same-address token elsewhere. When DexScreener has
+> no pair (the normal state for a pair minutes old), `POOL_PRICE_FALLBACK`
+> (default on) reads the price from the token's own Uniswap pool. If neither
+> source has an answer the price is **unknown (null)** and every gate fails
+> closed on it — see `src/chain/price.ts` and `src/chain/poolPrice.ts`.
+>
+> `PRICE_SYNTHETIC_FALLBACK` (default **off**, dev only) restores the old
+> behaviour of hashing the token address into a price. It fabricated ANOA's
+> "$13.1M" market cap on 2026-08-04 — real cap $2,598 — and cleared the $25k
+> alert floor with it. Never enable it in production.
 
 ## Configuration
 
