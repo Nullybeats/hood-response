@@ -52,7 +52,7 @@ describe('PRIME formatting', () => {
     const s = swarm({ prime: false });
     expect(headline(s)).not.toContain('PRIME');
     expect(headline(s)).toContain(KIND_EMOJI.ENTRY);
-    expect(textBody(s)).toContain('🪰 SWARM THE FLY 🪰');
+    expect(textBody(s)).toContain('😼 SNIPURR ALERT 😼');
     expect(telegramHtml(s)).not.toContain('👑');
   });
 
@@ -63,11 +63,11 @@ describe('PRIME formatting', () => {
     expect(h).toContain(KIND_EMOJI.ENTRY.repeat(3));
   });
 
-  it('triples the fly in plain text and Telegram headers for PRIME alerts', () => {
+  it('triples the cat in plain text and Telegram headers for PRIME alerts', () => {
     const s = swarm({ prime: true });
-    expect(textBody(s)).toContain('🪰🪰🪰 SWARM THE FLY 🪰🪰🪰');
+    expect(textBody(s)).toContain('😼😼😼 SNIPURR ALERT 😼😼😼');
     const html = telegramHtml(s);
-    expect(html).toContain('🪰🪰🪰 <b>SWARM THE FLY</b> 🪰🪰🪰');
+    expect(html).toContain('😼😼😼 <b>SNIPURR ALERT</b> 😼😼😼');
     expect(html).toContain('👑 PRIME SIGNAL 👑');
   });
 
@@ -192,8 +192,8 @@ describe('result footer (the running result edited onto the alert card)', () => 
   });
 
   it('appends to the original card rather than replacing it', () => {
-    const html = telegramHtmlWithResult('<b>SWARM THE FLY</b>', trackedCall(), now);
-    expect(html.startsWith('<b>SWARM THE FLY</b>')).toBe(true);
+    const html = telegramHtmlWithResult('<b>SNIPURR ALERT</b>', trackedCall(), now);
+    expect(html.startsWith('<b>SNIPURR ALERT</b>')).toBe(true);
     expect(html).toContain('Now +50%');
   });
 });

@@ -11,9 +11,24 @@ import {
   milestoneTextBody,
   telegramHtmlWithResult,
 } from './format.js';
-import { explorerUrl, sigmaBuyUrl, basedBuyUrl } from '../links.js';
+import { explorerUrl, sigmaBuyUrl, basedBuyUrl, mascotUrl } from '../links.js';
 
 const TIMEOUT_MS = 4000;
+
+/**
+ * Telegram renders the artwork as a link preview, not an attachment, on purpose:
+ * a sendPhoto message can only ever be edited as a caption (1024 chars, and a
+ * different endpoint), which would break the running result footer editAlertResult()
+ * writes onto the same message. link_preview_options keeps the card a normal text
+ * message while still showing the cat above it.
+ */
+function previewOptions(kind: string, prime: boolean): Record<string, unknown> {
+  return {
+    url: mascotUrl(kind, prime),
+    prefer_large_media: true,
+    show_above_text: true,
+  };
+}
 
 async function postJson(url: string, body: unknown): Promise<Response> {
   const ctrl = new AbortController();
@@ -86,11 +101,11 @@ async function sendDiscord(url: string, s: Swarm): Promise<NotificationDelivery>
         inline: true,
       },
     ],
-    footer: { text: 'Swarm the Fly · Robinhood Chain' },
+    footer: { text: 'Snipurr · Robinhood Chain' },
     timestamp: new Date(s.lastSeen).toISOString(),
   };
   try {
-    const res = await postJson(url, { username: 'Swarm the Fly', embeds: [embed] });
+    const res = await postJson(url, { username: 'Snipurr', embeds: [embed] });
     return delivery('discord', res.ok, res.ok ? undefined : `HTTP ${res.status}`);
   } catch (err) {
     return delivery('discord', false, (err as Error).message);
@@ -116,7 +131,7 @@ async function sendTelegram(
       chat_id: chatId,
       text: cardHtml,
       parse_mode: 'HTML',
-      disable_web_page_preview: true,
+      link_preview_options: previewOptions(s.kind, s.prime === true),
     });
     if (res.ok) {
       // Remember which message this call owns. Failing to read the id only costs
@@ -161,7 +176,9 @@ export async function editAlertResult(
       message_id: messageId,
       text: telegramHtmlWithResult(cardHtml, call, Date.now()),
       parse_mode: 'HTML',
-      disable_web_page_preview: true,
+      // Same preview the card was sent with — omitting it would strip the mascot
+      // off the message the first time a result footer lands.
+      link_preview_options: previewOptions(call.kind, cardHtml.includes('PRIME SIGNAL')),
     });
     if (res.ok) return true;
     const reason = await res
@@ -248,11 +265,11 @@ async function sendMilestoneDiscord(
         : []),
       { name: 'Links', value: `[📊 Chart](${dexUrl}) · [🔎 Explorer](${explorerUrl(call.token)})`, inline: true },
     ],
-    footer: { text: 'Swarm the Fly · PnL milestone' },
+    footer: { text: 'Snipurr · PnL milestone' },
     timestamp: new Date().toISOString(),
   };
   try {
-    const res = await postJson(url, { username: 'Swarm the Fly', embeds: [embed] });
+    const res = await postJson(url, { username: 'Snipurr', embeds: [embed] });
     return delivery('discord', res.ok, res.ok ? undefined : `HTTP ${res.status}`);
   } catch (err) {
     return delivery('discord', false, (err as Error).message);

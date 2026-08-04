@@ -20,6 +20,25 @@ export function explorerUrl(tokenAddress: string): string {
   return `${base}/token/${tokenAddress.toLowerCase()}`;
 }
 
+/** Mascot art for an alert, by kind — the cat Telegram renders above the card.
+ *  PRIME overrides the kind and gets the sniper portrait. Paths are files in
+ *  cipherfi's `web/public/`, served from ASSET_BASE_URL. */
+export function mascotUrl(kind: string, prime = false): string {
+  const base = config.ASSET_BASE_URL.replace(/\/$/, '');
+  if (prime) return `${base}/lore/sniper-cat.webp`;
+  const path =
+    kind === 'SELL'
+      ? '/mascot/kneel.webp'
+      : kind === 'ROTATION'
+        ? '/mascot/point.webp'
+        : kind === 'SOLO'
+          ? '/mascot/bipod.webp'
+          : kind === 'ENTRY'
+            ? '/mascot/prone.webp'
+            : '/mascot/advance.webp';
+  return `${base}${path}`;
+}
+
 /** One-tap Sigma bot buy link, pre-filled with the token contract. Null when
  *  no referral id is configured (SIGMA_REF). */
 export function sigmaBuyUrl(tokenAddress: string): string | null {

@@ -3,12 +3,15 @@ import type { TrackedCall } from '../engine/performance.js';
 import { explorerUrl, sigmaBuyUrl, basedBuyUrl } from '../links.js';
 
 export const KIND_EMOJI: Record<Swarm['kind'], string> = {
-  BUY: '🟢🪰',
-  SELL: '🔴🪰',
-  ROTATION: '🔄🪰',
-  SOLO: '🕵️🪰',
-  ENTRY: '🌱🪰',
+  BUY: '🟢😼',
+  SELL: '🔴🙀',
+  ROTATION: '🔄🐈',
+  SOLO: '🕵️🐱',
+  ENTRY: '🌱🐾',
 };
+
+/** Brand title every alert card opens with. */
+const BRAND = 'SNIPURR ALERT';
 
 /** PRIME multiplies the kind icon itself — the swarm literally gets bigger. */
 function primeIcon(s: Swarm): string {
@@ -75,7 +78,7 @@ function repeatLines(s: Swarm): string[] {
   const lines: string[] = [];
   if (s.repeatNewWallet) {
     // A different top holder just joined — the strongest repeat signal.
-    lines.push(`🚨 NEW HOLDER IN 🪰🔥 · ${ordinal(n)} alert · ${w} wallet${w > 1 ? 's' : ''} in ${win}m`);
+    lines.push(`🚨 NEW HOLDER IN 😼🔥 · ${ordinal(n)} alert · ${w} wallet${w > 1 ? 's' : ''} in ${win}m`);
   } else {
     const heat = n >= 4 ? '🔥🔥' : '🔥';
     lines.push(`🔁 REPEAT x${n} ${heat} · ${ordinal(n)} alert in ${win}m`);
@@ -114,7 +117,7 @@ export function headline(s: Swarm): string {
  *  alert icon itself multiplies (3x), same idea as the header. */
 function primeBanner(s: Swarm): string[] {
   if (!s.prime) return [];
-  const swarm = '🪰'.repeat(9);
+  const swarm = '🐾'.repeat(9);
   return [swarm, `👑 PRIME SIGNAL 👑 ${primeIcon(s)}`, swarm];
 }
 
@@ -131,7 +134,7 @@ function athLabel(s: Swarm): string {
 /** The card's stacked display lines (no links; shared by plain + HTML). */
 function cardLines(s: Swarm): string[] {
   const sym = s.tokenSymbol;
-  const marker = s.kind === 'SELL' ? '🔻' : s.kind === 'ENTRY' ? '🌱' : '🩸';
+  const marker = s.kind === 'SELL' ? '🔻' : s.kind === 'ENTRY' ? '🌱' : '🎯';
   const buys = s.momentum?.buys ?? null;
   const sells = s.momentum?.sells ?? null;
 
@@ -147,7 +150,7 @@ function cardLines(s: Swarm): string[] {
     `📊 Vol ${compact(s.momentum?.volumeUsd)}  ·  ⏳ Age ${fmtAge(s.pairAgeHours)}`,
     `📈 24h ${pct(s.momentum?.priceChange24h)}  ·  1h ${pct(s.momentum?.priceChange1h)}  ·  🅑 ${buys ?? '?'} 🅢 ${sells ?? '?'}`,
     ``,
-    `🐝 CONVICTION ${s.conviction}/100${s.momentum?.confirmed ? ' 🔥' : ''}`,
+    `😼 CONVICTION ${s.conviction}/100${s.momentum?.confirmed ? ' 🔥' : ''}`,
     convBar(s.conviction),
     `👛 ${s.walletSummary}`,
   ];
@@ -165,8 +168,8 @@ function cardLines(s: Swarm): string[] {
 
 // ── plain text (generic webhooks) ─────────────────────────────────────────────
 export function textBody(s: Swarm): string {
-  const fly = s.prime ? '🪰'.repeat(3) : '🪰';
-  const lines = [`${fly} SWARM THE FLY ${fly}`, typeTitle(s), ``, ...cardLines(s), ``, s.token];
+  const cat = s.prime ? '😼'.repeat(3) : '😼';
+  const lines = [`${cat} ${BRAND} ${cat}`, typeTitle(s), ``, ...cardLines(s), ``, s.token];
   lines.push(`📊 Chart: ${s.dexUrl}`);
   lines.push(`🔎 Explorer: ${explorerUrl(s.token)}`);
   const sigma = sigmaBuyUrl(s.token);
@@ -182,7 +185,7 @@ const esc = (str: string): string =>
 
 export function telegramHtml(s: Swarm): string {
   const body = cardLines(s).map(esc).join('\n');
-  const fly = s.prime ? '🪰'.repeat(3) : '🪰';
+  const cat = s.prime ? '😼'.repeat(3) : '😼';
   const sigma = sigmaBuyUrl(s.token);
   const based = basedBuyUrl(s.token);
   const buyLinks = [
@@ -190,7 +193,7 @@ export function telegramHtml(s: Swarm): string {
     based ? `<a href="${esc(based)}">🎲 Buy BSD</a>` : null,
   ].filter((x): x is string => x != null);
   return (
-    `${fly} <b>SWARM THE FLY</b> ${fly}\n` +
+    `${cat} <b>${BRAND}</b> ${cat}\n` +
     `<b>${esc(typeTitle(s))}</b>\n\n` +
     `${body}\n\n` +
     `<code>${esc(s.token)}</code>\n` +
@@ -254,11 +257,11 @@ function milestoneLines(call: TrackedCall, milestonePct: number): string[] {
   const ageMin = Math.floor((Date.now() - call.entryAt) / 60_000);
   const age = ageMin < 60 ? `${ageMin}m` : `${Math.floor(ageMin / 60)}h`;
   const lines: string[] = [
-    `🪰 $${call.tokenSymbol} just crossed +${milestonePct}% peak`,
+    `😼 $${call.tokenSymbol} just crossed +${milestonePct}% peak`,
     `💎 Entry ${compact(call.entryMarketCap)} MC → now ${compact(call.lastMarketCap)} MC`,
     `📈 Currently ${call.lastGainPct >= 0 ? '+' : ''}${call.lastGainPct}% vs entry`,
     `⏳ ${age} since the call · pair was ${fmtAge(call.pairAgeHours)} old`,
-    `🐝 Conviction ${call.conviction}/100 · ${call.kind}`,
+    `😼 Conviction ${call.conviction}/100 · ${call.kind}`,
   ];
   if (call.walletLabels.length) lines.push(`👛 Called by: ${call.walletLabels.join(', ')}`);
   return lines;

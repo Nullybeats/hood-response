@@ -330,6 +330,11 @@ const schema = z.object({
   // contract so tapping the button opens the bot with the swap pre-filled.
   // Each ref is the operator's own referral id with that bot; blank disables
   // the button for that bot.
+  // Public origin serving the site's static art (web/public/**). Alert cards point
+  // Telegram's link preview at a mascot image under here, so it must be reachable
+  // from Telegram's servers — a localhost value silently drops the artwork.
+  ASSET_BASE_URL: z.string().default('https://snipurr.fun'),
+
   SIGMA_REF: z.string().default('450463357'),
   BASED_REF: z.string().default('Rick'),
 
