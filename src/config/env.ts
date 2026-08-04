@@ -1,6 +1,21 @@
 import { readFileSync, existsSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { getAddress } from 'ethers';
 import { z } from 'zod';
+
+/** Resolve the admin password, failing CLOSED when none is configured: an unset or blank value
+ *  becomes a random secret nobody holds, so the admin surface is unreachable instead of open.
+ *  Warns rather than throws — a feed with no admin password is still a perfectly good alert feed. */
+function adminPassword(raw: string): string {
+  const t = raw.trim();
+  if (t) return t;
+  // eslint-disable-next-line no-console -- the logger imports config, so it cannot be used here.
+  console.warn(
+    '[config] ADMIN_PASSWORD is not set — admin routes are locked with a random per-boot secret. ' +
+    'Set ADMIN_PASSWORD to use them.',
+  );
+  return randomBytes(24).toString('hex');
+}
 
 /** Normalise an address to a valid EIP-55 checksum regardless of input casing;
  *  returns '' for empty and leaves genuinely invalid strings as-is. */
@@ -182,9 +197,15 @@ const schema = z.object({
   // mounted Railway Volume (e.g. /data/settings.json); empty = in-memory only.
   STORE_SETTINGS_PATH: z.string().default(''),
   // Password gating the dashboard admin controls (Alert Filters, Wallet Groups)
-  // and their toggle endpoints. Change this in Railway for real security — the
-  // default is a convenience only. Empty disables the admin gate entirely.
-  ADMIN_PASSWORD: z.string().default('abcfly'),
+  // and their toggle endpoints.
+  //
+  // NO DEFAULT PASSWORD, and empty no longer means "open". This used to default to a short literal
+  // with a comment saying to change it in Railway; [verified 2026-08-04] the live public feed had
+  // never had it set, so all 24 admin-gated routes — including POST /api/performance/reset, which
+  // wipes the public call record — accepted that literal from anyone who read the repo.
+  // Unset now yields a random per-boot secret (see the derived config below): admin routes become
+  // unreachable rather than open. Fails closed, loudly.
+  ADMIN_PASSWORD: z.string().default(''),
 
   // ── Sniper: auto-buy alerts with a server hot wallet ──────────────────────────
   // A single on/off switch (SNIPER_ENABLED), OFF by default. When ON it places
@@ -441,6 +462,9 @@ export const config = {
       .map((s) => s.trim().toUpperCase())
       .filter(Boolean),
   ),
+  // An unset admin password becomes a random per-boot secret rather than a known literal or an
+  // open gate, so a deployment that forgot to set one is locked out of admin, not exposed by it.
+  ADMIN_PASSWORD: adminPassword(env.ADMIN_PASSWORD),
   // Normalise so any casing of the router/WETH addresses is accepted (ethers
   // rejects a mixed-case address whose checksum doesn't match).
   SNIPER_ROUTER: normAddr(env.SNIPER_ROUTER),

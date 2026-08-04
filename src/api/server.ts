@@ -158,8 +158,9 @@ export async function buildServer(
     if (tier) wallets = wallets.filter((w) => w.tier === tier);
     // Address is redacted for the PUBLIC list; the authenticated admin (the cipherfi
     // wallet-manager) gets it so it can identify wallets to retier/remove.
+    // Same rule as adminOk: an unconfigured password must not reveal addresses to everyone.
     const showAddr =
-      config.ADMIN_PASSWORD.length === 0 || req.headers['x-admin-password'] === config.ADMIN_PASSWORD;
+      config.ADMIN_PASSWORD.length > 0 && req.headers['x-admin-password'] === config.ADMIN_PASSWORD;
     return wallets.map(({ address, ...w }) => ({
       ...w,
       address: showAddr ? address : undefined,
@@ -205,9 +206,14 @@ export async function buildServer(
   // ── Admin gate ──────────────────────────────────────────────────────────────
   // Admin controls (Alert Filters, Wallet Groups) sit behind a password checked
   // server-side, so the secret is never in the page source and the toggle
-  // endpoints can't be hit without it. Empty ADMIN_PASSWORD disables the gate.
+  // endpoints can't be hit without it.
+  //
+  // There is deliberately NO "empty password opens the gate" escape any more. It read as a
+  // convenience and behaved as a backdoor: the worst possible value silently granted everyone
+  // admin. config.ADMIN_PASSWORD is now never empty (unset → random per boot), so an unconfigured
+  // deployment is locked, not open.
   const adminOk = (req: { headers: Record<string, unknown>; query?: unknown }): boolean => {
-    if (config.ADMIN_PASSWORD.length === 0) return true;
+    if (config.ADMIN_PASSWORD.length === 0) return false; // unreachable by construction; fail closed anyway
     const header = req.headers['x-admin-password'];
     const fromHeader = typeof header === 'string' ? header : undefined;
     const fromQuery = (req.query as { pw?: string } | undefined)?.pw;
