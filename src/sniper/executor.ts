@@ -317,6 +317,7 @@ export class SwapExecutor {
   }
 
   /** Set the hot-wallet key at runtime (from the dashboard). Not persisted. */
+  // (see addressOfPrivateKey below for the non-mutating derivation used by enrolment checks)
   setPrivateKey(pk: string): string {
     const clean = pk.trim();
     const w = new Wallet(clean); // throws on a bad key
@@ -1521,4 +1522,15 @@ export class SwapExecutor {
       venue: 'v3',
     };
   }
+}
+
+/**
+ * The address a private key controls, WITHOUT enrolling or unlocking anything.
+ *
+ * Enrolment needs to answer "is another owner already using this wallet?" before it commits, and
+ * the only other way to learn the address was `setPrivateKey`, which loads the key into a live
+ * executor. Throws on a malformed key, exactly as enrolment does.
+ */
+export function addressOfPrivateKey(pk: string): string {
+  return new Wallet(pk.trim()).address;
 }

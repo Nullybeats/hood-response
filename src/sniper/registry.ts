@@ -7,6 +7,7 @@ import type { Swarm } from '../types.js';
 import { SniperEngine } from './engine.js';
 import { SniperStateStore } from './state.js';
 import { notifyBotState } from '../notify/state.js';
+import { findWalletOwner, sharedWallets } from './walletShare.js';
 
 /**
  * Multi-tenant sniper: one {@link SniperEngine} per admin (keyed by their cipherfi
@@ -102,6 +103,27 @@ export class SniperRegistry {
   /** All live engines — the alert stream is broadcast to each. */
   all(): SniperEngine[] {
     return [...this.engines.values()];
+  }
+
+  /**
+   * Which OTHER owner already has this wallet address enrolled, if any.
+   *
+   * The per-position sell cap stops one tenant dumping another's lot, but it cannot make a shared
+   * wallet's BALANCE two balances: both engines size their buys against the same ETH, so one
+   * owner's fill silently spends what the other's sizing already counted on. That is not fixable
+   * downstream — the only real fix is not to share the wallet — so this exists to refuse the
+   * condition at the moment it would be created, rather than warn about it a boot later.
+   *
+   * `null` when the address is free. Case-insensitive; an unenrolled or locked engine has no
+   * address and is skipped.
+   */
+  ownerOfWallet(address: string, exceptOwner: string): string | null {
+    return findWalletOwner(this.engines.values(), address, exceptOwner);
+  }
+
+  /** Announce a shared wallet NOW rather than at the next boot — called after a deliberate override. */
+  announceSharedWallets(): void {
+    this.warnOnSharedWallets();
   }
 
   /** Fan an alert out to every engine; each decides independently by its own
@@ -206,14 +228,7 @@ export class SniperRegistry {
    * condition the operator may have chosen; this makes it visible and leaves the choice.
    */
   private warnOnSharedWallets(): void {
-    const byAddress = new Map<string, string[]>();
-    for (const engine of this.engines.values()) {
-      const addr = engine.walletAddress?.toLowerCase();
-      if (!addr) continue; // locked or unenrolled — nothing to compare
-      byAddress.set(addr, [...(byAddress.get(addr) ?? []), engine.owner]);
-    }
-    for (const [addr, owners] of byAddress) {
-      if (owners.length < 2) continue;
+    for (const [addr, owners] of sharedWallets(this.engines.values())) {
       logger.warn(
         { addr, owners },
         'sniper: SHARED WALLET — one address is enrolled by multiple owners; sells are capped per position, but balances are not isolated',

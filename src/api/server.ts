@@ -9,6 +9,7 @@ import type { AlertEngine } from '../engine/alertEngine.js';
 import type { Aggregator } from '../engine/aggregator.js';
 import type { PerformanceTracker } from '../engine/performance.js';
 import type { SniperRegistry } from '../sniper/registry.js';
+import { addressOfPrivateKey } from '../sniper/executor.js';
 import { configuredChannels, dispatch } from '../notify/index.js';
 import { walletId } from '../walletId.js';
 import type { Alert, AlertRule, Swarm, SwapEvent, WalletCategory } from '../types.js';
@@ -320,13 +321,39 @@ export async function buildServer(
   app.post('/api/sniper/wallet', async (req, reply) => {
     if (!adminOk(req)) return denyAdmin(reply);
     if (!sniper) return reply.code(503).send({ error: 'sniper not available' });
-    const pk = (req.body as { privateKey?: string } | undefined)?.privateKey;
+    const body = req.body as { privateKey?: string; allowShared?: boolean } | undefined;
+    const pk = body?.privateKey;
     if (!pk || typeof pk !== 'string') return reply.code(400).send({ error: 'privateKey required' });
+
+    // Derive the address BEFORE committing anything. Two owners on one wallet share a BALANCE:
+    // the per-position sell cap stops one dumping the other's lot, but both engines size their
+    // buys against the same ETH, so one owner's fill silently spends what the other's sizing
+    // counted on. Nothing downstream can fix that — so refuse to create it here. `allowShared`
+    // is the deliberate override for an operator who really does mean it (e.g. the same person
+    // on two accounts); it enrols AND announces the condition immediately.
+    let address: string;
     try {
-      const engine = await sniper.get(userIdOf(req));
-      const address = engine.enrollPrivateKey(pk);
-      logger.info({ owner: engine.owner, address }, 'sniper: encrypted wallet key enrolled');
-      return { ok: true, address };
+      address = addressOfPrivateKey(pk);
+    } catch {
+      return reply.code(400).send({ error: 'invalid private key' });
+    }
+    const engine = await sniper.get(userIdOf(req));
+    const otherOwner = sniper.ownerOfWallet(address, engine.owner);
+    if (otherOwner && !body?.allowShared) {
+      logger.warn({ owner: engine.owner, address, otherOwner }, 'sniper: refused shared-wallet enrolment');
+      return reply.code(409).send({
+        error: 'wallet already enrolled by another operator — balances would not be isolated',
+        address,
+        conflictsWith: otherOwner,
+        hint: 'use a separate wallet, or resend with allowShared:true to accept a shared balance',
+      });
+    }
+
+    try {
+      const enrolled = engine.enrollPrivateKey(pk);
+      logger.info({ owner: engine.owner, address: enrolled, shared: !!otherOwner }, 'sniper: encrypted wallet key enrolled');
+      if (otherOwner) sniper.announceSharedWallets(); // deliberate override — say so now, not next boot
+      return { ok: true, address: enrolled, sharedWith: otherOwner ?? undefined };
     } catch {
       return reply.code(400).send({ error: 'invalid private key' });
     }
