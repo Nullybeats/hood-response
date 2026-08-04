@@ -188,6 +188,41 @@ export class SniperRegistry {
       }
       // Non-auto owners (customers) intentionally stay locked-at-rest; no alert.
     }
+    this.warnOnSharedWallets();
+  }
+
+  /**
+   * Report any wallet address enrolled by more than one owner.
+   *
+   * Tenants are structurally separate — own engine, own store, own executor, own key — so this
+   * is not a leak. It is an OPERATIONAL condition: two owners can enrol the SAME key, and then a
+   * sell by one is a transfer out of the other's balance too. The executor already sizes every
+   * sell to the position's own recorded lot (see `sell()` in executor.ts), which is what stops a
+   * sibling being dumped; but that cap is the only thing standing between a shared wallet and a
+   * cross-tenant surprise, and until now nothing said out loud that the wallet WAS shared. One
+   * position closed `reconciled` at -100.59% before that cap existed.
+   *
+   * Log-only, deliberately. Refusing to boot on a shared wallet would take the sniper dark over a
+   * condition the operator may have chosen; this makes it visible and leaves the choice.
+   */
+  private warnOnSharedWallets(): void {
+    const byAddress = new Map<string, string[]>();
+    for (const engine of this.engines.values()) {
+      const addr = engine.walletAddress?.toLowerCase();
+      if (!addr) continue; // locked or unenrolled — nothing to compare
+      byAddress.set(addr, [...(byAddress.get(addr) ?? []), engine.owner]);
+    }
+    for (const [addr, owners] of byAddress) {
+      if (owners.length < 2) continue;
+      logger.warn(
+        { addr, owners },
+        'sniper: SHARED WALLET — one address is enrolled by multiple owners; sells are capped per position, but balances are not isolated',
+      );
+      notifyBotState(
+        'wallet-locked',
+        `⚠️ shared wallet ${addr.slice(0, 8)}… is enrolled by ${owners.length} owners (${owners.join(', ')}) — balances are not isolated`,
+      );
+    }
   }
 
   start(): void {

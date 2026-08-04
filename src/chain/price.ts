@@ -14,11 +14,14 @@ interface LivePrice {
   /** Which real source produced this price. */
   source: PriceSource;
   priceUsd: number;
-  /** Price in the pair's quote currency (almost always WETH here) — lets us
-   *  derive an ETH/USD rate from ANY live pair (priceUsd / priceNative), since
-   *  DexScreener won't return a direct listing for WETH itself (it's the quote
-   *  side of virtually every pair, never the base). */
+  /** Price in the pair's QUOTE currency. `priceUsd / priceNative` is the quote
+   *  token's USD rate — which is the ETH/USD rate only when the quote token is
+   *  actually WETH. It usually is, and "usually" is why {@link quoteToken}
+   *  exists: see the note on ethUsdPrice(). */
   priceNative: number | null;
+  /** The pair's quote token address, lowercased, when the source reports one.
+   *  Null for pool-derived entries (no DexScreener pair behind them). */
+  quoteToken: string | null;
   /** Market cap (USD) as reported by the source, or null when the source has
    *  none — pool-derived prices know nothing about supply. */
   marketCap: number | null;
@@ -40,6 +43,7 @@ interface DexPair {
   dexId?: string;
   pairAddress?: string;
   baseToken?: { address?: string; symbol?: string };
+  quoteToken?: { address?: string; symbol?: string };
   priceUsd?: string;
   priceNative?: string;
   marketCap?: number;
@@ -60,6 +64,11 @@ const MAX_CACHE = 5_000;
 const LIVE_STALE_MS = 30 * 60_000;
 // How long a fetched ETH/USD reference rate stays usable.
 const ETH_USD_REF_TTL_MS = 5 * 60_000;
+/** Plausibility band for an ETH/USD rate. Wide on purpose: this exists to reject a
+ *  catastrophically wrong rate (the observed failures were $1.00 and $0.0089), not to
+ *  second-guess the market. Widen it before ETH ever threatens either end. */
+const ETH_USD_MIN = 50;
+const ETH_USD_MAX = 100_000;
 
 /** Evict oldest-inserted entries until the map is under `max`. */
 function capMap<T>(map: Map<string, T>, max: number): void {
@@ -230,23 +239,53 @@ export class PriceOracle {
   }
 
   /**
-   * Native-token (ETH/WETH) USD price, derived from ANY currently-live pair as
-   * priceUsd / priceNative — since a token's own priceUsd is already priced
-   * against its quote currency (WETH here), that ratio IS the ETH/USD rate.
-   * DexScreener never returns a direct "WETH" listing (WETH is the quote side
-   * of virtually every pair, never the base), so this is the reliable source.
-   * Returns null only if no live pair has been fetched yet.
+   * Native-token (ETH/WETH) USD price, derived from a live pair as
+   * priceUsd / priceNative — a token's priceUsd is quoted against its QUOTE
+   * currency, so that ratio is the quote token's USD rate.
+   *
+   * That is the ETH/USD rate ONLY IF the quote token is WETH. The original
+   * version assumed it always was and took whichever pair was fetched most
+   * recently, which is how a single stablecoin-quoted pair could set the
+   * process-wide ETH rate to ~$1.00.
+   *
+   * [verified 2026-08-04] It did. Recovering the implied rate from 24 closed
+   * positions (exitPriceUsd x tokensReceived / exitValueEth) gives 13 at ~$1900,
+   * but 8 at ~$1.00, two at ~$113, one at ~$22 and one at ~$0.0089 — every
+   * non-WETH quote in the cache, stamped onto whatever position happened to
+   * close while it was the newest entry. Those exits recorded a fill price up to
+   * ~1900x wrong.
+   *
+   * Three changes, in order of how much they matter:
+   *  1. Only WETH-quoted pairs count. A pair whose quote we cannot identify is
+   *     skipped, never guessed at — same rule as the rest of this file.
+   *  2. The MEDIAN of the fresh candidates, not the newest one. One anomalous
+   *     pair should not be able to move the rate the whole process prices with.
+   *  3. A plausibility band. This is a backstop, not the fix: it rejects a
+   *     catastrophically wrong rate rather than trying to correct one, and it
+   *     is deliberately wide enough to never clip a real market move.
+   *
+   * Returns null when nothing qualifies — unknown, not a guess.
    */
   ethUsdPrice(): number | null {
-    let best: { rate: number; fetchedAt: number } | null = null;
-    for (const l of this.live.values()) {
-      if (!l.priceNative || l.priceNative <= 0) continue;
-      const rate = l.priceUsd / l.priceNative;
-      if (!best || l.fetchedAt > best.fetchedAt) best = { rate, fetchedAt: l.fetchedAt };
+    const weth = config.SNIPER_WETH?.toLowerCase();
+    const now = Date.now();
+    const rates: number[] = [];
+    if (weth) {
+      for (const l of this.live.values()) {
+        if (!l.priceNative || l.priceNative <= 0) continue;
+        if (l.quoteToken !== weth) continue; // not an ETH-quoted pair: its ratio is some OTHER token's USD rate
+        if (now - l.fetchedAt > LIVE_STALE_MS) continue;
+        const rate = l.priceUsd / l.priceNative;
+        if (Number.isFinite(rate) && rate >= ETH_USD_MIN && rate <= ETH_USD_MAX) rates.push(rate);
+      }
     }
-    if (best) return best.rate;
-    // Nothing cached yet — fall back to the last reference rate we fetched.
-    return this.ethUsdRef && Date.now() - this.ethUsdRef.at < ETH_USD_REF_TTL_MS
+    if (rates.length) {
+      rates.sort((a, b) => a - b);
+      const m = rates.length >> 1;
+      return rates.length % 2 ? rates[m]! : (rates[m - 1]! + rates[m]!) / 2;
+    }
+    // Nothing qualifies — fall back to the last reference rate we fetched.
+    return this.ethUsdRef && now - this.ethUsdRef.at < ETH_USD_REF_TTL_MS
       ? this.ethUsdRef.rate
       : null;
   }
@@ -404,6 +443,7 @@ export class PriceOracle {
         source: 'dexscreener',
         priceUsd,
         priceNative: Number.isFinite(priceNative) && priceNative > 0 ? priceNative : null,
+        quoteToken: best.quoteToken?.address?.toLowerCase() ?? null,
         marketCap,
         liquidityUsd: best.liquidity?.usd ?? null,
         pairCreatedAt: best.pairCreatedAt ?? null,
@@ -457,6 +497,7 @@ export class PriceOracle {
       source: 'pool',
       priceUsd,
       priceNative: null,
+      quoteToken: null,
       // A pool knows a price, not a supply — market cap is derived by the
       // caller from a VERIFIED total supply, or left unknown.
       marketCap: null,

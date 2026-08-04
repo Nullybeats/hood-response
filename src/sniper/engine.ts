@@ -360,6 +360,10 @@ export class SniperEngine {
 
   get executionMode(): SniperMode { return this.mode; }
 
+  /** This engine's unlocked wallet address, or null when locked/unenrolled. Read-only; used by the
+   *  registry to spot one address enrolled by more than one owner. */
+  get walletAddress(): string | null { return this.executor.address(); }
+
   setMode(mode: SniperMode): { mode: SniperMode } {
     if (mode === 'live') {
       if (config.SNIPER_GLOBAL_KILL) throw new Error('global kill switch is active');
