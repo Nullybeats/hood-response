@@ -229,6 +229,24 @@ export interface Evidence {
   deltas: WalletDelta[];
   /** Human-readable one-liner. Supplementary to the structured fields above. */
   note?: string;
+  /**
+   * Set only on `insufficient_trace_data`, to make the trace-provider decision
+   * quantifiable rather than a judgement call.
+   *
+   *   oneSidedDelta   exactly one token leg moved for this wallet
+   *   hadTopLevelValue tx.value was non-zero (so the native leg MIGHT be visible)
+   *   hadVerifiedSwap a verified pool emitted a Swap in this transaction
+   *
+   * A case with a one-sided delta, no top-level value, and a verified swap is a
+   * PLAUSIBLE trade that traces would resolve. One without a swap is probably
+   * unrelated and traces would not help. Counting them separately is what says
+   * whether a trace provider is worth its complexity.
+   */
+  traceGap?: {
+    oneSidedDelta: boolean;
+    hadTopLevelValue: boolean;
+    hadVerifiedSwap: boolean;
+  };
 }
 
 export interface AttributionResult {

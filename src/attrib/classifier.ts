@@ -221,14 +221,18 @@ export function classifyTransaction(input: ClassifyInput): AttributionResult {
         ev('swap present but no net asset movement for this wallet'),
       );
     }
-    return result(
-      'insufficient_trace_data',
-      ev(
-        traceUnreadable
-          ? 'swap present; a native leg is known to exist but the trace could not be read'
-          : 'swap present, one asset leg only; native/internal flow unprovable from receipts',
-      ),
+    const gapEv = ev(
+      traceUnreadable
+        ? 'swap present; a native leg is known to exist but the trace could not be read'
+        : 'swap present, one asset leg only; native/internal flow unprovable from receipts',
     );
+    // Quantify the gap so the trace-provider decision is arithmetic, not taste.
+    gapEv.traceGap = {
+      oneSidedDelta: up.length + down.length === 1,
+      hadTopLevelValue: ctx.nativeValueWei != null && ctx.nativeValueWei !== '0',
+      hadVerifiedSwap: oursSwaps.length > 0,
+    };
+    return result('insufficient_trace_data', gapEv);
   }
 
   // An unverified swap is evidence of something, but never of a trade.

@@ -775,6 +775,37 @@ export class AttributionLedger {
     return { pairs, attributed, pending, drift: pairs - attributed - pending };
   }
 
+  /**
+   * Rows needed for the trace-provider decision: every `insufficient_trace_data`
+   * verdict, with whether the LIVE listener emitted a swap for the same pair.
+   *
+   * The join to attrib_emission is what turns "how many are trace-blocked" into
+   * "how many LIVE SIGNALS would change", which is the number the decision
+   * actually rests on.
+   */
+  traceGapRows(classifierVersion: number): { evidence_json: string; liveEmitted: number }[] {
+    if (!this.db) return [];
+    return this.db
+      .prepare(
+        `SELECT a.evidence_json AS evidence_json,
+                EXISTS (SELECT 1 FROM attrib_emission e
+                  WHERE e.tx_hash = a.tx_hash AND e.watched_wallet = a.watched_wallet) AS liveEmitted
+         FROM attrib_attribution a
+         WHERE a.classifier_version = ? AND a.category = 'insufficient_trace_data'`,
+      )
+      .all(classifierVersion) as unknown as { evidence_json: string; liveEmitted: number }[];
+  }
+
+  /** How many attributed pairs the live listener also emitted a swap for. */
+  liveEmittedCount(): number {
+    if (!this.db) return 0;
+    return (
+      this.db
+        .prepare('SELECT COUNT(*) AS n FROM (SELECT DISTINCT tx_hash, watched_wallet FROM attrib_emission)')
+        .get() as unknown as { n: number }
+    ).n;
+  }
+
   /** Prune old rows. Failures and still-pending pairs are never auto-pruned. */
   pruneBefore(block: number): number {
     if (!this.db) return 0;
