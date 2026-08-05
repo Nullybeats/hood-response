@@ -75,8 +75,8 @@ export interface PonsJournalSummary {
   simulated: number;
   wouldFill: number;
   wouldFillPct: number | null;
-  /** Median entry slippage, quoted vs simulated, in %. */
-  medianSlippagePct: number | null;
+  /** Median gas the simulated buy would burn — the one cost a same-block sim CAN measure. */
+  medianGas: number | null;
 }
 
 /** Aggregate for the UI header. Deliberately counts skips by reason — see the note above. */
@@ -90,15 +90,20 @@ export function ponsJournalSummary(owner?: string): PonsJournalSummary {
   const armedEarly = acted.filter((e) => e.gateLatencyMs > 1000).length;
   const sims = src.filter((e) => e.sim);
   const filled = sims.filter((e) => e.sim!.wouldFill);
-  const slip = filled
-    .filter((e) => e.sim!.quotedTokens > 0)
-    .map((e) => (1 - e.sim!.simulatedTokens / e.sim!.quotedTokens) * 100)
+  // NOT slippage. Quote and eth_call run against the same block and the same state, so simulated
+  // always equals quoted and the difference is structurally 0 — reporting it as "entry slippage"
+  // would be reporting a constant as a measurement. Real slippage comes from the blocks that pass
+  // between quoting and inclusion, which nothing same-block can observe. Gas is measurable, so
+  // that is what gets reported.
+  const gas = filled
+    .map((e) => Number(e.sim!.gas ?? 0))
+    .filter((g) => g > 0)
     .sort((a, b) => a - b);
   return {
     simulated: sims.length,
     wouldFill: filled.length,
     wouldFillPct: sims.length ? (100 * filled.length) / sims.length : null,
-    medianSlippagePct: slip.length ? slip[Math.floor(slip.length / 2)]! : null,
+    medianGas: gas.length ? gas[Math.floor(gas.length / 2)]! : null,
     total: src.length,
     dryRun: src.filter((e) => e.outcome === 'dry-run').length,
     bought: src.filter((e) => e.outcome === 'bought').length,

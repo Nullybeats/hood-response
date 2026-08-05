@@ -564,6 +564,10 @@ export class SniperEngine {
       const sim = await this.executor
         .simulatePonsBuyV3(token, size, launch.fee)
         .catch((e: unknown) => ({ wouldFill: false, quotedTokens: 0, simulatedTokens: 0, gas: null, reason: String(e).slice(0, 120) }));
+      // An engine with no unlocked key cannot trade at all, so counting it as a failed simulation
+      // corrupts the one number the go-live decision rests on: with two engines and one locked, a
+      // perfect 5/5 fill rate reported as 50%. That is a SKIP, not a would-not-fill.
+      if (!sim.wouldFill && sim.reason === 'no wallet configured') return void journal('skipped', 'wallet not unlocked');
       logger.info(
         {
           token, symbol: launch.symbol, sizeEth: size, fee: launch.fee,
