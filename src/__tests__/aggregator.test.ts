@@ -76,6 +76,47 @@ describe('Aggregator', () => {
     expect(agg.ingest(dust(wallets[2]!))).toHaveLength(0);
   });
 
+  it('REGRESSION: an UNPRICED swap still reaches detection', () => {
+    // The feed went to 0 swarms because this was rejected. The background price
+    // oracle can only keep ~48 tokens fresh (12 per 15s tick, 60s TTL), so on a
+    // 146-token registry every DISCOVERED coin is unpriced — measured 0/33 on
+    // the live feed. Treating unknown-size as dust discarded every new coin
+    // before detection, which is exactly the population worth detecting.
+    const { agg, wallets, token } = ctx;
+    const now = Date.now();
+    const unpriced = (w: string): SwapEvent => ({
+      ...swap(w, token, 'BUY', now),
+      usdValue: null as unknown as number,
+    });
+    agg.ingest(unpriced(wallets[0]!));
+    agg.ingest(unpriced(wallets[1]!));
+    expect(agg.ingest(unpriced(wallets[2]!))).toHaveLength(1);
+  });
+
+  it('an unpriced leg contributes 0 to totalUsd rather than a guess', () => {
+    const { agg, wallets, token } = ctx;
+    const now = Date.now();
+    const mixed = [
+      { ...swap(wallets[0]!, token, 'BUY', now), usdValue: null as unknown as number },
+      swap(wallets[1]!, token, 'BUY', now + 1), // 5_000
+      swap(wallets[2]!, token, 'BUY', now + 2), // 5_000
+    ];
+    let swarms: ReturnType<typeof agg.ingest> = [];
+    for (const s of mixed) swarms = agg.ingest(s);
+    expect(swarms).toHaveLength(1);
+    // Detection ran on 3 wallets, but the sum reports only what was measurable.
+    expect(swarms[0]!.totalUsd).toBe(10_000);
+  });
+
+  it('still ignores dust we can actually measure', () => {
+    const { agg, wallets, token } = ctx;
+    const now = Date.now();
+    const dust = (w: string): SwapEvent => ({ ...swap(w, token, 'BUY', now), usdValue: 1 });
+    agg.ingest(dust(wallets[0]!));
+    agg.ingest(dust(wallets[1]!));
+    expect(agg.ingest(dust(wallets[2]!))).toHaveLength(0);
+  });
+
   it('ignores settlement/equity symbols (e.g. WETH) entirely', () => {
     const { agg, wallets, token } = ctx;
     const now = Date.now();
