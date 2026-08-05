@@ -530,10 +530,15 @@ export class SniperEngine {
     const size = Math.min(config.PONS_BUY_ETH, config.SNIPER_MAX_ETH_PER_TRADE);
     // Journal EVERY outcome, skips included: "we passed on 40 launches because the cap was hit" is
     // exactly what silently invalidates a day of dry-run data when it isn't visible.
-    const journal = (outcome: 'dry-run' | 'bought' | 'buy-failed' | 'skipped', reason?: string, txHash?: string) =>
+    const journal = (
+      outcome: 'dry-run' | 'bought' | 'buy-failed' | 'skipped',
+      reason?: string,
+      txHash?: string,
+      sim?: { wouldFill: boolean; quotedTokens: number; simulatedTokens: number; gas: string | null },
+    ) =>
       recordPonsDecision({
         at: Date.now(), owner: this.owner, token, symbol: launch.symbol, deployer: launch.deployer,
-        selfBuyEth, sizeEth: size, outcome, reason, txHash, gateLatencyMs: Date.now() - launch.seenAt,
+        selfBuyEth, sizeEth: size, outcome, reason, txHash, gateLatencyMs: Date.now() - launch.seenAt, sim,
       });
 
     // Rails. Ordered cheapest-first so we never pay for a check a prior one would have vetoed.
@@ -553,11 +558,28 @@ export class SniperEngine {
     // backtest put it at roughly break-even, so "it detected correctly" is not sufficient evidence
     // to spend.
     if (config.PONS_DRY_RUN) {
+      // Simulate the REAL transaction rather than just recording the intent. "We would have bought"
+      // proves only that the decision was reached; whether the buy would actually have gone through
+      // is the unknown, and the whole point of a dry run is to learn it without paying for it.
+      const sim = await this.executor
+        .simulatePonsBuyV3(token, size, launch.fee)
+        .catch((e: unknown) => ({ wouldFill: false, quotedTokens: 0, simulatedTokens: 0, gas: null, reason: String(e).slice(0, 120) }));
       logger.info(
-        { token, symbol: launch.symbol, sizeEth: size, fee: launch.fee, gateLatencyMs: now - launch.seenAt },
-        'pons: DRY RUN — would buy (set PONS_DRY_RUN=0 to trade real funds)',
+        {
+          token, symbol: launch.symbol, sizeEth: size, fee: launch.fee,
+          gateLatencyMs: now - launch.seenAt,
+          wouldFill: sim.wouldFill, tokens: sim.simulatedTokens, gas: sim.gas, reason: sim.reason,
+        },
+        sim.wouldFill
+          ? 'pons: DRY RUN — buy SIMULATED OK (set PONS_DRY_RUN=0 to trade real funds)'
+          : 'pons: DRY RUN — buy would NOT have filled',
       );
-      journal('dry-run');
+      journal('dry-run', sim.reason, undefined, {
+        wouldFill: sim.wouldFill,
+        quotedTokens: sim.quotedTokens,
+        simulatedTokens: sim.simulatedTokens,
+        gas: sim.gas,
+      });
       return;
     }
 

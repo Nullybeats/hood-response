@@ -39,6 +39,12 @@ export interface PonsDecision {
    * means we only saw the launch after its gate had already opened and fired late.
    */
   gateLatencyMs: number;
+  /**
+   * Result of simulating the REAL buy at the gate (dry run only). `wouldFill` is the number that
+   * matters — it is the difference between "we decided to buy" and "the buy would have worked".
+   * Entry slippage falls out of quoted vs simulated.
+   */
+  sim?: { wouldFill: boolean; quotedTokens: number; simulatedTokens: number; gas: string | null };
 }
 
 const MAX = 300;
@@ -65,6 +71,12 @@ export interface PonsJournalSummary {
   armedEarlyPct: number | null;
   medianGateLatencyMs: number | null;
   skipReasons: Record<string, number>;
+  /** Of the dry-run buys we simulated, how many would actually have filled. */
+  simulated: number;
+  wouldFill: number;
+  wouldFillPct: number | null;
+  /** Median entry slippage, quoted vs simulated, in %. */
+  medianSlippagePct: number | null;
 }
 
 /** Aggregate for the UI header. Deliberately counts skips by reason — see the note above. */
@@ -76,7 +88,17 @@ export function ponsJournalSummary(owner?: string): PonsJournalSummary {
   for (const e of src) if (e.outcome === 'skipped' && e.reason) skipReasons[e.reason] = (skipReasons[e.reason] ?? 0) + 1;
   // >1s of wait means we held the launch until the gate opened rather than arriving after it.
   const armedEarly = acted.filter((e) => e.gateLatencyMs > 1000).length;
+  const sims = src.filter((e) => e.sim);
+  const filled = sims.filter((e) => e.sim!.wouldFill);
+  const slip = filled
+    .filter((e) => e.sim!.quotedTokens > 0)
+    .map((e) => (1 - e.sim!.simulatedTokens / e.sim!.quotedTokens) * 100)
+    .sort((a, b) => a - b);
   return {
+    simulated: sims.length,
+    wouldFill: filled.length,
+    wouldFillPct: sims.length ? (100 * filled.length) / sims.length : null,
+    medianSlippagePct: slip.length ? slip[Math.floor(slip.length / 2)]! : null,
     total: src.length,
     dryRun: src.filter((e) => e.outcome === 'dry-run').length,
     bought: src.filter((e) => e.outcome === 'bought').length,

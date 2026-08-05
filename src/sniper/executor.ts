@@ -1047,6 +1047,65 @@ export class SwapExecutor {
     return await this.buyV3(token, ethAmount, null, fee);
   }
 
+  /**
+   * Simulate the exact buy `buyPonsV3` would broadcast, without broadcasting it.
+   *
+   * This is what makes a dry run worth running. Logging "we would have bought" only proves the
+   * DECISION was reached; it says nothing about whether the trade would actually have gone through,
+   * which is the thing we do not know and the thing that costs money to find out the hard way. So we
+   * build the identical calldata, `eth_call` it from the real wallet at the current block, and
+   * estimate its gas.
+   *
+   * Deliberately runs the SAME `minOut` the live path would apply, so a simulation that passes here
+   * is a trade that would have passed there — a sim with `amountOutMinimum: 0` would happily "fill"
+   * on a launch whose slippage the real buy would have rejected.
+   *
+   * Nothing is signed and nothing is sent: `staticCall` and `estimateGas` are both read-only RPC.
+   */
+  async simulatePonsBuyV3(
+    token: string,
+    ethAmount: number,
+    fee: number,
+  ): Promise<{ wouldFill: boolean; quotedTokens: number; simulatedTokens: number; gas: string | null; reason?: string }> {
+    this.init();
+    if (!this.wallet) return { wouldFill: false, quotedTokens: 0, simulatedTokens: 0, gas: null, reason: 'no wallet configured' };
+    const weth = getAddress(config.SNIPER_WETH);
+    const t = getAddress(token);
+    const amountIn = parseEther(ethAmount.toString());
+
+    let quoted: bigint;
+    let decimals: number;
+    try {
+      [quoted, decimals] = await Promise.all([this.quoteV3(weth, t, fee, amountIn), this.decimalsOf(token)]);
+    } catch (err) {
+      return { wouldFill: false, quotedTokens: 0, simulatedTokens: 0, gas: null, reason: `quote reverted (${shortErr(err)})` };
+    }
+    if (quoted <= 0n) return { wouldFill: false, quotedTokens: 0, simulatedTokens: 0, gas: null, reason: 'zero quote' };
+
+    const router = new Contract(V3_ROUTER, V3_ROUTER_ABI, this.wallet);
+    const params = [weth, t, fee, this.wallet.address, amountIn, this.minOut(quoted), 0n];
+    const quotedTokens = Number(formatUnits(quoted, decimals));
+    try {
+      const fn = router.getFunction('exactInputSingle') as unknown as {
+        staticCall: (p: unknown, o: unknown) => Promise<bigint>;
+        estimateGas: (p: unknown, o: unknown) => Promise<bigint>;
+      };
+      const [out, gas] = await Promise.all([
+        fn.staticCall(params, { value: amountIn }),
+        fn.estimateGas(params, { value: amountIn }).catch(() => null),
+      ]);
+      return {
+        wouldFill: out > 0n,
+        quotedTokens,
+        simulatedTokens: Number(formatUnits(out, decimals)),
+        gas: gas === null ? null : gas.toString(),
+      };
+    } catch (err) {
+      // A revert here is the useful answer, not a failure: it is the buy we did NOT lose money on.
+      return { wouldFill: false, quotedTokens, simulatedTokens: 0, gas: null, reason: shortErr(err) };
+    }
+  }
+
   private async buyV4(
     token: string,
     ethAmount: number,
