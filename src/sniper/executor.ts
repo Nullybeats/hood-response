@@ -1066,7 +1066,7 @@ export class SwapExecutor {
     token: string,
     ethAmount: number,
     fee: number,
-  ): Promise<{ wouldFill: boolean; quotedTokens: number; simulatedTokens: number; gas: string | null; reason?: string }> {
+  ): Promise<{ wouldFill: boolean; quotedTokens: number; simulatedTokens: number; gas: string | null; roundTripRetained?: number; reason?: string }> {
     this.init();
     if (!this.wallet) return { wouldFill: false, quotedTokens: 0, simulatedTokens: 0, gas: null, reason: 'no wallet configured' };
     const weth = getAddress(config.SNIPER_WETH);
@@ -1078,9 +1078,9 @@ export class SwapExecutor {
     try {
       [quoted, decimals] = await Promise.all([this.quoteV3(weth, t, fee, amountIn), this.decimalsOf(token)]);
     } catch (err) {
-      return { wouldFill: false, quotedTokens: 0, simulatedTokens: 0, gas: null, reason: `quote reverted (${shortErr(err)})` };
+      return { wouldFill: false, quotedTokens: 0, simulatedTokens: 0, gas: null, roundTripRetained: 0, reason: `quote reverted (${shortErr(err)})` };
     }
-    if (quoted <= 0n) return { wouldFill: false, quotedTokens: 0, simulatedTokens: 0, gas: null, reason: 'zero quote' };
+    if (quoted <= 0n) return { wouldFill: false, quotedTokens: 0, simulatedTokens: 0, gas: null, roundTripRetained: 0, reason: 'zero quote' };
 
     const router = new Contract(V3_ROUTER, V3_ROUTER_ABI, this.wallet);
     const params = [weth, t, fee, this.wallet.address, amountIn, this.minOut(quoted), 0n];
@@ -1094,15 +1094,24 @@ export class SwapExecutor {
         fn.staticCall(params, { value: amountIn }),
         fn.estimateGas(params, { value: amountIn }).catch(() => null),
       ]);
+      // Round trip: quote selling the whole lot straight back at the same block. This is the depth
+      // gate, and skipping it for Pons was a real mistake — [measured over 200 paper trades] most
+      // launches retain ~98% (the 1% fee each way), but a minority retain as little as 6%, and those
+      // are not price moves, they are pools with no ETH to sell into. They correlate with a near-zero
+      // deployer self-buy, because that self-buy IS the pool's ETH side. Entering one is an instant
+      // ~90% loss no exit rule can recover.
+      const back = out > 0n ? await this.quoteV3(t, weth, fee, out).catch(() => 0n) : 0n;
+      const roundTripRetained = back > 0n ? Number(formatEther(back)) / ethAmount : 0;
       return {
         wouldFill: out > 0n,
         quotedTokens,
         simulatedTokens: Number(formatUnits(out, decimals)),
         gas: gas === null ? null : gas.toString(),
+        roundTripRetained,
       };
     } catch (err) {
       // A revert here is the useful answer, not a failure: it is the buy we did NOT lose money on.
-      return { wouldFill: false, quotedTokens, simulatedTokens: 0, gas: null, reason: shortErr(err) };
+      return { wouldFill: false, quotedTokens, simulatedTokens: 0, gas: null, roundTripRetained: 0, reason: shortErr(err) };
     }
   }
 

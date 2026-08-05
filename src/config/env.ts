@@ -258,6 +258,15 @@ const schema = z.object({
   PONS_DAILY_CAP_ETH: num(0.02),
   /** Skip a launch whose deployer self-buy is below this (wei-denominated conviction signal). */
   PONS_MIN_INITIAL_BUY_ETH: num(0),
+  /**
+   * Depth gate: skip unless buying and instantly selling back retains at least this %.
+   *
+   * [measured over 200 paper trades] the median launch retains ~98% (the 1% pool fee each way) but a
+   * minority retain 6-13% — pools with essentially no ETH on the other side, where entry is an
+   * instant ~90% loss that no exit rule can recover. Those trades produced most of a -53.9% paper
+   * result. 90 keeps the normal ~98% population and cuts the untradeable tail.
+   */
+  PONS_MIN_ROUNDTRIP_PCT: num(90),
   SNIPER_MIN_CONVICTION: num(60),
   SNIPER_MAX_CONVICTION: num(100),
   SNIPER_BUY_ETH: num(0.0005), // per-alert buy size

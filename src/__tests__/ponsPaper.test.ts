@@ -93,3 +93,35 @@ describe('paper positions', () => {
     expect(s.winRatePct).not.toBeNull();
   });
 });
+
+/**
+ * Depth gate thresholds, pinned to measured values.
+ *
+ * [measured 2026-08-05, 12 live launches] round-trip retained was 97.9% median but 6.2% at worst,
+ * and the bad ones tracked a near-zero deployer self-buy — that self-buy IS the pool's ETH side.
+ * These are the numbers the 90% default is drawn from, so a change to it should fail here first.
+ */
+describe('depth gate thresholds', () => {
+  const MIN = 90;
+  const measured = [
+    { selfBuyEth: 0.02, retainedPct: 6.2 },
+    { selfBuyEth: 0.0, retainedPct: 12.6 },
+    { selfBuyEth: 0.07, retainedPct: 63.7 },
+    { selfBuyEth: 0.1, retainedPct: 97.9 },
+    { selfBuyEth: 3.5, retainedPct: 97.9 },
+    { selfBuyEth: 3.5, retainedPct: 99.0 },
+  ];
+
+  it('rejects every pool that cannot be exited', () => {
+    const rejected = measured.filter((m) => m.retainedPct < MIN);
+    expect(rejected.map((m) => m.retainedPct)).toEqual([6.2, 12.6, 63.7]);
+  });
+
+  it('keeps the normal ~98% population intact', () => {
+    expect(measured.filter((m) => m.retainedPct >= MIN)).toHaveLength(3);
+  });
+
+  it('a 1% pool fee each way still passes — the gate must not reject healthy pools', () => {
+    expect(97.9).toBeGreaterThanOrEqual(MIN);
+  });
+});

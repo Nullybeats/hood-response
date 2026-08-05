@@ -564,11 +564,18 @@ export class SniperEngine {
       // is the unknown, and the whole point of a dry run is to learn it without paying for it.
       const sim = await this.executor
         .simulatePonsBuyV3(token, size, launch.fee)
-        .catch((e: unknown) => ({ wouldFill: false, quotedTokens: 0, simulatedTokens: 0, gas: null, reason: String(e).slice(0, 120) }));
+        .catch((e: unknown) => ({ wouldFill: false, quotedTokens: 0, simulatedTokens: 0, gas: null, roundTripRetained: 0, reason: String(e).slice(0, 120) }));
       // An engine with no unlocked key cannot trade at all, so counting it as a failed simulation
       // corrupts the one number the go-live decision rests on: with two engines and one locked, a
       // perfect 5/5 fill rate reported as 50%. That is a SKIP, not a would-not-fill.
       if (!sim.wouldFill && sim.reason === 'no wallet configured') return void journal('skipped', 'wallet not unlocked');
+      // Depth gate. A pool we cannot exit is not a trade, it is a donation — and it is knowable
+      // BEFORE entering, which is the whole point of checking it here rather than discovering it on
+      // the first mark.
+      const retainedPct = (sim.roundTripRetained ?? 0) * 100;
+      if (sim.wouldFill && retainedPct < config.PONS_MIN_ROUNDTRIP_PCT) {
+        return void journal('skipped', `round trip ${retainedPct.toFixed(0)}% < ${config.PONS_MIN_ROUNDTRIP_PCT}%`);
+      }
       logger.info(
         {
           token, symbol: launch.symbol, sizeEth: size, fee: launch.fee,
