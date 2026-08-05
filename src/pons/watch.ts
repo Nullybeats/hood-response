@@ -1,4 +1,5 @@
 import { config } from '../config/env.js';
+import { HyperSyncClient } from '../chain/hypersync.js';
 import { logger } from '../logger.js';
 import { PONS_FACTORY, TOKEN_LAUNCHED_TOPIC, PONS_POOL_FEE, DEFAULT_RESTRICTION_BLOCKS, decodeTokenLaunched, type PonsLaunch } from './config.js';
 import { gateFor, gateOpen, launchBlockL1From, type PonsGate } from './gate.js';
@@ -68,38 +69,34 @@ export class PonsWatcher {
 
   constructor(private readonly onLaunch: LaunchHandler) {}
 
+  /** One shared client (chain/hypersync.ts) rather than a second copy of the
+   *  pagination contract. Keeps its OWN token: this watcher guards live entry
+   *  gates and must not share quota with the feed's shadow sweeps. */
+  private readonly hs = new HyperSyncClient({
+    url: config.PONS_HYPERSYNC_URL,
+    token: config.PONS_HYPERSYNC_TOKEN,
+    op: 'pons',
+  });
+
   private async query(body: unknown): Promise<HsResponse | null> {
-    try {
-      const headers: Record<string, string> = { 'content-type': 'application/json' };
-      if (config.PONS_HYPERSYNC_TOKEN) headers.authorization = `Bearer ${config.PONS_HYPERSYNC_TOKEN}`;
-      const res = await fetch(`${config.PONS_HYPERSYNC_URL}/query`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(15_000),
-      });
-      if (!res.ok) return null;
-      return (await res.json()) as HsResponse;
-    } catch {
-      return null;
-    }
+    return (await this.hs.query(body)) as HsResponse | null;
   }
 
   private async height(): Promise<number | null> {
-    try {
-      const headers: Record<string, string> = {};
-      if (config.PONS_HYPERSYNC_TOKEN) headers.authorization = `Bearer ${config.PONS_HYPERSYNC_TOKEN}`;
-      const res = await fetch(`${config.PONS_HYPERSYNC_URL}/height`, { headers, signal: AbortSignal.timeout(10_000) });
-      if (!res.ok) return null;
-      const j = (await res.json()) as { height?: number };
-      return j.height ?? null;
-    } catch {
-      return null;
-    }
+    return this.hs.height();
   }
 
   start(): void {
     if (!config.PONS_ENABLED) return;
+    // HyperSync requires auth; without a token the client is inert. Say so
+    // loudly — an enabled watcher that silently observes nothing is exactly the
+    // absence-read-as-data failure this codebase keeps paying for.
+    if (!this.hs.enabled) {
+      logger.warn(
+        'pons: watcher enabled but PONS_HYPERSYNC_TOKEN is unset — NO launches will be detected',
+      );
+      return;
+    }
     logger.info(
       { dryRun: config.PONS_DRY_RUN, buyEth: config.PONS_BUY_ETH, maxOpen: config.PONS_MAX_OPEN },
       config.PONS_DRY_RUN

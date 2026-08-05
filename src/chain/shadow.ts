@@ -3,7 +3,8 @@ import { logger } from '../logger.js';
 import { TRANSFER_TOPIC, addressToTopic } from './decoder.js';
 import { V3_SWAP_TOPIC, V4_SWAP_TOPIC } from './receipt.js';
 import { classifyCandidate, emptyTally, type CandidateClass, type TxLog } from './classify.js';
-import { logHttpFailure, logRpcThrow, rpcHost } from './rpcLog.js';
+import { rpcHost } from './rpcLog.js';
+import { HyperSyncClient, type HsLog } from './hypersync.js';
 
 /**
  * HyperSync SHADOW listener — measures, never acts.
@@ -26,19 +27,6 @@ import { logHttpFailure, logRpcThrow, rpcHost } from './rpcLog.js';
  * the shadow loudly instead of producing a confident zero.
  */
 
-interface HsLog {
-  topic0?: string;
-  topic1?: string;
-  topic2?: string;
-  topic3?: string;
-  block_number?: number;
-  transaction_hash?: string;
-  address?: string;
-}
-interface HsResponse {
-  data?: { logs?: HsLog[] }[];
-  next_block?: number;
-}
 
 export interface ShadowStats {
   enabled: boolean;
@@ -135,98 +123,35 @@ export class HyperSyncShadow {
     };
   }
 
-  private headers(): Record<string, string> {
-    return {
-      'content-type': 'application/json',
-      authorization: `Bearer ${config.FEED_HYPERSYNC_TOKEN}`,
-    };
-  }
+  /** One shared client (chain/hypersync.ts). Failures are counted here as well
+   *  as logged, so a quiet result can always be told apart from a failed one. */
+  private readonly hs = new HyperSyncClient({
+    url: config.FEED_HYPERSYNC_URL,
+    token: config.FEED_HYPERSYNC_TOKEN,
+    op: 'shadow',
+    onFailure: (f) => {
+      if (f.op.endsWith('-height')) this.failures.height += 1;
+      else this.failures.query += 1;
+    },
+  });
 
   private async height(): Promise<number | null> {
-    try {
-      const res = await fetch(`${config.FEED_HYPERSYNC_URL}/height`, {
-        headers: { authorization: `Bearer ${config.FEED_HYPERSYNC_TOKEN}` },
-        signal: AbortSignal.timeout(10_000),
-      });
-      if (!res.ok) {
-        this.failures.height += 1;
-        logHttpFailure(
-          { op: 'shadow-height', url: config.FEED_HYPERSYNC_URL },
-          res.status,
-          res.statusText,
-        );
-        return null;
-      }
-      const j = (await res.json()) as { height?: number };
-      return typeof j.height === 'number' ? j.height : null;
-    } catch (err) {
-      this.failures.height += 1;
-      logRpcThrow({ op: 'shadow-height', url: config.FEED_HYPERSYNC_URL }, err);
-      return null;
-    }
+    return this.hs.height();
   }
 
   /**
-   * Run one query to completion over [from, to), following `next_block`.
-   *
-   * Returns the logs AND the block the response actually reached. HyperSync
-   * truncates a page on response size — [verified 2026-08-05: a swap-log query
-   * over 1000 blocks stopped at 261 while the transfer query over the same range
-   * covered all 1000] — so a caller that assumes full coverage silently
-   * under-reports and calls it a quiet chain.
+   * Sweep a range to completion. Returns what was GENUINELY covered — a caller
+   * that advances past `covered` marks blocks scanned whose contents were never
+   * fetched.
    */
   private async queryAll(
     from: number,
     to: number,
     logs: unknown[],
   ): Promise<{ logs: HsLog[]; covered: number } | null> {
-    const out: HsLog[] = [];
-    let cur = from;
-    let pages = 0;
-    while (cur < to && pages < 40) {
-      let r: HsResponse;
-      try {
-        const res = await fetch(`${config.FEED_HYPERSYNC_URL}/query`, {
-          method: 'POST',
-          headers: this.headers(),
-          body: JSON.stringify({
-            from_block: cur,
-            to_block: to,
-            logs,
-            field_selection: {
-              log: ['topic0', 'topic1', 'topic2', 'block_number', 'transaction_hash', 'address'],
-            },
-          }),
-          signal: AbortSignal.timeout(20_000),
-        });
-        if (!res.ok) {
-          this.failures.query += 1;
-          logHttpFailure(
-            { op: 'shadow-query', url: config.FEED_HYPERSYNC_URL, range: `${cur}-${to}` },
-            res.status,
-            res.statusText,
-          );
-          return pages > 0 ? { logs: out, covered: cur } : null;
-        }
-        r = (await res.json()) as HsResponse;
-      } catch (err) {
-        this.failures.query += 1;
-        logRpcThrow(
-          { op: 'shadow-query', url: config.FEED_HYPERSYNC_URL, range: `${cur}-${to}` },
-          err,
-        );
-        return pages > 0 ? { logs: out, covered: cur } : null;
-      }
-
-      out.push(...(r.data ?? []).flatMap((d) => d.logs ?? []));
-      pages += 1;
-      this.pagesFetched += 1;
-      // No forward progress means the endpoint cannot serve this range; stop
-      // rather than spin, and report only what was genuinely covered.
-      if (typeof r.next_block !== 'number' || r.next_block <= cur) break;
-      cur = r.next_block;
-    }
-    return { logs: out, covered: Math.min(cur, to) };
+    const r = await this.hs.sweepLogs(from, to, logs);
+    this.pagesFetched = this.hs.pagesFetched;
+    return r ? { logs: r.items, covered: r.covered } : null;
   }
 
   private async tick(): Promise<void> {
