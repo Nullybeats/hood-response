@@ -247,8 +247,14 @@ async function main(): Promise<void> {
     // verify is not a cap above the floor.
     if (config.ALERT_MIN_MARKETCAP > 0) {
       if (swarm.marketCap == null) {
+        // Say WHICH unknown. "no-price" means nobody has indexed the pair and
+        // its pool could not be read; "unverified-supply" means we have a real
+        // price but never got totalSupply() off the contract — which is now
+        // queued for backfill, so the same coin can resolve on a later pass.
+        const tok = store.tokensByAddress.get(swarm.token);
+        const cap = tok ? price.resolveCap(tok) : null;
         logger.info(
-          { token: swarm.tokenSymbol, priceSource: swarm.priceSource },
+          { token: swarm.tokenSymbol, priceSource: swarm.priceSource, capReason: cap?.reason },
           'alert suppressed: market cap unknown (fail closed)',
         );
         return;

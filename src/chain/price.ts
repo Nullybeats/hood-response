@@ -5,6 +5,8 @@ import { logger } from '../logger.js';
 import { dexScreenerUrl } from '../links.js';
 import { computeMomentum } from './momentum.js';
 import { PoolPriceReader } from './poolPrice.js';
+import { fetchTokenMetadata } from './metadata.js';
+import { resolveMarketCap, type CapResult, type CapSource } from './marketCap.js';
 
 /** Where a live price came from. Never 'synthetic' — a fabricated number is not
  *  a price, and is only ever produced when PRICE_SYNTHETIC_FALLBACK is on. */
@@ -61,6 +63,11 @@ const TTL_MS = 60_000;
 const MAX_PER_TICK = 12;
 // Bound the caches on a long-running process (many discovered tokens).
 const MAX_CACHE = 5_000;
+/** On-chain supply backfills per refresh tick — 3 eth_calls each, so kept small. */
+const MAX_SUPPLY_PER_TICK = 6;
+/** Give up after this many failed supply reads; some contracts have no working
+ *  totalSupply() and must not be retried on every evaluation forever. */
+const MAX_SUPPLY_ATTEMPTS = 3;
 const LIVE_STALE_MS = 30 * 60_000;
 // How long a fetched ETH/USD reference rate stays usable.
 const ETH_USD_REF_TTL_MS = 5 * 60_000;
@@ -103,6 +110,10 @@ export class PriceOracle {
   private readonly synthetic = new Map<string, number>();
   private readonly live = new Map<string, LivePrice>();
   private readonly queue = new Set<string>();
+  /** Tokens awaiting an on-chain supply read (see drainSupplyQueue). */
+  private readonly supplyQueue = new Set<string>();
+  /** Failed supply-read counts, so a hopeless contract is not retried forever. */
+  private readonly supplyAttempts = new Map<string, number>();
   private timer: NodeJS.Timeout | null = null;
   /** Highest market cap seen for each token since this process started
    *  tracking it (not a true lifetime ATH — DexScreener doesn't expose one —
@@ -156,6 +167,17 @@ export class PriceOracle {
     this.queue.add(address.toLowerCase());
   }
 
+  /**
+   * Queue an on-chain supply read for a token whose cap is blocked only by an
+   * unverified supply. Bounded by `supplyAttempts`: a contract with no working
+   * totalSupply() must not be retried forever on every evaluation.
+   */
+  private maybeEnqueueSupply(address: string): void {
+    const key = address.toLowerCase();
+    if ((this.supplyAttempts.get(key) ?? 0) >= MAX_SUPPLY_ATTEMPTS) return;
+    this.supplyQueue.add(key);
+  }
+
   /** The token's USD price, or **null** when no real source has one. */
   priceOf(tokenAddress: string): number | null {
     const key = tokenAddress.toLowerCase();
@@ -183,15 +205,36 @@ export class PriceOracle {
    * exactly that product.
    */
   marketCap(token: TrackedToken): number | null {
+    return this.resolveCap(token).cap;
+  }
+
+  /**
+   * Full cap resolution — the value, which source established it, and when
+   * nothing could, why not. See chain/marketCap.ts for the ordering.
+   *
+   * Side effect by design: when a cap fails *only* because the supply was never
+   * read from the contract, the token is queued for an on-chain supply backfill.
+   * That failure used to be permanent — a single flaky totalSupply() left the
+   * token capless for its whole life, and every cap gate suppressed it forever
+   * after. Queuing (rather than fetching inline) keeps the hot detection path
+   * synchronous and off the network; the next evaluation gets the answer.
+   */
+  resolveCap(token: TrackedToken): CapResult {
     const live = this.fresh(token.address);
     this.maybeEnqueue(token.address);
-    // DexScreener's own market cap is authoritative — it knows the real supply.
-    if (live && live.marketCap != null && live.marketCap > 0) return live.marketCap;
-    // Otherwise derive it, but only from a real price AND a verified supply.
-    const price = this.priceOf(token.address);
-    if (price == null || !(price > 0)) return null;
-    if (!token.supplyVerified || !(token.totalSupply > 0)) return null;
-    return price * token.totalSupply;
+    const result = resolveMarketCap({
+      sourceCap: live?.marketCap ?? null,
+      price: this.priceOf(token.address),
+      totalSupply: token.totalSupply,
+      supplyVerified: token.supplyVerified === true,
+    });
+    if (result.reason === 'unverified-supply') this.maybeEnqueueSupply(token.address);
+    return result;
+  }
+
+  /** Which source established the token's cap, or null when it has none. */
+  marketCapSource(token: TrackedToken): CapSource | null {
+    return this.resolveCap(token).source;
   }
 
   /** True when the token currently has a REAL price (DexScreener or its pool). */
@@ -400,10 +443,38 @@ export class PriceOracle {
     for (const [addr, l] of this.live) if (l.fetchedAt < staleBefore) this.live.delete(addr);
     capMap(this.live, MAX_CACHE);
 
+    await this.drainSupplyQueue();
+
     if (this.queue.size === 0) return;
     const batch = [...this.queue].slice(0, MAX_PER_TICK);
     for (const a of batch) this.queue.delete(a);
     await Promise.all(batch.map((a) => this.fetchOne(a)));
+  }
+
+  /**
+   * Backfill supplies the metadata read never established, so a cap blocked on
+   * `supplyVerified` can become resolvable instead of staying unknown for the
+   * token's whole life. Reads the contract directly — the most authoritative
+   * supply there is, and no third-party dependency.
+   */
+  private async drainSupplyQueue(): Promise<void> {
+    if (this.supplyQueue.size === 0 || !this.store) return;
+    const batch = [...this.supplyQueue].slice(0, MAX_SUPPLY_PER_TICK);
+    for (const a of batch) this.supplyQueue.delete(a);
+    await Promise.all(
+      batch.map(async (address) => {
+        this.supplyAttempts.set(address, (this.supplyAttempts.get(address) ?? 0) + 1);
+        const meta = await fetchTokenMetadata(config.CHAIN_HTTP_URL, address).catch(() => null);
+        if (!meta?.supplyVerified) return;
+        this.store?.updateTokenMeta(address, meta);
+        this.supplyAttempts.delete(address);
+        logger.debug(
+          { token: address, totalSupply: meta.totalSupply },
+          'price: backfilled on-chain supply — market cap is now resolvable',
+        );
+      }),
+    );
+    capMap(this.supplyAttempts, MAX_CACHE);
   }
 
   private async fetchOne(address: string): Promise<void> {

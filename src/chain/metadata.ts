@@ -89,11 +89,23 @@ export async function fetchTokenMetadata(
     meta.symbol = symbol;
     meta.name = symbol;
   }
-  if (rawSupply != null && decimals != null && decimals >= 0 && decimals <= 36) {
+
+  // DECIMALS AND SUPPLY ARE INDEPENDENT FACTS, and used to be written as one.
+  //
+  // They were set together under `rawSupply != null && decimals != null`, so a
+  // transient failure on the totalSupply() call alone discarded the decimals
+  // too. buildSwapFromLog drops any swap whose token has no decimals — so one
+  // flaky eth_call did not merely leave the cap unknown, it made the token
+  // invisible to detection entirely, and brand-new coins are both the ones we
+  // care about and the ones being read under the least favourable conditions.
+  const decimalsOk = decimals != null && decimals >= 0 && decimals <= 36;
+  if (decimalsOk) meta.decimals = decimals;
+
+  // The supply is only a supply when the contract gave us one. Absent that,
+  // `supplyVerified` stays false and the oracle refuses to derive a cap — the
+  // ANOA guard, unchanged.
+  if (rawSupply != null && decimalsOk) {
     meta.totalSupply = rawSupply / 10 ** decimals;
-    meta.decimals = decimals;
-    // The supply is now the contract's own, not ensureToken's 1e9 placeholder —
-    // which is the only condition under which price * supply is a market cap.
     meta.supplyVerified = true;
   }
   return Object.keys(meta).length ? meta : null;
