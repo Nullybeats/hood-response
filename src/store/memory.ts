@@ -32,6 +32,14 @@ class Ring<T> {
   recent(limit = this.cap): T[] {
     return this.buf.slice(-limit).reverse();
   }
+  /** Oldest first — the order `restore` expects back. */
+  drain(): T[] {
+    return [...this.buf];
+  }
+  /** Replace contents (oldest first), keeping the cap. Emits nothing by design. */
+  restore(items: T[]): void {
+    this.buf = items.slice(-this.cap);
+  }
   get size(): number {
     return this.buf.length;
   }
@@ -50,6 +58,22 @@ export interface LatencyMetrics {
   rpcLatencyMs: number | null;
   lastBlock: number;
   lastEventAt: number | null;
+  /**
+   * Scan health. `lastBlock` is the chain HEAD — it advances whether or not we
+   * managed to read the logs, so on its own it cannot distinguish "keeping up"
+   * from "silently skipping". These four can:
+   *
+   *   cursor              last block actually scanned
+   *   cursorLag           head - cursor (0 = caught up)
+   *   consecutiveFailures resets to 0 on any successful scan
+   *   lastScanAt          unix ms of the last successful scan
+   */
+  cursor: number;
+  cursorLag: number;
+  consecutiveFailures: number;
+  lastScanAt: number | null;
+  /** Blocks abandoned by a backfill clamp (FEED_MAX_BACKFILL_BLOCKS). Should stay 0. */
+  skippedBlocks: number;
 }
 
 /**
@@ -81,6 +105,11 @@ export class MemoryStore extends EventEmitter {
     rpcLatencyMs: null,
     lastBlock: 0,
     lastEventAt: null,
+    cursor: 0,
+    cursorLag: 0,
+    consecutiveFailures: 0,
+    lastScanAt: null,
+    skippedBlocks: 0,
   };
 
   /** Per-wallet, per-token running counts used by leaderboards. */
@@ -151,6 +180,55 @@ export class MemoryStore extends EventEmitter {
     } catch (err) {
       logger.warn({ err: String(err) }, 'store: could not save settings');
     }
+  }
+
+  // ── Feed durability ────────────────────────────────────────────────────────
+  // See store/feedState.ts. Only DISCOVERED tokens are exported: the seed set is
+  // reconstructed in the constructor on every boot, so persisting it would just
+  // grow the snapshot and risk a stale seed shadowing the compiled one.
+
+  /** Discovered (auto-registered) tokens, for the durable snapshot. */
+  exportDiscoveredTokens(): TrackedToken[] {
+    return [...this.tokensByAddress.values()].filter((t) => t.discovered === true);
+  }
+
+  /**
+   * Re-register tokens from a snapshot. Existing entries win — a live token has
+   * already been enriched this boot, and the snapshot is by definition older.
+   * Returns how many were actually added. Emits no 'token' event: this is a
+   * restore of things already discovered, not a new discovery.
+   */
+  importTokens(tokens: TrackedToken[]): number {
+    let added = 0;
+    for (const t of tokens) {
+      const key = t.address.toLowerCase();
+      if (this.tokensByAddress.has(key)) continue;
+      const token: TrackedToken = { ...t, address: key };
+      this.tokensByAddress.set(key, token);
+      // Never clobber a symbol the seed set owns — discovered symbols collide.
+      if (!this.tokensBySymbol.has(token.symbol)) this.tokensBySymbol.set(token.symbol, token);
+      added += 1;
+    }
+    return added;
+  }
+
+  /** Swarm/alert history for the durable snapshot (oldest first). */
+  exportHistory(): { swarms: Swarm[]; alerts: Alert[] } {
+    return { swarms: this.swarms.drain(), alerts: this.alerts.drain() };
+  }
+
+  /**
+   * Restore swarm/alert history for DISPLAY ONLY.
+   *
+   * Deliberately does not emit 'swarm'/'alert'. Those events are what the SSE
+   * stream — and therefore the sniper's FeedSubscriber — consume, so re-emitting
+   * a persisted alert on boot would replay old calls as if they were live and
+   * could open duplicate positions. Totals are not restored either; they count
+   * this process's work and are reported next to `uptimeSeconds`.
+   */
+  restoreHistory(swarms: Swarm[], alerts: Alert[]): void {
+    if (swarms.length) this.swarms.restore(swarms);
+    if (alerts.length) this.alerts.restore(alerts);
   }
 
   isTracked(wallet: string): boolean {

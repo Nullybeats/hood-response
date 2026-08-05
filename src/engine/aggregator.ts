@@ -66,11 +66,27 @@ export class Aggregator {
 
   /** Should this swap be considered for swarm detection? */
   private eligible(swap: SwapEvent): boolean {
-    // An unvalued swap cannot clear a USD floor — we have no idea what it is
-    // worth. Fails closed: detection would otherwise be sized in fabricated
-    // dollars, which is what the synthetic price used to supply.
-    if (config.IGNORE_DUST_USD > 0) {
-      if (swap.usdValue == null || swap.usdValue < config.IGNORE_DUST_USD) return false;
+    // The dust floor filters swaps we know to be small. It cannot judge one
+    // whose size we do not know, and treating unknown as dust is what silenced
+    // the feed.
+    //
+    // This gate briefly rejected null. That looked like the careful choice, but
+    // it inverted the project's own rule — unknown is not safe AND NOT UNSAFE —
+    // and it fired constantly rather than rarely: the background price oracle
+    // refreshes 12 tokens per 15s tick against a 60s freshness window, so with
+    // 146 tracked tokens it can never reach the discovered ones at all.
+    // Measured 2026-08-05 on the live feed: 0 of 33 swaps on discovered tokens
+    // carried a price, so this line discarded EVERY new coin before detection.
+    // Swarms went to 0 and stayed there.
+    //
+    // Letting an unvalued swap through does not resurrect the fabricated price.
+    // It restores the pre-existing behaviour, where usdValue was never null so
+    // this branch never ran — but on honest data. Nothing downstream is fed a
+    // number we invented: `totalUsd` sums only priced legs, and every market-cap
+    // gate at ALERT time still fails closed on an unknown cap. That is where
+    // ANOA is caught, and it is caught on its real $2,598, not on a hash.
+    if (config.IGNORE_DUST_USD > 0 && swap.usdValue != null) {
+      if (swap.usdValue < config.IGNORE_DUST_USD) return false;
     }
     // Skip settlement/quote tokens and tokenised equities — never gems, and the
     // quote-token leg of a real buy would otherwise fire a spurious sell.

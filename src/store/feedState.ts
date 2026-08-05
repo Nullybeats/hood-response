@@ -1,0 +1,176 @@
+import { readFile, writeFile, rename, mkdir } from 'node:fs/promises';
+import { dirname } from 'node:path';
+import type { Alert, Swarm, TrackedToken } from '../types.js';
+import { logger } from '../logger.js';
+
+/**
+ * Durable feed state — the minimum a restart must not lose.
+ *
+ * The Railway feed runs with `database=false, redis=false`, so before this
+ * everything lived in process memory. Two of those things were load-bearing:
+ *
+ *   - the **listener cursor**. On boot the poller set `lastBlock = head`, so
+ *     every block between the crash and the restart was never scanned. Not
+ *     "scanned late" — never.
+ *   - the **discovered-token registry**. Tokens are learned by observing them,
+ *     so a restart dropped the feed to the seed set and it rebuilt from zero.
+ *     Measured 2026-08-05: the feed knew 73 tokens against the box's 1,894 on
+ *     identical code, purely because the box had not restarted.
+ *
+ * Swarms and alerts are carried too, but for display only — see `restoreHistory`
+ * on MemoryStore, which deliberately does NOT re-emit them. Re-emitting a
+ * persisted alert on boot would push it back down the SSE feed to the sniper,
+ * which is a duplicate-buy bug, not a durability feature.
+ *
+ * Schema-versioned: an unknown version is discarded rather than coerced. A
+ * snapshot is a cache, so throwing it away costs a rebuild, and mis-reading one
+ * costs a wrong cursor — the asymmetry says discard.
+ */
+export const FEED_STATE_VERSION = 1;
+
+/** Only the fields we can restore meaningfully; everything else re-enriches. */
+export interface PersistedToken {
+  address: string;
+  symbol: string;
+  name: string;
+  totalSupply: number;
+  supplyVerified: boolean;
+  stable: boolean;
+  discovered: boolean;
+  firstSeen: number;
+  decimals?: number;
+}
+
+export interface FeedStateSnapshot {
+  version: number;
+  savedAt: number;
+  /** Last block fully scanned. The next poll resumes at cursor + 1. */
+  cursor: number;
+  tokens: PersistedToken[];
+  swarms: Swarm[];
+  alerts: Alert[];
+}
+
+const isObj = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
+const finiteNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+/** Narrow one token entry, rejecting anything we cannot use. */
+function parseToken(v: unknown): PersistedToken | null {
+  if (!isObj(v)) return null;
+  const { address, symbol, name, totalSupply, firstSeen } = v;
+  if (typeof address !== 'string' || !/^0x[0-9a-f]{40}$/i.test(address)) return null;
+  if (typeof symbol !== 'string' || symbol.length === 0) return null;
+  return {
+    address: address.toLowerCase(),
+    symbol,
+    name: typeof name === 'string' ? name : symbol,
+    totalSupply: finiteNum(totalSupply) && totalSupply > 0 ? totalSupply : 1_000_000_000,
+    // Absent/!== true reads as false: an unverified supply must never be
+    // restored as verified, or the oracle would treat a placeholder as measured.
+    supplyVerified: v.supplyVerified === true,
+    stable: v.stable === true,
+    discovered: v.discovered !== false,
+    firstSeen: finiteNum(firstSeen) ? firstSeen : Date.now(),
+    ...(finiteNum(v.decimals) ? { decimals: v.decimals } : {}),
+  };
+}
+
+/**
+ * Read a snapshot. Returns null for "nothing usable" — missing file, unreadable,
+ * malformed JSON, wrong version, or a cursor that is not a real block number.
+ * Never throws: a bad snapshot must degrade to a cold start, not a crash loop.
+ */
+export async function loadFeedState(path: string): Promise<FeedStateSnapshot | null> {
+  if (!path) return null;
+  let raw: string;
+  try {
+    raw = await readFile(path, 'utf8');
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code !== 'ENOENT') {
+      logger.warn({ err: String(err), path }, 'feed state: could not read snapshot');
+    }
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    logger.warn({ err: String(err), path }, 'feed state: snapshot is not valid JSON — cold start');
+    return null;
+  }
+
+  if (!isObj(parsed)) {
+    logger.warn({ path }, 'feed state: snapshot is not an object — cold start');
+    return null;
+  }
+  if (parsed.version !== FEED_STATE_VERSION) {
+    logger.warn(
+      { path, found: parsed.version, expected: FEED_STATE_VERSION },
+      'feed state: snapshot version mismatch — cold start',
+    );
+    return null;
+  }
+  if (!finiteNum(parsed.cursor) || parsed.cursor < 0) {
+    logger.warn({ path, cursor: parsed.cursor }, 'feed state: snapshot cursor invalid — cold start');
+    return null;
+  }
+
+  const tokens = Array.isArray(parsed.tokens)
+    ? parsed.tokens.map(parseToken).filter((t): t is PersistedToken => t !== null)
+    : [];
+  const swarms = Array.isArray(parsed.swarms) ? (parsed.swarms as Swarm[]) : [];
+  const alerts = Array.isArray(parsed.alerts) ? (parsed.alerts as Alert[]) : [];
+
+  return {
+    version: FEED_STATE_VERSION,
+    savedAt: finiteNum(parsed.savedAt) ? parsed.savedAt : 0,
+    cursor: Math.floor(parsed.cursor),
+    tokens,
+    swarms,
+    alerts,
+  };
+}
+
+/**
+ * Write a snapshot atomically (temp file + rename), matching the pattern the
+ * settings and performance stores already use. A torn snapshot would be read
+ * back as corrupt on the next boot, which is precisely the case this is for.
+ */
+export async function saveFeedState(
+  path: string,
+  snapshot: Omit<FeedStateSnapshot, 'version' | 'savedAt'>,
+): Promise<void> {
+  if (!path) return;
+  const data: FeedStateSnapshot = {
+    version: FEED_STATE_VERSION,
+    savedAt: Date.now(),
+    ...snapshot,
+  };
+  try {
+    await mkdir(dirname(path), { recursive: true });
+    const tmp = `${path}.tmp`;
+    await writeFile(tmp, JSON.stringify(data));
+    await rename(tmp, path);
+  } catch (err) {
+    logger.warn({ err: String(err), path }, 'feed state: could not save snapshot');
+  }
+}
+
+/** Project a live token down to the persisted shape. */
+export function toPersistedToken(t: TrackedToken): PersistedToken {
+  return {
+    address: t.address,
+    symbol: t.symbol,
+    name: t.name,
+    totalSupply: t.totalSupply,
+    supplyVerified: t.supplyVerified === true,
+    stable: t.stable === true,
+    discovered: t.discovered === true,
+    firstSeen: typeof t.firstSeen === 'number' ? t.firstSeen : Date.now(),
+    ...(typeof t.decimals === 'number' ? { decimals: t.decimals } : {}),
+  };
+}
