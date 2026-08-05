@@ -14,7 +14,7 @@ import {
 } from './decoder.js';
 import { fetchTokenMetadata } from './metadata.js';
 import { receiptConfirmsSwap, receiptDiagnostic } from './receipt.js';
-import { logHttpFailure, logRpcError, logRpcThrow } from './rpcLog.js';
+import { logHttpFailure, logRpcError, logRpcThrow, rpcHost } from './rpcLog.js';
 
 export type SwapHandler = (e: SwapEvent) => void;
 
@@ -125,7 +125,8 @@ export class LiveChainListener implements ChainListener {
   private connect(): void {
     if (this.stopped) return;
     const url = config.CHAIN_WS_URL;
-    logger.info({ url }, 'connecting to Robinhood Chain RPC');
+    // Host only: a WSS endpoint can carry its API key in the path.
+    logger.info({ host: rpcHost(url) }, 'connecting to Robinhood Chain RPC');
     const ws = new WebSocket(url);
     this.ws = ws;
 
@@ -406,7 +407,7 @@ export class HttpPollingChainListener implements ChainListener {
     this.stopped = false;
     this.walletTopics = [...this.store.wallets.keys()].map(addressToTopic);
     this.store.updateMetrics({ mode: 'live' });
-    logger.info({ rpc: config.CHAIN_HTTP_URL }, 'HTTP polling listener started');
+    logger.info({ host: rpcHost(config.CHAIN_HTTP_URL) }, 'HTTP polling listener started');
     void this.init();
   }
 

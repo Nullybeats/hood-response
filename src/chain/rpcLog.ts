@@ -26,10 +26,38 @@ import { logger } from '../logger.js';
 /** Host only — an endpoint URL may embed an API key. */
 export function rpcHost(url: string): string {
   try {
+    // .hostname deliberately, not .host or .href: it drops userinfo, port,
+    // path and query, which is where every credential form lives.
     return new URL(url).hostname;
   } catch {
     return '<unparseable>';
   }
+}
+
+/**
+ * Scrub anything credential-shaped out of a message we did not author.
+ *
+ * Node's fetch errors and a node's own JSON-RPC `message` can both echo the
+ * request back, so logging them verbatim can reprint the very URL `rpcHost`
+ * exists to avoid. Any URL collapses to its host; long opaque tokens are
+ * masked. Cheap insurance on a path whose entire job is being safe to read.
+ */
+export function redact(input: string): string {
+  return (
+    input
+      // Any URL -> scheme + host, dropping userinfo, path, query and fragment.
+      .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/gi, (m) => {
+        try {
+          const u = new URL(m);
+          return `${u.protocol}//${u.hostname}/<redacted>`;
+        } catch {
+          return '<redacted-url>';
+        }
+      })
+      // Bearer tokens and long opaque hex/base64 runs (API keys, JWTs).
+      .replace(/\bBearer\s+[\w.\-]+/gi, 'Bearer <redacted>')
+      .replace(/\b[A-Za-z0-9_-]{32,}\b/g, '<redacted-token>')
+  );
 }
 
 export interface RpcFailureContext {
@@ -71,7 +99,7 @@ export function logRpcError(ctx: RpcFailureContext, error: unknown): void {
       ...(ctx.range ? { range: ctx.range } : {}),
       code: typeof e.code === 'number' ? e.code : undefined,
       // Bounded: some nodes return multi-KB messages on a range that is too wide.
-      message: typeof e.message === 'string' ? e.message.slice(0, 200) : undefined,
+      message: typeof e.message === 'string' ? redact(e.message).slice(0, 200) : undefined,
     },
     'rpc jsonrpc error',
   );
@@ -85,7 +113,7 @@ export function logRpcThrow(ctx: RpcFailureContext, err: unknown): void {
       host: rpcHost(ctx.url),
       ...(ctx.method ? { method: ctx.method } : {}),
       ...(ctx.range ? { range: ctx.range } : {}),
-      err: String(err).slice(0, 200),
+      err: redact(String(err)).slice(0, 200),
     },
     'rpc transport error',
   );
