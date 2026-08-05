@@ -3,6 +3,7 @@ import { readFile, writeFile, rename, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { parseEther, formatEther } from 'ethers';
 import { config } from '../config/env.js';
+import { recordPonsDecision } from '../pons/journal.js';
 import { logger } from '../logger.js';
 import type { PriceOracle } from '../chain/price.js';
 import type { Swarm } from '../types.js';
@@ -525,20 +526,27 @@ export class SniperEngine {
     const now = Date.now();
     const token = launch.token.toLowerCase();
 
+    const selfBuyEth = Number(launch.initialBuyWei) / 1e18;
+    const size = Math.min(config.PONS_BUY_ETH, config.SNIPER_MAX_ETH_PER_TRADE);
+    // Journal EVERY outcome, skips included: "we passed on 40 launches because the cap was hit" is
+    // exactly what silently invalidates a day of dry-run data when it isn't visible.
+    const journal = (outcome: 'dry-run' | 'bought' | 'buy-failed' | 'skipped', reason?: string, txHash?: string) =>
+      recordPonsDecision({
+        at: Date.now(), owner: this.owner, token, symbol: launch.symbol, deployer: launch.deployer,
+        selfBuyEth, sizeEth: size, outcome, reason, txHash, gateLatencyMs: Date.now() - launch.seenAt,
+      });
+
     // Rails. Ordered cheapest-first so we never pay for a check a prior one would have vetoed.
-    if (this.buying.has(token)) return; // per-token in-flight lock
-    if (this.holdsOpen(token)) return;
+    if (this.buying.has(token)) return; // per-token in-flight lock — not a decision, a duplicate
+    if (this.holdsOpen(token)) return void journal('skipped', 'already holding');
     const openPons = this.openPositions().filter((p) => p.kind === 'PONS').length;
-    if (openPons >= config.PONS_MAX_OPEN) return;
+    if (openPons >= config.PONS_MAX_OPEN) return void journal('skipped', 'max open positions');
     if (this.ponsSpentLast24h(now) >= config.PONS_DAILY_CAP_ETH) {
       logger.warn({ token }, 'pons: 24h cap reached, skipping');
-      return;
+      return void journal('skipped', '24h cap reached');
     }
     const minInitial = config.PONS_MIN_INITIAL_BUY_ETH;
-    if (minInitial > 0 && Number(launch.initialBuyWei) / 1e18 < minInitial) return;
-
-    // Size is clamped by the same per-trade ceiling as every other buy.
-    const size = Math.min(config.PONS_BUY_ETH, config.SNIPER_MAX_ETH_PER_TRADE);
+    if (minInitial > 0 && selfBuyEth < minInitial) return void journal('skipped', 'deployer self-buy too small');
 
     // DRY RUN: everything above ran for real; we just don't broadcast. This is the default, and it
     // is how the strategy proves itself against live launches before any capital moves. The
@@ -549,6 +557,7 @@ export class SniperEngine {
         { token, symbol: launch.symbol, sizeEth: size, fee: launch.fee, gateLatencyMs: now - launch.seenAt },
         'pons: DRY RUN — would buy (set PONS_DRY_RUN=0 to trade real funds)',
       );
+      journal('dry-run');
       return;
     }
 
@@ -590,10 +599,12 @@ export class SniperEngine {
       this.positions.set(pos.id, pos);
       this.state?.audit(this.owner, 'buy-confirmed', { positionId: pos.id, tx: res.txHash, eth: res.ethSpent });
       logger.info({ token, symbol: launch.symbol, eth: res.ethSpent, tx: res.txHash }, 'pons: opened position');
+      journal('bought', undefined, res.txHash);
       void this.prepareExit(pos);
       void this.persist();
     } catch (err) {
       logger.error({ token, err: String(err) }, 'pons: buy failed');
+      journal('buy-failed', (err instanceof Error ? err.message : String(err)).slice(0, 120));
     } finally {
       this.buying.delete(token);
     }

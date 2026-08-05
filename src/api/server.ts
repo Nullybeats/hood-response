@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import { z } from 'zod';
 import { config } from '../config/env.js';
+import { ponsDecisions, ponsJournalSummary } from '../pons/journal.js';
 import { logger } from '../logger.js';
 import type { MemoryStore } from '../store/memory.js';
 import { recordWalletUpsert, recordWalletRemove } from '../store/walletOverrides.js';
@@ -247,6 +248,24 @@ export async function buildServer(
     return { muted, mutedWalletCount, groups };
   };
   app.get('/api/muted', async (req, reply) => (adminOk(req) ? mutedState() : denyAdmin(reply)));
+
+  // ── Pons launchpad decision journal ───────────────────────────────────────────
+  // What the launchpad executor decided and why, including skips. Admin-gated like every other
+  // operational surface. Read-only: it reports the journal, it never influences a trade.
+  app.get('/api/pons/decisions', async (req, reply) => {
+    if (!adminOk(req)) return denyAdmin(reply);
+    const q = req.query as { limit?: string; owner?: string };
+    const limit = Math.min(300, Math.max(1, Number(q.limit) || 100));
+    return {
+      dryRun: config.PONS_DRY_RUN,
+      enabled: config.PONS_ENABLED,
+      buyEth: config.PONS_BUY_ETH,
+      maxOpen: config.PONS_MAX_OPEN,
+      dailyCapEth: config.PONS_DAILY_CAP_ETH,
+      summary: ponsJournalSummary(q.owner),
+      decisions: ponsDecisions(limit, q.owner),
+    };
+  });
 
   // ── Blue-chip buy/sell filter (weed out whales rotating known coins) ───────────
   const filterState = () => ({ blueChipBuys: store.blueChipBuys, blueChipSells: store.blueChipSells });
