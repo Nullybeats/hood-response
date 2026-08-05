@@ -115,6 +115,23 @@ const schema = z.object({
   FEED_BACKOFF_MIN_MS: num(1_000),
   FEED_BACKOFF_MAX_MS: num(30_000),
 
+  // ── Shadow listener (chain/shadow.ts) ──────────────────────────────────────
+  // Measures only: classifies tracked-wallet transfers against the swap and
+  // liquidity events in their own transaction, so we can say what the live
+  // listener sees, misses, and over-counts. Emits nothing into detection.
+  //
+  // A DEDICATED token, never the box's: the shadow deliberately hammers
+  // HyperSync with paginated queries, and sharing a token would draw down the
+  // quota the box's Pons watcher depends on — coupling the measurement to the
+  // execution environment is the exact failure mode being measured.
+  FEED_SHADOW_ENABLED: bool(true),
+  FEED_HYPERSYNC_URL: z.string().default('https://robinhood.hypersync.xyz'),
+  // Empty = shadow disabled. HyperSync requires auth (401 unauthenticated), and
+  // an unauthenticated query reads as "no logs" rather than "unauthorized", so
+  // running without a token would manufacture a confident zero.
+  FEED_HYPERSYNC_TOKEN: z.string().default(''),
+  FEED_SHADOW_INTERVAL_MS: num(5_000),
+
   ALERT_MIN_WALLETS: num(2),
   ALERT_WINDOW_SECONDS: num(300),
   ALERT_MIN_USD: num(0),

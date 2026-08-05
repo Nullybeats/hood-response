@@ -11,6 +11,7 @@ import type { AlertEngine } from '../engine/alertEngine.js';
 import type { Aggregator } from '../engine/aggregator.js';
 import type { PerformanceTracker } from '../engine/performance.js';
 import type { SniperRegistry } from '../sniper/registry.js';
+import type { HyperSyncShadow } from '../chain/shadow.js';
 import { addressOfPrivateKey } from '../sniper/executor.js';
 import { configuredChannels, dispatch } from '../notify/index.js';
 import { walletId } from '../walletId.js';
@@ -104,6 +105,7 @@ export async function buildServer(
   aggregator: Aggregator,
   performance?: PerformanceTracker,
   sniper?: SniperRegistry,
+  shadow?: HyperSyncShadow,
 ): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
   await app.register(cors, { origin: true });
@@ -130,6 +132,24 @@ export async function buildServer(
       trackedTokens: store.tokensByAddress.size,
     },
   }));
+
+  // ── Shadow comparison (read-only measurement, never affects detection) ─────
+  // Deliberately its own endpoint rather than a field on /health: this is an
+  // experiment's output, and folding it into the health contract would invite
+  // treating it as production truth before it has been reviewed.
+  app.get('/api/shadow', async () => {
+    if (!shadow) return { enabled: false, reason: 'shadow listener not constructed' };
+    const s = shadow.stats();
+    const elapsedMin = s.startedAt ? (Date.now() - s.startedAt) / 60_000 : 0;
+    return {
+      ...s,
+      elapsedMinutes: Math.round(elapsedMin * 10) / 10,
+      // Named for what it measures. A V3/V4 Swap in the same transaction proves a
+      // swap happened there — NOT that this transfer was the trader's purchase.
+      note: 'swap-cooccurrence = a V3/V4 Swap event shares the transaction; it is evidence, not proof',
+      live: { swaps: store.totals.swaps, swarms: store.totals.swarms, alerts: store.totals.alerts },
+    };
+  });
 
   // ── Stats / config ──────────────────────────────────────────────────────────
   app.get('/api/stats', async () => ({
