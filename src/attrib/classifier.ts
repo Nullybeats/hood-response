@@ -33,6 +33,13 @@ export interface ClassifyInput {
   ctx: TxContext;
   /** Decimals per token, when known. Absent decimals never block a verdict. */
   decimals?: Record<string, number>;
+  /**
+   * Deltas the receipt cannot show — native movement recovered from an
+   * execution trace, or an explicit `insufficient_trace_data` marker recording
+   * that a leg exists but could not be read. Supplied by the ingester, which is
+   * the only component that knows whether the source has traces at all.
+   */
+  extraDeltas?: WalletDelta[];
 }
 
 /**
@@ -93,7 +100,7 @@ function walletSentSomething(ctx: TxContext): boolean {
 export function classifyTransaction(input: ClassifyInput): AttributionResult {
   const { ctx } = input;
   const findings = runAdapters(ctx);
-  const deltas = walletDeltas(ctx, input.decimals ?? {});
+  const deltas = [...walletDeltas(ctx, input.decimals ?? {}), ...(input.extraDeltas ?? [])];
   const ev = (note?: string): Evidence => buildEvidence(ctx, findings, deltas, note);
 
   // 1. A reverted transaction moved nothing, whatever its logs suggest.
@@ -123,39 +130,65 @@ export function classifyTransaction(input: ClassifyInput): AttributionResult {
   //    non-trade would hide a real trade; declaring it a trade would resurrect
   //    the `chain/receipt.ts` defect. So protocol findings are gathered first,
   //    and the wallet's own net flow is what resolves which it was.
-  const up = deltas.filter((d) => BigInt(d.rawDelta) > 0n);
-  const down = deltas.filter((d) => BigInt(d.rawDelta) < 0n);
+  // Token legs only. A native trace delta proves the NATIVE side and must not
+  // also be counted as one of the two token legs, or a single-sided trade would
+  // appear to have both.
+  const tokenDeltas = deltas.filter(
+    (d) => d.source === 'erc20_logs' || d.source === 'weth_wrap_logs',
+  );
+  const up = tokenDeltas.filter((d) => BigInt(d.rawDelta) > 0n);
+  const down = tokenDeltas.filter((d) => BigInt(d.rawDelta) < 0n);
   const wrapped = findings.filter(
     (f) => (f.kind === 'wrap' || f.kind === 'unwrap') && f.verified && isWallet(f.beneficiary, ctx.wallet),
   );
 
   // Native proof is broader than WETH events. A user may legitimately pay native
-  // ETH straight to a verified protocol entry point, in which case there is no
-  // Deposit/Withdrawal to find. Accepted proofs, in order of directness:
-  //   a) a WETH Deposit/Withdrawal crediting this wallet
-  //   b) top-level tx.value sent BY this wallet TO a verified entry point
-  //   c) an internal native transfer from a trace (delta_source === 'trace')
-  // Anything else leaves the native leg unproven.
+  // ETH straight to a verified protocol entry point, where there is no
+  // Deposit/Withdrawal to find; requiring one would misclassify a real buy.
+  //
+  // Accepted proofs, in order of directness:
+  //   a) a canonical WETH Deposit/Withdrawal crediting this wallet
+  //   b) top-level tx.value sent to a VERIFIED entry point
+  //   c) an execution trace showing native value moving to/from this wallet
+  //
+  // (c) is POSITIVE proof and is distinct from `insufficient_trace_data`, which
+  // is the ABSENCE of proof. Conflating them — as an earlier revision did by
+  // reading the failure marker as evidence — would confirm trades on data we
+  // explicitly could not read.
   const paidNativeToProtocol =
     ctx.nativeValueWei != null &&
     ctx.nativeValueWei !== '0' &&
     ctx.txTo != null &&
     (ctx.verifiedContracts?.has(lc(ctx.txTo)) ?? false);
-  const traceNative = deltas.some((d) => d.source === 'insufficient_trace_data');
-  const nativeLeg = wrapped.length > 0 || paidNativeToProtocol;
+  const traceNativeProven = deltas.some(
+    (d) => d.source === 'trace_native' && BigInt(d.rawDelta) !== 0n,
+  );
+  const traceUnreadable = deltas.some((d) => d.source === 'insufficient_trace_data');
+  const nativeLeg = wrapped.length > 0 || paidNativeToProtocol || traceNativeProven;
 
   const bothSides = up.length > 0 && down.length > 0;
   const exchangeProven = bothSides || ((up.length > 0 || down.length > 0) && nativeLeg);
   const liqOrFee = oursLiq.length > 0 || oursFees.length > 0;
 
   if (oursSwaps.length > 0 && liqOrFee) {
-    // Both kinds of activity are present and attributable to this wallet.
-    // Genuinely unresolved without decomposing the transaction, so it is
-    // recorded as unresolved — and suppressed for live alerts — rather than
-    // being forced into either bucket.
+    // MIXED PROTOCOL ACTIONS ARE CURRENTLY SUPPRESSED PENDING ACTION-LEVEL
+    // DECOMPOSITION.
+    //
+    // Stated precisely, because it is easy to overclaim: this branch does NOT
+    // attempt to resolve the transaction from net flow. Net flow alone cannot
+    // separate the swap leg of a zap from its liquidity leg — both legs net
+    // into the same wallet-level delta vector, so a rebalance and a buy-then-LP
+    // are indistinguishable without attributing individual asset movements to
+    // individual protocol actions.
+    //
+    // Until an adapter can decompose them, the honest answer is "unresolved",
+    // and unresolved is suppressed for live alerts. Do not read this as
+    // "zap/rebalance trades are classified accurately" — they are not
+    // classified at all yet, and the size of this bucket is the measure of how
+    // much that costs.
     return result(
       'mixed_or_ambiguous_activity',
-      ev('both liquidity/fee and swap activity attributable to this wallet; net flow does not resolve which'),
+      ev('verified swap and verified liquidity/fee both attributable to this wallet; not decomposed'),
     );
   }
 
@@ -191,8 +224,8 @@ export function classifyTransaction(input: ClassifyInput): AttributionResult {
     return result(
       'insufficient_trace_data',
       ev(
-        traceNative
-          ? 'swap present; native leg known to exist but not readable'
+        traceUnreadable
+          ? 'swap present; a native leg is known to exist but the trace could not be read'
           : 'swap present, one asset leg only; native/internal flow unprovable from receipts',
       ),
     );

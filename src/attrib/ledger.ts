@@ -207,7 +207,12 @@ export class AttributionLedger {
 
       CREATE TABLE IF NOT EXISTS attrib_wallet_delta (
         tx_hash TEXT NOT NULL, wallet TEXT NOT NULL, token TEXT NOT NULL,
-        net_raw_delta TEXT NOT NULL, decimals INTEGER, delta_source TEXT NOT NULL,
+        net_raw_delta TEXT NOT NULL, decimals INTEGER,
+        -- trace_native (positive proof) and insufficient_trace_data (absence of
+        -- proof) are opposites; the CHECK keeps any writer from inventing a
+        -- third meaning for either.
+        delta_source TEXT NOT NULL CHECK (delta_source IN
+          ('erc20_logs','weth_wrap_logs','trace_native','insufficient_trace_data')),
         PRIMARY KEY (tx_hash, wallet, token)
       );
 

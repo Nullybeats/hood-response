@@ -195,9 +195,22 @@ export interface WalletDelta {
   /** Signed, in raw contract units. Stringified: these exceed Number precision. */
   rawDelta: string;
   decimals: number | null;
-  /** How the delta was established. `insufficient_trace_data` means a leg is
-   *  known to exist but is invisible in receipt logs. */
-  source: 'erc20_logs' | 'weth_wrap_logs' | 'insufficient_trace_data';
+  /**
+   * How the delta was established. These are NOT interchangeable:
+   *
+   *   erc20_logs             a Transfer log named this wallet
+   *   weth_wrap_logs         a canonical WETH Deposit/Withdrawal credited it
+   *   trace_native           an execution trace showed native value moving
+   *                          to/from this wallet — POSITIVE proof
+   *   insufficient_trace_data
+   *                          a leg is known to exist but could not be read —
+   *                          the ABSENCE of proof, never evidence of a movement
+   *
+   * The last two are opposites and must never be conflated. Treating an
+   * unreadable leg as a proven one would confirm trades on missing data, which
+   * is the failure mode this whole subsystem exists to prevent.
+   */
+  source: 'erc20_logs' | 'weth_wrap_logs' | 'trace_native' | 'insufficient_trace_data';
 }
 
 /** Why the classifier decided what it decided. Never free text alone. */

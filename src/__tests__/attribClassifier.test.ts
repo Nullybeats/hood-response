@@ -14,6 +14,7 @@ const TOKEN = '0x4444444444444444444444444444444444444444';
 const WETH = '0x0bd7d308f8e1639fab988df18a8011f41eacad73';
 
 const NPM = '0x58daec3116aae6d93017baaea7749052e8a04fa7'; // POSITION_MANAGER
+const NATIVE = '0x0000000000000000000000000000000000000000';
 const V3_BURN = id('Burn(address,int24,int24,uint128,uint256,uint256)').toLowerCase();
 const NPM_INCREASE = id('IncreaseLiquidity(uint256,uint128,uint256,uint256)').toLowerCase();
 const NPM_COLLECT = id('Collect(uint256,address,uint256,uint256)').toLowerCase();
@@ -164,6 +165,66 @@ describe('attribution classifier — a trade requires a demonstrated exchange', 
       ]),
     });
     expect(r.outcome).toBe('confirmed_trade');
+  });
+
+  it('accepts one token leg when a TRACE proves the native payment', () => {
+    // A user paying native ETH through internal calls leaves no Transfer and no
+    // WETH Deposit. Only a trace can show it. `trace_native` is positive proof.
+    const r = classifyTransaction({
+      ctx: ctx([
+        xfer(TOKEN, POOL, WALLET, 900n),
+        log(POOL, V3_SWAP_TOPIC, addressToTopic(OTHER), addressToTopic(WALLET)),
+      ]),
+      extraDeltas: [
+        { token: NATIVE, rawDelta: '-1000000000000000000', decimals: 18, source: 'trace_native' },
+      ],
+    });
+    expect(r.outcome).toBe('confirmed_trade');
+    expect(r.category).toBe('swap_v3_router');
+  });
+
+  it('an UNREADABLE trace is the absence of proof, not proof', () => {
+    // `insufficient_trace_data` is the opposite of `trace_native`. An earlier
+    // revision read the failure marker as evidence, which would have confirmed
+    // trades on data we explicitly could not read.
+    const r = classifyTransaction({
+      ctx: ctx([
+        xfer(TOKEN, POOL, WALLET, 900n),
+        log(POOL, V3_SWAP_TOPIC, addressToTopic(OTHER), addressToTopic(WALLET)),
+      ]),
+      extraDeltas: [
+        { token: NATIVE, rawDelta: '0', decimals: 18, source: 'insufficient_trace_data' },
+      ],
+    });
+    expect(r.outcome).toBe('unknown_unsupported');
+    expect(r.category).toBe('insufficient_trace_data');
+    expect(r.evidence.note).toContain('could not be read');
+  });
+
+  it('a zero-value trace-native delta does not prove a payment', () => {
+    const r = classifyTransaction({
+      ctx: ctx([
+        xfer(TOKEN, POOL, WALLET, 900n),
+        log(POOL, V3_SWAP_TOPIC, addressToTopic(OTHER), addressToTopic(WALLET)),
+      ]),
+      extraDeltas: [{ token: NATIVE, rawDelta: '0', decimals: 18, source: 'trace_native' }],
+    });
+    expect(r.category).toBe('insufficient_trace_data');
+  });
+
+  it('MIXED protocol actions are suppressed, not resolved', () => {
+    // Documented limitation, asserted so it cannot be quietly overclaimed later:
+    // net flow alone cannot separate a zap's swap leg from its liquidity leg.
+    const r = classifyTransaction({
+      ctx: ctx([
+        xfer(WETH, WALLET, POOL, 10n ** 18n),
+        xfer(TOKEN, POOL, WALLET, 100n),
+        log(POOL, V3_SWAP_TOPIC, addressToTopic(OTHER), addressToTopic(WALLET)),
+        log(NPM, NPM_INCREASE, addressToTopic(WALLET)),
+      ]),
+    });
+    expect(r.category).toBe('mixed_or_ambiguous_activity');
+    expect(r.evidence.note).toContain('not decomposed');
   });
 
   it('a reverted transaction is never a trade', () => {
