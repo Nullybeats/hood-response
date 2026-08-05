@@ -732,6 +732,49 @@ export class AttributionLedger {
     return (this.db.prepare('SELECT COUNT(*) AS n FROM attrib_reorg').get() as unknown as { n: number }).n;
   }
 
+  /**
+   * The same invariant, scoped to a BLOCK RANGE.
+   *
+   * The global form silently describes all-time when a caller asks about a
+   * window, which lets a report claim to cover [from, to] while quoting numbers
+   * from every block ever ingested. Every count here is constrained to pairs
+   * whose OBSERVATION falls inside the interval, so the denominator and the
+   * drift both mean what the range says they mean.
+   */
+  accountedForRange(classifierVersion: number, fromBlock: number, toBlock: number): AccountedFor {
+    if (!this.db) return { pairs: 0, attributed: 0, pending: 0, drift: 0 };
+    const inRange =
+      `SELECT DISTINCT tx_hash, watched_wallet FROM attrib_observation
+       WHERE block_number >= ? AND block_number <= ?`;
+    const pairs = (
+      this.db.prepare(`SELECT COUNT(*) AS n FROM (${inRange})`).get(fromBlock, toBlock) as unknown as {
+        n: number;
+      }
+    ).n;
+    const attributed = (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM attrib_attribution a
+           WHERE a.classifier_version = ?
+             AND EXISTS (SELECT 1 FROM attrib_observation o
+               WHERE o.tx_hash = a.tx_hash AND o.watched_wallet = a.watched_wallet
+                 AND o.block_number >= ? AND o.block_number <= ?)`,
+        )
+        .get(classifierVersion, fromBlock, toBlock) as unknown as { n: number }
+    ).n;
+    const pending = (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM attrib_pending p
+           WHERE EXISTS (SELECT 1 FROM attrib_observation o
+             WHERE o.tx_hash = p.tx_hash AND o.watched_wallet = p.watched_wallet
+               AND o.block_number >= ? AND o.block_number <= ?)`,
+        )
+        .get(fromBlock, toBlock) as unknown as { n: number }
+    ).n;
+    return { pairs, attributed, pending, drift: pairs - attributed - pending };
+  }
+
   /** Prune old rows. Failures and still-pending pairs are never auto-pruned. */
   pruneBefore(block: number): number {
     if (!this.db) return 0;

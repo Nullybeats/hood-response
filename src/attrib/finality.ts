@@ -28,8 +28,19 @@ export interface FinalityStatus {
   safeHead: number | null;
   /** How far the ingester has genuinely covered — never beyond a sweep's `covered`. */
   cursorBlock: number | null;
-  /** Hash checkpointed at the cursor, when one is known. */
+  /**
+   * Hash checkpointed at EXACTLY `cursorBlock`, or null.
+   *
+   * Never the latest checkpoint of some stream: `cursorBlock` is the MINIMUM
+   * across streams and pending work, so the newest wallet-transfers checkpoint
+   * routinely belongs to a later block. Reporting it here would pair a cursor
+   * from one stream with a hash from another — a continuity claim about a block
+   * we never checkpointed.
+   */
   cursorHash: string | null;
+  /** Per-stream cursor and its checkpointed hash, when one exists at that exact
+   *  height. This is where a caller looks when the aggregate hash is null. */
+  streams: Record<string, { cursor: number; hash: string | null }>;
   finalityDepth: number;
   /** True when the cursor is above the safe head: results in this window may
    *  still be invalidated by a reorg and must be labelled provisional. */
@@ -47,14 +58,21 @@ export function finalityStatus(
   const depth = finalityDepth();
   const safeHead = observedHead == null ? null : Math.max(0, observedHead - depth);
   const cursorBlock = ledger.safeCursor();
-  const cp = ledger.latestCheckpoint(streamId);
   const provisional =
     cursorBlock != null && safeHead != null ? cursorBlock > safeHead : cursorBlock != null;
+  // Only a checkpoint AT the reported cursor block may be called the cursor
+  // hash. Anything else is a hash for a different block.
+  const cursorHash = cursorBlock == null ? null : ledger.checkpointAt(streamId, cursorBlock);
+  const streams: Record<string, { cursor: number; hash: string | null }> = {};
+  for (const [id, cursor] of Object.entries(ledger.cursors())) {
+    streams[id] = { cursor, hash: ledger.checkpointAt(id, cursor) };
+  }
   return {
     observedHead,
     safeHead,
     cursorBlock,
-    cursorHash: cp?.block_hash ?? null,
+    cursorHash,
+    streams,
     finalityDepth: depth,
     provisional,
     provisionalBlocks:
@@ -64,7 +82,21 @@ export function finalityStatus(
 }
 
 export interface ContinuityCheck {
+  /** False ONLY when a reorg was positively detected. Not a proof of health. */
   ok: boolean;
+  /** Did the source supply a usable rollback guard at all? */
+  guardPresent: boolean;
+  /** True only when a guard was compared against a checkpoint and MATCHED. */
+  continuityProven: boolean;
+  /**
+   * True when nothing could be checked — no guard, or no checkpoint to compare
+   * against. `ok: true` alone was indistinguishable from "verified intact",
+   * which would let a source that stopped emitting guards look exactly like a
+   * chain that never reorgs. Callers must surface this, not collapse it.
+   */
+  continuityUnknown: boolean;
+  /** Why continuity could not be established, when it could not. */
+  reason?: 'no_guard' | 'no_checkpoint';
   /** Set when a reorg was detected: the block whose parent no longer matches. */
   brokenAt?: number;
   expectedHash?: string | null;
@@ -89,14 +121,33 @@ export function checkContinuity(
   firstGuard: RollbackGuard | null,
 ): ContinuityCheck {
   if (!firstGuard?.first_block_number || !firstGuard.first_parent_hash) {
-    return { ok: true };
+    return {
+      ok: true,
+      guardPresent: false,
+      continuityProven: false,
+      continuityUnknown: true,
+      reason: 'no_guard',
+    };
   }
   const parentHeight = firstGuard.first_block_number - 1;
   const known = ledger.checkpointAt(streamId, parentHeight);
-  if (!known) return { ok: true }; // nothing to contradict
-  if (known.toLowerCase() === firstGuard.first_parent_hash.toLowerCase()) return { ok: true };
+  if (!known) {
+    return {
+      ok: true,
+      guardPresent: true,
+      continuityProven: false,
+      continuityUnknown: true,
+      reason: 'no_checkpoint',
+    };
+  }
+  if (known.toLowerCase() === firstGuard.first_parent_hash.toLowerCase()) {
+    return { ok: true, guardPresent: true, continuityProven: true, continuityUnknown: false };
+  }
   return {
     ok: false,
+    guardPresent: true,
+    continuityProven: false,
+    continuityUnknown: false,
     brokenAt: firstGuard.first_block_number,
     expectedHash: known,
     actualParentHash: firstGuard.first_parent_hash,
@@ -130,7 +181,7 @@ export function coverageWindow(
   toBlock: number,
   provisional: boolean,
 ): CoverageWindow {
-  const a = ledger.accountedFor(classifierVersion);
+  const a = ledger.accountedForRange(classifierVersion, fromBlock, toBlock);
   const denom = a.attributed + a.pending + a.drift;
   return {
     fromBlock,
