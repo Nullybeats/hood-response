@@ -49,21 +49,50 @@ export interface HsTransaction {
   block_number?: number;
 }
 
+/**
+ * HyperSync's reorg primitive, verified present on this chain 2026-08-05.
+ *
+ *   first_block_number / first_parent_hash — lets a caller prove the page joins
+ *     onto the chain it last checkpointed. A mismatch IS a reorg.
+ *   block_number / hash — the new checkpoint to persist.
+ *
+ * Without this, a durable cursor is only a promise that we read some blocks; it
+ * says nothing about whether those blocks are still on the canonical chain.
+ */
+export interface RollbackGuard {
+  block_number?: number;
+  hash?: string;
+  timestamp?: number;
+  first_block_number?: number;
+  first_parent_hash?: string;
+}
+
 export interface HsResponse {
   data?: { blocks?: HsBlock[]; logs?: HsLog[]; transactions?: HsTransaction[] }[];
   next_block?: number;
   archive_height?: number;
+  rollback_guard?: RollbackGuard;
 }
 
 /** Result of a fully-paginated sweep. `covered` may be < `to` on failure. */
 export interface SweepResult<T> {
   items: T[];
-  /** The block through which this sweep is genuinely complete. */
+  /**
+   * The block through which this sweep is genuinely complete.
+   *
+   * Observations may be recorded ONLY up to here, and coverage may never be
+   * claimed beyond here. A partial query contributes what it returned and
+   * nothing more.
+   */
   covered: number;
   pages: number;
   /** True when the sweep stopped early — the caller must not treat the
    *  remainder as empty. */
   truncated: boolean;
+  /** Continuity/checkpoint data from the LAST page, when the source supplies it. */
+  guard: RollbackGuard | null;
+  /** Continuity data from the FIRST page — what must join onto our checkpoint. */
+  firstGuard: RollbackGuard | null;
 }
 
 export interface HyperSyncFailure {
@@ -185,13 +214,19 @@ export class HyperSyncClient {
     const out: (HsLog | HsBlock | HsTransaction)[] = [];
     let cur = from;
     let pages = 0;
+    let guard: RollbackGuard | null = null;
+    let firstGuard: RollbackGuard | null = null;
     while (cur < to && pages < this.maxPages) {
       const r = await this.query({ ...body, from_block: cur, to_block: to }, `${cur}-${to}`);
       if (!r) {
         // Partial coverage is still coverage; report exactly how far we got.
         return pages > 0
-          ? { items: out, covered: cur, pages, truncated: true }
+          ? { items: out, covered: cur, pages, truncated: true, guard, firstGuard }
           : null;
+      }
+      if (r.rollback_guard) {
+        if (firstGuard === null) firstGuard = r.rollback_guard;
+        guard = r.rollback_guard;
       }
       // Spread would blow the stack on a large page; measured at ~200k logs.
       for (const item of extract(r)) out.push(item);
@@ -200,12 +235,12 @@ export class HyperSyncClient {
       // No forward progress means the endpoint cannot serve this range; stop
       // rather than spin, and report only what was genuinely covered.
       if (typeof r.next_block !== 'number' || r.next_block <= cur) {
-        return { items: out, covered: Math.min(cur, to), pages, truncated: cur < to };
+        return { items: out, covered: Math.min(cur, to), pages, truncated: cur < to, guard, firstGuard };
       }
       cur = r.next_block;
     }
     const covered = Math.min(cur, to);
-    return { items: out, covered, pages, truncated: covered < to };
+    return { items: out, covered, pages, truncated: covered < to, guard, firstGuard };
   }
 
   /** Sweep returning logs, the common case. */

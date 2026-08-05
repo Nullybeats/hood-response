@@ -150,6 +150,11 @@ const schema = z.object({
   // Row-level detail (tx hashes, wallets) is admin-gated AND off by default —
   // a tx hash is a one-lookup deanonymiser for a watched wallet.
   ATTRIB_EXPOSE_DETAIL: bool(false),
+  // Blocks below the observed head treated as settled. Above this the
+  // accounting window is PROVISIONAL and reported as such — a scanned block is
+  // not a final block, and a reorg must not silently invalidate published
+  // numbers. ~30s at this chain's 0.1s blocks.
+  ATTRIB_FINALITY_DEPTH: num(300),
 
   ALERT_MIN_WALLETS: num(2),
   ALERT_WINDOW_SECONDS: num(300),

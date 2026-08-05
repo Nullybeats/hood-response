@@ -234,6 +234,29 @@ export class AttributionLedger {
         safe_detail TEXT, tx_hash TEXT, wallet TEXT, at INTEGER NOT NULL
       );
 
+      -- Chain continuity. A cursor alone only promises we READ some blocks; it
+      -- says nothing about whether those blocks are still canonical. Persisting
+      -- the hash at each checkpoint is what lets a reorg be detected instead of
+      -- silently inherited.
+      CREATE TABLE IF NOT EXISTS attrib_checkpoint (
+        stream_id TEXT NOT NULL,
+        block_number INTEGER NOT NULL,
+        block_hash TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (stream_id, block_number)
+      );
+
+      CREATE TABLE IF NOT EXISTS attrib_reorg (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        stream_id TEXT NOT NULL,
+        detected_at INTEGER NOT NULL,
+        at_block INTEGER NOT NULL,
+        expected_hash TEXT, actual_parent_hash TEXT,
+        rolled_back_to INTEGER NOT NULL,
+        observations_removed INTEGER NOT NULL,
+        attributions_removed INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS attrib_cursor (
         stream_id TEXT PRIMARY KEY,
         covered_through_block INTEGER NOT NULL,
@@ -608,6 +631,105 @@ export class AttributionLedger {
       this.db.prepare('SELECT COUNT(*) AS n FROM attrib_pending').get() as unknown as { n: number }
     ).n;
     return { pairs, attributed, pending, drift: pairs - attributed - pending };
+  }
+
+  // ── Finality / reorg ───────────────────────────────────────────────────────
+
+  /** Persist the hash of a checkpointed block, so continuity is provable later. */
+  recordCheckpoint(streamId: string, blockNumber: number, blockHash: string): void {
+    if (!this.db) return;
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO attrib_checkpoint (stream_id, block_number, block_hash, at)
+         VALUES (?,?,?,?)`,
+      )
+      .run(streamId, blockNumber, blockHash.toLowerCase(), Date.now());
+    // Keep a bounded window of recent checkpoints — deep history is not useful
+    // for continuity and unbounded growth is.
+    this.db
+      .prepare(
+        `DELETE FROM attrib_checkpoint WHERE stream_id = ? AND block_number <
+           (SELECT MIN(block_number) FROM
+             (SELECT block_number FROM attrib_checkpoint WHERE stream_id = ?
+              ORDER BY block_number DESC LIMIT 500))`,
+      )
+      .run(streamId, streamId);
+  }
+
+  checkpointAt(streamId: string, blockNumber: number): string | null {
+    if (!this.db) return null;
+    const r = this.db
+      .prepare(
+        'SELECT block_hash FROM attrib_checkpoint WHERE stream_id = ? AND block_number = ?',
+      )
+      .get(streamId, blockNumber) as unknown as { block_hash?: string } | undefined;
+    return r?.block_hash ?? null;
+  }
+
+  latestCheckpoint(streamId: string): { block_number: number; block_hash: string } | null {
+    if (!this.db) return null;
+    const r = this.db
+      .prepare(
+        `SELECT block_number, block_hash FROM attrib_checkpoint WHERE stream_id = ?
+         ORDER BY block_number DESC LIMIT 1`,
+      )
+      .get(streamId) as unknown as { block_number: number; block_hash: string } | undefined;
+    return r ?? null;
+  }
+
+  /**
+   * Roll back everything at or after `block` and rewind the cursor.
+   *
+   * Observations, attributions, pending work, deltas, protocol hits and
+   * emissions for the affected blocks are all removed — a reorged block's
+   * transactions may simply not exist on the canonical chain, so leaving their
+   * verdicts in place would report classifications for events that never
+   * happened. The reorg itself is recorded permanently.
+   */
+  rollbackTo(streamId: string, block: number, expectedHash: string | null, actualParent: string | null): {
+    observationsRemoved: number;
+    attributionsRemoved: number;
+  } {
+    if (!this.db) return { observationsRemoved: 0, attributionsRemoved: 0 };
+    return this.transaction(() => {
+      const txs = this.db!
+        .prepare('SELECT DISTINCT tx_hash FROM attrib_observation WHERE block_number >= ?')
+        .all(block) as unknown as { tx_hash: string }[];
+      const hashes = txs.map((t) => t.tx_hash);
+      let attributionsRemoved = 0;
+      for (const h of hashes) {
+        attributionsRemoved += Number(
+          this.db!.prepare('DELETE FROM attrib_attribution WHERE tx_hash = ?').run(h).changes,
+        );
+        this.db!.prepare('DELETE FROM attrib_pending WHERE tx_hash = ?').run(h);
+        this.db!.prepare('DELETE FROM attrib_wallet_delta WHERE tx_hash = ?').run(h);
+        this.db!.prepare('DELETE FROM attrib_protocol_hit WHERE tx_hash = ?').run(h);
+        this.db!.prepare('DELETE FROM attrib_emission WHERE tx_hash = ?').run(h);
+        this.db!.prepare('DELETE FROM attrib_tx WHERE tx_hash = ?').run(h);
+      }
+      const observationsRemoved = Number(
+        this.db!.prepare('DELETE FROM attrib_observation WHERE block_number >= ?').run(block).changes,
+      );
+      this.db!.prepare('DELETE FROM attrib_checkpoint WHERE block_number >= ?').run(block);
+      // Rewind every stream: a reorg invalidates the range for all of them.
+      this.db!
+        .prepare('UPDATE attrib_cursor SET covered_through_block = ?, updated_at = ? WHERE covered_through_block > ?')
+        .run(block - 1, Date.now(), block - 1);
+      this.db!
+        .prepare(
+          `INSERT INTO attrib_reorg
+           (stream_id, detected_at, at_block, expected_hash, actual_parent_hash,
+            rolled_back_to, observations_removed, attributions_removed)
+           VALUES (?,?,?,?,?,?,?,?)`,
+        )
+        .run(streamId, Date.now(), block, expectedHash, actualParent, block - 1, observationsRemoved, attributionsRemoved);
+      return { observationsRemoved, attributionsRemoved };
+    });
+  }
+
+  reorgCount(): number {
+    if (!this.db) return 0;
+    return (this.db.prepare('SELECT COUNT(*) AS n FROM attrib_reorg').get() as unknown as { n: number }).n;
   }
 
   /** Prune old rows. Failures and still-pending pairs are never auto-pruned. */
