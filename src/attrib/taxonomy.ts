@@ -18,7 +18,22 @@
  * the sniper and a wrong label is what buys the wrong coin.
  */
 
-/** Bump on ANY change to classifier rules. Written on every result row. */
+/**
+ * THE CANONICAL UNIT IS `(txHash, watchedWallet)` — NOT `(txHash, logIndex)`.
+ *
+ * A transaction can carry many Transfer logs, more than one swap, and more than
+ * one watched wallet. A log index identifies an EMISSION; it does not identify
+ * the economic action. Keying the verdict on it would let one transaction hold
+ * several contradictory answers for the same wallet, and would make "did this
+ * wallet trade here?" unanswerable without re-joining. So:
+ *
+ *   observation  (txHash, logIndex, wallet)  — the raw triggering log, provenance
+ *   attribution  (txHash, wallet, version)   — the one canonical outcome
+ *
+ * The accounted-for invariant runs over observed `(txHash, wallet)` PAIRS.
+ */
+
+/** Bump on ANY change to classifier rules. Written on every attribution row. */
 export const CLASSIFIER_VERSION = 1;
 
 /** Bump when an adapter's interpretation changes. Written alongside the above. */
@@ -71,6 +86,18 @@ export type UnknownCategory =
   /** An event signature no adapter claims. Drives the unknown-topic leaderboard. */
   | 'unknown_topic'
   | 'unsupported_protocol'
+  /**
+   * The transaction legitimately contains BOTH a liquidity/fee action and a
+   * swap, and the wallet's net flow does not resolve which the wallet was
+   * doing — a zap, a rebalance, a multi-action batch.
+   *
+   * This is why there is no blanket "liquidity present ⇒ not a trade" rule: a
+   * rebalance really does swap. Calling it a non-trade hides a real trade;
+   * calling it a trade resurrects the receipt.ts defect. It is genuinely
+   * unresolved, so it is recorded as unresolved and SUPPRESSED for live alerts
+   * until an adapter can decompose it.
+   */
+  | 'mixed_or_ambiguous_activity'
   /** A Swap exists but the asset deltas do not reconcile to THIS wallet — a
    *  router settling for a third party, an aggregator batching users. This is
    *  what stops "destination is a router" from being read as "wallet traded". */
@@ -85,6 +112,30 @@ export type UnknownCategory =
   | 'unpriced_metadata_missing';
 
 /** We failed to observe, not the chain failing to be observable. */
+/**
+ * Whether a failure can be retried.
+ *
+ * This distinction exists because the accounted-for invariant must never create
+ * pressure to write a TERMINAL verdict for a transaction we simply failed to
+ * fetch. A 429 on a receipt is not "unknown_unsupported" — it is "we have not
+ * looked yet". Terminalising it to zero the drift count would launder an
+ * infrastructure problem into a permanent classification, which is precisely
+ * the absence-as-data failure this subsystem exists to remove.
+ */
+export type FailureDisposition = 'retriable' | 'terminal';
+
+export const FAILURE_DISPOSITION: Record<FailureCategory, FailureDisposition> = {
+  rpc_http_error: 'retriable',
+  rpc_jsonrpc_error: 'retriable',
+  rpc_transport_error: 'retriable',
+  pagination_truncated: 'retriable',
+  receipt_missing: 'retriable',
+  ledger_write_error: 'retriable',
+  // A payload we fetched successfully and could not parse will not parse next
+  // time either; retrying is a loop, not a fix.
+  decode_error: 'terminal',
+};
+
 export type FailureCategory =
   | 'rpc_http_error'
   | 'rpc_jsonrpc_error'
@@ -121,6 +172,7 @@ export const OUTCOME_OF: Record<Category, Outcome> = {
   unrelated_or_no_net_trade: 'confirmed_non_trade',
 
   unknown_topic: 'unknown_unsupported',
+  mixed_or_ambiguous_activity: 'unknown_unsupported',
   unsupported_protocol: 'unknown_unsupported',
   ambiguous_multiparty: 'unknown_unsupported',
   insufficient_trace_data: 'unknown_unsupported',

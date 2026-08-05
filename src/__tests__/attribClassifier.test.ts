@@ -13,6 +13,7 @@ const POOL = '0x3333333333333333333333333333333333333333';
 const TOKEN = '0x4444444444444444444444444444444444444444';
 const WETH = '0x0bd7d308f8e1639fab988df18a8011f41eacad73';
 
+const NPM = '0x58daec3116aae6d93017baaea7749052e8a04fa7'; // POSITION_MANAGER
 const V3_BURN = id('Burn(address,int24,int24,uint128,uint256,uint256)').toLowerCase();
 const NPM_INCREASE = id('IncreaseLiquidity(uint256,uint128,uint256,uint256)').toLowerCase();
 const NPM_COLLECT = id('Collect(uint256,address,uint256,uint256)').toLowerCase();
@@ -35,6 +36,12 @@ function log(address: string, topic0: string, t1?: string, t2?: string, data = '
 const xfer = (token: string, from: string, to: string, amt: bigint) =>
   log(token, TRANSFER_TOPIC, addressToTopic(from), addressToTopic(to), hex(amt));
 
+/**
+ * By default the pool and WETH are VERIFIED emitters — a topic hash alone is
+ * never enough, so a fixture that does not establish identity would (correctly)
+ * classify as `unsupported_protocol`. Tests that want the unverified path pass
+ * `verifiedContracts: new Set()` explicitly.
+ */
 function ctx(logs: TxLogView[], over: Partial<TxContext> = {}): TxContext {
   idx = 0;
   return {
@@ -46,6 +53,7 @@ function ctx(logs: TxLogView[], over: Partial<TxContext> = {}): TxContext {
     selector: null,
     nativeValueWei: null,
     receiptStatus: '0x1',
+    verifiedContracts: new Set([POOL, WETH, NPM]),
     ...over,
   };
 }
@@ -77,20 +85,22 @@ describe('attribution classifier — a trade requires a demonstrated exchange', 
     expect(r.category).toBe('swap_v4_poolmanager');
   });
 
-  it('REGRESSION: a zap liquidity-add that emits a Swap is NOT a trade', () => {
-    // This is the live defect in chain/receipt.ts:45 — it requires only that the
-    // tx contain the transfer and *some* Swap, so this exact shape is emitted as
-    // a wallet BUY today. Liquidity is checked first here precisely to stop it.
+  it('REGRESSION: a zap (liquidity + swap) is neither a trade nor a non-trade', () => {
+    // chain/receipt.ts:45 emits this as a wallet BUY today, because it requires
+    // only the transfer plus *some* Swap. But calling it a plain non-trade would
+    // be equally wrong — a zap or rebalance really does swap. It is genuinely
+    // unresolved, so it is recorded as unresolved and suppressed for alerts
+    // rather than forced into either bucket.
     const r = classifyTransaction({
       ctx: ctx([
         xfer(WETH, WALLET, POOL, 10n ** 18n),
         xfer(TOKEN, POOL, WALLET, 100n),
         log(POOL, V3_SWAP_TOPIC, addressToTopic(OTHER), addressToTopic(WALLET)),
-        log(POOL, NPM_INCREASE, addressToTopic(WALLET)),
+        log(NPM, NPM_INCREASE, addressToTopic(WALLET)),
       ]),
     });
-    expect(r.outcome).toBe('confirmed_non_trade');
-    expect(r.category).toBe('liquidity_add');
+    expect(r.outcome).toBe('unknown_unsupported');
+    expect(r.category).toBe('mixed_or_ambiguous_activity');
   });
 
   it('classifies an LP withdrawal (V3 Burn) as liquidity_remove, not a sell', () => {
@@ -106,7 +116,7 @@ describe('attribution classifier — a trade requires a demonstrated exchange', 
 
   it('classifies fee collection as a non-trade', () => {
     const r = classifyTransaction({
-      ctx: ctx([log(POOL, NPM_COLLECT, addressToTopic(WALLET)), xfer(TOKEN, POOL, WALLET, 5n)]),
+      ctx: ctx([log(NPM, NPM_COLLECT, addressToTopic(WALLET)), xfer(TOKEN, POOL, WALLET, 5n)]),
     });
     expect(r.category).toBe('fee_collection');
   });

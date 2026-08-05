@@ -1,49 +1,77 @@
 import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createRequire } from 'node:module';
+import { config } from '../config/env.js';
+import { logger } from '../logger.js';
+import { redact, rpcHost } from '../chain/rpcLog.js';
+import {
+  FAILURE_DISPOSITION,
+  OUTCOME_OF,
+  type AttributionResult,
+  type FailureCategory,
+  type WalletDelta,
+} from './taxonomy.js';
 
 // `node:sqlite` via createRequire, not a static import.
 //
 // Vite (and therefore Vitest) rewrites the `node:sqlite` specifier to a bare
-// `sqlite` and then cannot resolve it, so ANY suite that transitively imports
-// this module fails to collect — the tests would silently not run, which is the
-// same class of invisible failure this whole subsystem exists to eliminate.
-// Resolving through Node's own require keeps the import out of Vite's static
-// analysis. Mirrors the indirect-import trick already used for Prisma in
-// store/persistence.ts.
+// `sqlite` and cannot resolve it, so ANY suite transitively importing this
+// module silently collected ZERO tests and still exited 0 — the same
+// absence-as-data failure this subsystem exists to remove. Mirrors the
+// indirect-import trick already used for Prisma in store/persistence.ts.
 const nodeRequire = createRequire(import.meta.url);
 const { DatabaseSync } = nodeRequire('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSync = InstanceType<typeof DatabaseSync>;
-import { config } from '../config/env.js';
-import { logger } from '../logger.js';
-import { redact, rpcHost } from '../chain/rpcLog.js';
-import type { AttributionResult, FailureCategory, WalletDelta } from './taxonomy.js';
 
 /**
  * The canonical transaction ledger.
  *
- * SQLite/WAL, following `src/sniper/state.ts` — already a proven in-repo
- * dependency with no new packages, and its `INSERT OR IGNORE` + `changes > 0`
- * idiom is exactly the first-writer-wins primitive an append-only ledger keyed
- * on `(tx_hash, log_index)` needs, so a replay can never double-count.
+ * THE UNIT OF TRUTH IS `(tx_hash, watched_wallet)`.
  *
- * Chosen over the JSON-snapshot store (`store/feedState.ts`) because that
- * rewrites the whole file per save and its validator DROPS malformed rows
- * silently — the precise opposite of the no-silent-drops requirement. Chosen
- * over append-only JSONL because JSONL has no unique constraint, so replaying a
- * range would duplicate every row in it.
+ * `attrib_observation` records raw triggering signals — one transaction can
+ * hold many, across several watched wallets. `attrib_attribution` holds exactly
+ * ONE canonical outcome per `(tx, wallet, classifier_version)`. Keying the
+ * verdict on a log index instead would let a single transaction carry several
+ * contradictory answers for the same wallet, because a log index identifies an
+ * EMISSION, not an economic action.
  *
- * `attrib_result` is keyed by `(tx_hash, log_index, classifier_version)`, so a
- * classifier change ADDS rows rather than overwriting them. Old verdicts stay
- * queryable, which is what makes "did this rule change help?" answerable at all.
+ * SQLite/WAL following `src/sniper/state.ts` — no new dependency, and its
+ * `INSERT OR IGNORE` + `changes > 0` idiom makes replaying an overlapping range
+ * idempotent.
+ *
+ * CONSTRAINTS LIVE IN THE SCHEMA, not only in the API. A `CHECK` on outcome,
+ * category, trigger source and failure disposition means a bug in calling code
+ * cannot persist an impossible row, and the guarantee survives anything that
+ * writes to this file without going through this class.
  */
 
-/** Bumped when the schema changes; gates migrations via `PRAGMA user_version`. */
-const SCHEMA_VERSION = 1;
+/** Bumped when the schema changes; recorded via `PRAGMA user_version`. */
+const SCHEMA_VERSION = 2;
 
-export interface CandidateKey {
+const sqlList = (vals: string[]): string => vals.map((v) => `'${v}'`).join(',');
+const OUTCOMES = sqlList([...new Set(Object.values(OUTCOME_OF))]);
+const CATEGORIES = sqlList(Object.keys(OUTCOME_OF));
+
+/**
+ * How a watched wallet came to our attention in a transaction.
+ *
+ * Transfer logs are a DISCOVERY INDEX, not the coverage universe. Defining
+ * coverage by them alone would leave pure native-ETH interactions, approvals,
+ * failed calls, unusual token contracts and some launchpad flows permanently
+ * invisible — and invisible is exactly what we are trying to stop.
+ */
+export type TriggerSource =
+  | 'transfer_log'
+  /** The wallet sent the transaction. Catches native-only sends and approvals. */
+  | 'tx_sender'
+  /** The transaction's top-level destination was the wallet. */
+  | 'tx_recipient'
+  /** Internal call frames named the wallet. Only where the source has traces. */
+  | 'trace';
+
+export interface ObservationKey {
   txHash: string;
-  logIndex: number;
+  wallet: string;
 }
 
 export interface TxRecord {
@@ -64,11 +92,12 @@ export interface FailureRecord {
   operation: string;
   fromBlock: number | null;
   toBlock: number | null;
-  /** A URL, which is reduced to its host before storage — never stored whole. */
+  /** Reduced to its host before storage — never stored whole. */
   sourceUrl: string;
   kind: FailureCategory;
   detail: string;
   txHash?: string;
+  wallet?: string;
 }
 
 export interface CoverageRow {
@@ -77,10 +106,21 @@ export interface CoverageRow {
   n: number;
 }
 
+export interface AccountedFor {
+  /** Distinct observed (tx, wallet) pairs — the coverage universe. */
+  pairs: number;
+  /** Pairs with a canonical attribution at this classifier version. */
+  attributed: number;
+  /** Pairs awaiting a retriable retry. Legitimately unresolved, NOT drift. */
+  pending: number;
+  /** pairs - attributed - pending. Non-zero means something fell through. */
+  drift: number;
+}
+
 export class AttributionLedger {
   private readonly db: DatabaseSync | null;
-  /** True when persistence is OFF. Surfaced so an empty ledger is never read as
-   *  a quiet chain — the same failure `rpcLog.ts` exists to prevent. */
+  /** True when persistence is OFF — surfaced so an empty ledger is never read
+   *  as a quiet chain. */
   readonly degraded: boolean;
 
   constructor(path = config.ATTRIB_LEDGER_PATH || '') {
@@ -110,14 +150,59 @@ export class AttributionLedger {
         ingested_at INTEGER NOT NULL
       );
 
-      -- The trigger log. INSERT OR IGNORE makes replay idempotent.
-      CREATE TABLE IF NOT EXISTS attrib_candidate (
-        tx_hash TEXT NOT NULL, log_index INTEGER NOT NULL,
+      -- Raw provenance: one row per triggering signal. Many rows may share a
+      -- (tx_hash, wallet) pair; log_index is -1 for non-log involvement.
+      CREATE TABLE IF NOT EXISTS attrib_observation (
+        tx_hash TEXT NOT NULL,
+        log_index INTEGER NOT NULL,
+        watched_wallet TEXT NOT NULL,
         block_number INTEGER NOT NULL,
-        watched_wallet TEXT NOT NULL, token TEXT,
-        direction_hint TEXT, raw_value TEXT,
+        trigger_source TEXT NOT NULL
+          CHECK (trigger_source IN ('transfer_log','tx_sender','tx_recipient','trace')),
+        token TEXT, direction_hint TEXT, raw_value TEXT,
         first_seen_at INTEGER NOT NULL,
-        PRIMARY KEY (tx_hash, log_index)
+        PRIMARY KEY (tx_hash, log_index, watched_wallet)
+      );
+
+      -- THE canonical verdict. Exactly one per (tx, wallet, classifier_version).
+      -- Append-only ACROSS versions: re-classification adds a row beside the old
+      -- one, so "did that rule change help?" stays answerable.
+      CREATE TABLE IF NOT EXISTS attrib_attribution (
+        tx_hash TEXT NOT NULL,
+        watched_wallet TEXT NOT NULL,
+        classifier_version INTEGER NOT NULL,
+        adapter_registry_version INTEGER NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN (${OUTCOMES})),
+        category TEXT NOT NULL CHECK (category IN (${CATEGORIES})),
+        evidence_json TEXT NOT NULL,
+        decided_at INTEGER NOT NULL,
+        PRIMARY KEY (tx_hash, watched_wallet, classifier_version)
+      );
+
+      -- Retriable work. A failed receipt fetch lands HERE, never in
+      -- attrib_attribution: terminalising an infrastructure failure to zero the
+      -- drift count would launder "we have not looked yet" into "we looked and
+      -- found nothing". Rows are removed when the pair is attributed.
+      CREATE TABLE IF NOT EXISTS attrib_pending (
+        tx_hash TEXT NOT NULL,
+        watched_wallet TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 1,
+        first_failed_at INTEGER NOT NULL,
+        last_failed_at INTEGER NOT NULL,
+        PRIMARY KEY (tx_hash, watched_wallet)
+      );
+
+      -- What the LIVE listener emitted, for reconciliation. Written by an
+      -- observer whose return value is never consumed, so it cannot alter
+      -- listener control flow.
+      CREATE TABLE IF NOT EXISTS attrib_emission (
+        tx_hash TEXT NOT NULL,
+        log_index INTEGER NOT NULL,
+        watched_wallet TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        token TEXT, emitted_at INTEGER NOT NULL,
+        PRIMARY KEY (tx_hash, log_index, watched_wallet)
       );
 
       CREATE TABLE IF NOT EXISTS attrib_wallet_delta (
@@ -126,29 +211,22 @@ export class AttributionLedger {
         PRIMARY KEY (tx_hash, wallet, token)
       );
 
+      -- The verified column records whether the emitter's protocol identity was
+      -- ESTABLISHED (a pool confirmed against its factory) rather than merely
+      -- matching a topic hash anyone can emit.
       CREATE TABLE IF NOT EXISTS attrib_protocol_hit (
         tx_hash TEXT NOT NULL, contract TEXT NOT NULL, event_sig TEXT NOT NULL,
         protocol_id TEXT, adapter_version INTEGER,
+        verified INTEGER NOT NULL DEFAULT 0 CHECK (verified IN (0,1)),
         PRIMARY KEY (tx_hash, contract, event_sig)
-      );
-
-      -- Append-only ACROSS classifier versions: re-classification never
-      -- overwrites a prior verdict, it records a new one beside it.
-      CREATE TABLE IF NOT EXISTS attrib_result (
-        tx_hash TEXT NOT NULL, log_index INTEGER NOT NULL,
-        classifier_version INTEGER NOT NULL, adapter_registry_version INTEGER NOT NULL,
-        outcome TEXT NOT NULL,          -- NOT NULL: no candidate without a verdict
-        category TEXT NOT NULL,
-        evidence_json TEXT NOT NULL,
-        decided_at INTEGER NOT NULL,
-        PRIMARY KEY (tx_hash, log_index, classifier_version)
       );
 
       CREATE TABLE IF NOT EXISTS attrib_failure (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         operation TEXT NOT NULL, from_block INTEGER, to_block INTEGER,
         source_host TEXT NOT NULL, failure_kind TEXT NOT NULL,
-        safe_detail TEXT, tx_hash TEXT, at INTEGER NOT NULL
+        disposition TEXT NOT NULL CHECK (disposition IN ('retriable','terminal')),
+        safe_detail TEXT, tx_hash TEXT, wallet TEXT, at INTEGER NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS attrib_cursor (
@@ -157,18 +235,32 @@ export class AttributionLedger {
         updated_at INTEGER NOT NULL
       );
 
-      CREATE INDEX IF NOT EXISTS idx_result_outcome ON attrib_result (outcome, category);
-      CREATE INDEX IF NOT EXISTS idx_candidate_block ON attrib_candidate (block_number);
-      CREATE INDEX IF NOT EXISTS idx_hit_sig ON attrib_protocol_hit (event_sig);
+      CREATE INDEX IF NOT EXISTS idx_attr_outcome ON attrib_attribution (outcome, category);
+      CREATE INDEX IF NOT EXISTS idx_obs_pair ON attrib_observation (tx_hash, watched_wallet);
+      CREATE INDEX IF NOT EXISTS idx_obs_block ON attrib_observation (block_number);
+      CREATE INDEX IF NOT EXISTS idx_hit_sig ON attrib_protocol_hit (event_sig, verified);
       CREATE INDEX IF NOT EXISTS idx_failure_kind ON attrib_failure (failure_kind, at);
     `);
-    const v = this.db.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined;
-    if (!v?.user_version) this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     logger.info({ schemaVersion: SCHEMA_VERSION }, 'attrib: ledger open');
   }
 
   close(): void {
     this.db?.close();
+  }
+
+  /** Run a unit of work atomically. Multi-table writes must not half-apply. */
+  transaction<T>(fn: () => T): T {
+    if (!this.db) return fn();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const out = fn();
+      this.db.exec('COMMIT');
+      return out;
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
   }
 
   // ── Writers ────────────────────────────────────────────────────────────────
@@ -186,8 +278,8 @@ export class AttributionLedger {
         tx.txHash.toLowerCase(),
         tx.blockNumber,
         tx.blockTimestamp,
-        tx.txFrom,
-        tx.txTo,
+        tx.txFrom?.toLowerCase() ?? null,
+        tx.txTo?.toLowerCase() ?? null,
         tx.selector,
         tx.nativeValueWei,
         tx.receiptStatus,
@@ -197,27 +289,31 @@ export class AttributionLedger {
       );
   }
 
-  /** Returns true when this candidate was newly claimed (first-writer-wins). */
-  recordCandidate(
-    key: CandidateKey,
-    blockNumber: number,
+  /** Record a raw involvement signal. Returns true when newly claimed. */
+  recordObservation(
+    txHash: string,
+    logIndex: number,
     wallet: string,
-    token: string | null,
-    directionHint: string | null,
-    rawValue: string | null,
+    blockNumber: number,
+    triggerSource: TriggerSource,
+    token: string | null = null,
+    directionHint: string | null = null,
+    rawValue: string | null = null,
   ): boolean {
     if (!this.db) return false;
     const r = this.db
       .prepare(
-        `INSERT OR IGNORE INTO attrib_candidate
-         (tx_hash, log_index, block_number, watched_wallet, token, direction_hint, raw_value, first_seen_at)
-         VALUES (?,?,?,?,?,?,?,?)`,
+        `INSERT OR IGNORE INTO attrib_observation
+         (tx_hash, log_index, watched_wallet, block_number, trigger_source, token,
+          direction_hint, raw_value, first_seen_at)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
       )
       .run(
-        key.txHash.toLowerCase(),
-        key.logIndex,
-        blockNumber,
+        txHash.toLowerCase(),
+        logIndex,
         wallet.toLowerCase(),
+        blockNumber,
+        triggerSource,
         token?.toLowerCase() ?? null,
         directionHint,
         rawValue,
@@ -227,27 +323,87 @@ export class AttributionLedger {
   }
 
   /**
-   * The only way a verdict is written. `outcome` is derived inside
-   * {@link AttributionResult}, never passed separately, so it cannot drift from
-   * the category.
+   * Write the canonical verdict for a `(tx, wallet)` pair and clear any pending
+   * retry for it, atomically — a resolved pair must never remain queued.
    */
-  recordResult(key: CandidateKey, res: AttributionResult): void {
+  recordAttribution(key: ObservationKey, res: AttributionResult): void {
     if (!this.db) return;
-    this.db
-      .prepare(
-        `INSERT OR REPLACE INTO attrib_result
-         (tx_hash, log_index, classifier_version, adapter_registry_version,
+    const tx = key.txHash.toLowerCase();
+    const w = key.wallet.toLowerCase();
+    this.transaction(() => {
+      this.db!.prepare(
+        `INSERT OR REPLACE INTO attrib_attribution
+         (tx_hash, watched_wallet, classifier_version, adapter_registry_version,
           outcome, category, evidence_json, decided_at)
          VALUES (?,?,?,?,?,?,?,?)`,
-      )
-      .run(
-        key.txHash.toLowerCase(),
-        key.logIndex,
+      ).run(
+        tx,
+        w,
         res.classifierVersion,
         res.adapterRegistryVersion,
         res.outcome,
         res.category,
         JSON.stringify(res.evidence),
+        Date.now(),
+      );
+      this.db!.prepare('DELETE FROM attrib_pending WHERE tx_hash = ? AND watched_wallet = ?').run(
+        tx,
+        w,
+      );
+    });
+  }
+
+  /**
+   * Park a pair for retry.
+   *
+   * The failure HISTORY in `attrib_failure` is written separately and never
+   * deleted, so a pair that later resolves still shows it took N attempts and
+   * why — both the failure record and the eventual classification survive.
+   */
+  markPending(key: ObservationKey, reason: FailureCategory): void {
+    if (!this.db) return;
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO attrib_pending
+         (tx_hash, watched_wallet, reason, attempts, first_failed_at, last_failed_at)
+         VALUES (?,?,?,1,?,?)
+         ON CONFLICT(tx_hash, watched_wallet) DO UPDATE SET
+           attempts = attempts + 1, reason = excluded.reason,
+           last_failed_at = excluded.last_failed_at`,
+      )
+      .run(key.txHash.toLowerCase(), key.wallet.toLowerCase(), reason, now, now);
+  }
+
+  pendingWork(limit = 100): { tx_hash: string; watched_wallet: string; attempts: number }[] {
+    if (!this.db) return [];
+    return this.db
+      .prepare(
+        `SELECT tx_hash, watched_wallet, attempts FROM attrib_pending
+         ORDER BY attempts ASC, last_failed_at ASC LIMIT ?`,
+      )
+      .all(limit) as unknown as { tx_hash: string; watched_wallet: string; attempts: number }[];
+  }
+
+  recordEmission(
+    txHash: string,
+    logIndex: number,
+    wallet: string,
+    direction: string,
+    token: string | null,
+  ): void {
+    if (!this.db) return;
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO attrib_emission
+         (tx_hash, log_index, watched_wallet, direction, token, emitted_at) VALUES (?,?,?,?,?,?)`,
+      )
+      .run(
+        txHash.toLowerCase(),
+        logIndex,
+        wallet.toLowerCase(),
+        direction,
+        token?.toLowerCase() ?? null,
         Date.now(),
       );
   }
@@ -270,14 +426,22 @@ export class AttributionLedger {
     }
   }
 
+  /** Record every topic/emitter seen, classified or not — the leaderboard is
+   *  generated from this, so nothing observed can go uncounted. */
   recordProtocolHits(
     txHash: string,
-    hits: { contract: string; eventSig: string; protocolId: string | null; adapterVersion: number | null }[],
+    hits: {
+      contract: string;
+      eventSig: string;
+      protocolId: string | null;
+      adapterVersion: number | null;
+      verified?: boolean;
+    }[],
   ): void {
     if (!this.db) return;
     const stmt = this.db.prepare(
-      `INSERT OR IGNORE INTO attrib_protocol_hit
-       (tx_hash, contract, event_sig, protocol_id, adapter_version) VALUES (?,?,?,?,?)`,
+      `INSERT OR REPLACE INTO attrib_protocol_hit
+       (tx_hash, contract, event_sig, protocol_id, adapter_version, verified) VALUES (?,?,?,?,?,?)`,
     );
     for (const h of hits) {
       stmt.run(
@@ -286,22 +450,19 @@ export class AttributionLedger {
         h.eventSig.toLowerCase(),
         h.protocolId,
         h.adapterVersion,
+        h.verified ? 1 : 0,
       );
     }
   }
 
-  /**
-   * Every external call records here on failure. `sourceUrl` is reduced to its
-   * host and `detail` is passed through `redact()` — a node echoing our request
-   * back must not reprint an API key into the ledger.
-   */
   recordFailure(f: FailureRecord): void {
     if (!this.db) return;
     this.db
       .prepare(
         `INSERT INTO attrib_failure
-         (operation, from_block, to_block, source_host, failure_kind, safe_detail, tx_hash, at)
-         VALUES (?,?,?,?,?,?,?,?)`,
+         (operation, from_block, to_block, source_host, failure_kind, disposition,
+          safe_detail, tx_hash, wallet, at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         f.operation,
@@ -309,8 +470,10 @@ export class AttributionLedger {
         f.toBlock,
         rpcHost(f.sourceUrl),
         f.kind,
+        FAILURE_DISPOSITION[f.kind],
         redact(f.detail).slice(0, 400),
         f.txHash?.toLowerCase() ?? null,
+        f.wallet?.toLowerCase() ?? null,
         Date.now(),
       );
   }
@@ -337,18 +500,33 @@ export class AttributionLedger {
     return Object.fromEntries(rows.map((r) => [r.stream_id, r.covered_through_block]));
   }
 
-  /**
-   * The block through which EVERY registered stream has safely reported.
-   *
-   * Generalises the rule already correct in `chain/shadow.ts`: two paginated
-   * queries over the same range reach different blocks — measured, a swap-log
-   * query stopped at 261 of 1000 while the transfer query covered all 1000.
-   * Advancing on the furthest would mark blocks scanned whose classification
-   * context was never fetched. Only this value is ever persisted as progress.
-   */
-  safeCursor(): number | null {
+  /** Minimum across streams. Measured motivation: a swap-log query over 1000
+   *  blocks truncated at 261 while the transfer query covered all 1000. */
+  private minStreamCursor(): number | null {
     const c = Object.values(this.cursors());
     return c.length ? Math.min(...c) : null;
+  }
+
+  /**
+   * The block it is safe to persist as progress.
+   *
+   * Held back by the OLDEST unresolved retriable pair as well as by the stream
+   * minimum. Advancing past a transaction whose receipt we never fetched would
+   * strand it permanently, because nothing would revisit that range.
+   */
+  safeCursor(): number | null {
+    const streams = this.minStreamCursor();
+    if (streams == null || !this.db) return streams;
+    const row = this.db
+      .prepare(
+        `SELECT MIN(o.block_number) AS b FROM attrib_pending p
+         JOIN attrib_observation o
+           ON o.tx_hash = p.tx_hash AND o.watched_wallet = p.watched_wallet`,
+      )
+      .get() as unknown as { b: number | null } | undefined;
+    const oldestPending = row?.b ?? null;
+    if (oldestPending == null) return streams;
+    return Math.min(streams, oldestPending - 1);
   }
 
   // ── Readers ────────────────────────────────────────────────────────────────
@@ -357,51 +535,87 @@ export class AttributionLedger {
     if (!this.db) return [];
     return this.db
       .prepare(
-        `SELECT outcome, category, COUNT(*) AS n FROM attrib_result
+        `SELECT outcome, category, COUNT(*) AS n FROM attrib_attribution
          WHERE classifier_version = ? GROUP BY outcome, category ORDER BY n DESC`,
       )
       .all(classifierVersion) as unknown as CoverageRow[];
   }
 
-  /** Unknown event signatures ranked by frequency — the adapter work queue. */
+  /** Unclaimed OR unverified signatures, ranked — the adapter work queue. */
   unknownTopics(limit = 50): { event_sig: string; contract: string; n: number }[] {
     if (!this.db) return [];
     return this.db
       .prepare(
         `SELECT event_sig, contract, COUNT(*) AS n FROM attrib_protocol_hit
-         WHERE protocol_id IS NULL GROUP BY event_sig, contract ORDER BY n DESC LIMIT ?`,
+         WHERE protocol_id IS NULL OR verified = 0
+         GROUP BY event_sig, contract ORDER BY n DESC LIMIT ?`,
       )
       .all(limit) as unknown as { event_sig: string; contract: string; n: number }[];
   }
 
-  failureRates(): { operation: string; source_host: string; failure_kind: string; n: number }[] {
+  failureRates(): {
+    operation: string;
+    source_host: string;
+    failure_kind: string;
+    disposition: string;
+    n: number;
+  }[] {
     if (!this.db) return [];
     return this.db
       .prepare(
-        `SELECT operation, source_host, failure_kind, COUNT(*) AS n FROM attrib_failure
-         GROUP BY operation, source_host, failure_kind ORDER BY n DESC`,
+        `SELECT operation, source_host, failure_kind, disposition, COUNT(*) AS n
+         FROM attrib_failure GROUP BY operation, source_host, failure_kind, disposition
+         ORDER BY n DESC`,
       )
-      .all() as unknown as { operation: string; source_host: string; failure_kind: string; n: number }[];
+      .all() as unknown as {
+      operation: string;
+      source_host: string;
+      failure_kind: string;
+      disposition: string;
+      n: number;
+    }[];
   }
 
   /**
-   * The no-silent-drops alarm: every candidate must have a verdict.
-   * A non-zero `drift` means something was observed and never accounted for.
+   * The no-silent-drops alarm, over observed `(tx, wallet)` PAIRS.
+   *
+   * `pending` is broken out deliberately. A pair awaiting a retriable retry is
+   * legitimately unresolved and must NOT count as drift — otherwise the
+   * invariant becomes an incentive to terminalise infrastructure failures into
+   * permanent verdicts. Only `drift` — observed, not attributed, not pending —
+   * is a bug.
    */
-  accountedFor(classifierVersion: number): { candidates: number; results: number; drift: number } {
-    if (!this.db) return { candidates: 0, results: 0, drift: 0 };
-    const c = this.db.prepare('SELECT COUNT(*) AS n FROM attrib_candidate').get() as unknown as { n: number };
-    const r = this.db
-      .prepare('SELECT COUNT(*) AS n FROM attrib_result WHERE classifier_version = ?')
-      .get(classifierVersion) as unknown as { n: number };
-    return { candidates: c.n, results: r.n, drift: c.n - r.n };
+  accountedFor(classifierVersion: number): AccountedFor {
+    if (!this.db) return { pairs: 0, attributed: 0, pending: 0, drift: 0 };
+    const pairs = (
+      this.db
+        .prepare(
+          'SELECT COUNT(*) AS n FROM (SELECT DISTINCT tx_hash, watched_wallet FROM attrib_observation)',
+        )
+        .get() as unknown as { n: number }
+    ).n;
+    const attributed = (
+      this.db
+        .prepare('SELECT COUNT(*) AS n FROM attrib_attribution WHERE classifier_version = ?')
+        .get(classifierVersion) as unknown as { n: number }
+    ).n;
+    const pending = (
+      this.db.prepare('SELECT COUNT(*) AS n FROM attrib_pending').get() as unknown as { n: number }
+    ).n;
+    return { pairs, attributed, pending, drift: pairs - attributed - pending };
   }
 
-  /** Prune old rows. Failures are never pruned — they are the record of what we
-   *  could not see, and that record is the point. */
+  /** Prune old rows. Failures and still-pending pairs are never auto-pruned. */
   pruneBefore(block: number): number {
     if (!this.db) return 0;
-    const r = this.db.prepare('DELETE FROM attrib_candidate WHERE block_number < ?').run(block);
+    const r = this.db
+      .prepare(
+        `DELETE FROM attrib_observation WHERE block_number < ?
+         AND NOT EXISTS (SELECT 1 FROM attrib_pending p
+           WHERE p.tx_hash = attrib_observation.tx_hash
+             AND p.watched_wallet = attrib_observation.watched_wallet)`,
+      )
+      .run(block);
     this.db.prepare('DELETE FROM attrib_tx WHERE block_number < ?').run(block);
     return Number(r.changes);
   }

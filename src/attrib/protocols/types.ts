@@ -38,6 +38,16 @@ export interface TxContext {
   /** Top-level native value in wei. Does NOT include internal transfers. */
   nativeValueWei: string | null;
   receiptStatus: string | null;
+  /**
+   * Contracts whose protocol identity has been ESTABLISHED for this
+   * transaction — e.g. a pool confirmed against its factory, or a known
+   * canonical address. Populated by the ingester.
+   *
+   * A topic hash is not an identity: anyone can deploy a contract that emits
+   * `Swap(...)` or `Paid(...)`. Findings from emitters absent here are marked
+   * unverified and can never support a `confirmed_trade`.
+   */
+  verifiedContracts?: Set<string>;
 }
 
 export type FindingKind =
@@ -67,6 +77,10 @@ export interface ProtocolFinding {
   eventSig: string;
   logIndex: number;
   beneficiary?: string | null;
+  /** True only when the emitter's protocol identity was established, not merely
+   *  when its topic matched. Unverified findings are evidence of *something*,
+   *  but never sufficient for a confirmed trade. */
+  verified: boolean;
   tokenIn?: string | null;
   tokenOut?: string | null;
   note?: string;

@@ -52,11 +52,20 @@ export const TRANSFER_WITH_SCALED_UI = id(
 const find = (ctx: TxContext, sigs: string[]): TxLogView[] =>
   ctx.logs.filter((l) => sigs.includes(lc(l.topic0)));
 
+/** Was this emitter's protocol identity actually established for this tx? */
+function isVerified(ctx: TxContext, address: string, canonical: string[] = []): boolean {
+  const a = lc(address);
+  if (canonical.some((c) => c && lc(c) === a)) return true;
+  return ctx.verifiedContracts?.has(a) ?? false;
+}
+
 function mk(
   a: Pick<ProtocolAdapter, 'id' | 'adapterVersion'>,
+  ctx: TxContext,
   l: TxLogView,
   kind: ProtocolFinding['kind'],
   extra: Partial<ProtocolFinding> = {},
+  canonical: string[] = [],
 ): ProtocolFinding {
   return {
     kind,
@@ -65,6 +74,7 @@ function mk(
     contract: lc(l.address),
     eventSig: lc(l.topic0),
     logIndex: l.logIndex,
+    verified: isVerified(ctx, l.address, canonical),
     ...extra,
   };
 }
@@ -88,21 +98,67 @@ const uniswapV3: ProtocolAdapter = {
   },
   interpret(ctx) {
     const out: ProtocolFinding[] = [];
-    // V3 Swap: topic2 is the recipient. That is the address the classifier will
-    // check against the wallet — presence of a Swap alone proves nothing.
+    const npm = lc(POSITION_MANAGER);
+    // V3 Swap: topic2 is the recipient. Presence of a Swap proves nothing on its
+    // own — the classifier checks the wallet's deltas, and `verified` records
+    // whether this emitter is actually a pool of this factory.
     for (const l of find(ctx, [V3_SWAP_TOPIC])) {
-      out.push(mk(this, l, 'swap', { beneficiary: topicAddr(l.topic2) }));
+      out.push(mk(this, ctx, l, 'swap', { beneficiary: topicAddr(l.topic2) }));
     }
-    for (const l of find(ctx, [V3_MINT, NPM_INCREASE])) {
-      out.push(mk(this, l, 'liquidity_add', { beneficiary: topicAddr(l.topic1) }));
+    // Pool-emitted liquidity: only meaningful from a verified pool.
+    for (const l of find(ctx, [V3_MINT])) {
+      out.push(mk(this, ctx, l, 'liquidity_add', { beneficiary: topicAddr(l.topic1) }));
     }
-    for (const l of find(ctx, [V3_BURN, NPM_DECREASE])) {
-      out.push(mk(this, l, 'liquidity_remove', { beneficiary: topicAddr(l.topic1) }));
+    for (const l of find(ctx, [V3_BURN])) {
+      out.push(mk(this, ctx, l, 'liquidity_remove', { beneficiary: topicAddr(l.topic1) }));
     }
-    for (const l of find(ctx, [V3_COLLECT, NPM_COLLECT, FEES_CLAIMED, PAID])) {
-      out.push(mk(this, l, 'fee', { beneficiary: topicAddr(l.topic1) }));
+    // Position-manager events are only ours when the POSITION MANAGER emitted
+    // them. Anyone can deploy a contract emitting IncreaseLiquidity.
+    for (const l of find(ctx, [NPM_INCREASE])) {
+      if (lc(l.address) !== npm) continue;
+      out.push(mk(this, ctx, l, 'liquidity_add', { beneficiary: topicAddr(l.topic1) }, [npm]));
+    }
+    for (const l of find(ctx, [NPM_DECREASE])) {
+      if (lc(l.address) !== npm) continue;
+      out.push(mk(this, ctx, l, 'liquidity_remove', { beneficiary: topicAddr(l.topic1) }, [npm]));
+    }
+    for (const l of find(ctx, [V3_COLLECT])) {
+      out.push(mk(this, ctx, l, 'fee', { beneficiary: topicAddr(l.topic1) }));
+    }
+    for (const l of find(ctx, [NPM_COLLECT])) {
+      if (lc(l.address) !== npm) continue;
+      out.push(mk(this, ctx, l, 'fee', { beneficiary: null }, [npm]));
     }
     return out;
+  },
+};
+
+/**
+ * `FeesClaimed` and `Paid` are GENERIC signatures.
+ *
+ * They were originally claimed by the Uniswap V3 adapter from ANY emitter,
+ * which would have made "some contract emitted Paid" globally mean "this wallet
+ * collected fees" — the same class of error as "a Transfer means a buy". They
+ * are now a separate, deliberately UNVERIFIED adapter: the findings are
+ * recorded so the events are never invisible, but they carry `verified: false`
+ * unless the emitter is independently established, and the classifier will not
+ * settle a verdict on them alone.
+ */
+const genericFeeEvents: ProtocolAdapter = {
+  id: 'generic-fee-events',
+  name: 'Generic fee-like events',
+  version: 'unscoped',
+  adapterVersion: ADAPTER_REGISTRY_VERSION,
+  status: 'observed-but-unsupported',
+  contracts: {},
+  events: { FeesClaimed: FEES_CLAIMED, Paid: PAID },
+  interpret(ctx) {
+    return find(ctx, [FEES_CLAIMED, PAID]).map((l) =>
+      mk(this, ctx, l, 'fee', {
+        beneficiary: topicAddr(l.topic1),
+        note: 'generic fee signature; emitter identity not established',
+      }),
+    );
   },
 };
 
@@ -122,10 +178,18 @@ const uniswapV4: ProtocolAdapter = {
     // classifier must fall back to the wallet's own asset deltas. Claiming the
     // router as beneficiary here is exactly the mislabel this design forbids.
     for (const l of find(ctx, [V4_SWAP_TOPIC])) {
-      out.push(mk(this, l, 'swap', { beneficiary: null, note: 'v4 sender is the router, not the user' }));
+      out.push(
+        mk(this, ctx, l, 'swap', { beneficiary: null, note: 'v4 sender is the router, not the user' }, [
+          lc(POOL_MANAGER),
+        ]),
+      );
     }
     for (const l of find(ctx, [V4_MODIFY_LIQUIDITY])) {
-      out.push(mk(this, l, 'liquidity_add', { beneficiary: null, note: 'sign of liquidityDelta not decoded' }));
+      out.push(
+        mk(this, ctx, l, 'liquidity_add', { beneficiary: null, note: 'liquidityDelta sign not decoded' }, [
+          lc(POOL_MANAGER),
+        ]),
+      );
     }
     return out;
   },
@@ -144,7 +208,9 @@ const bagsHook: ProtocolAdapter = {
     // Hooked swaps still emit the standard V4 Swap; this only annotates that the
     // hook took its 2% cut, so fee-adjusted reconciliation can allow for it.
     const hit = ctx.logs.find((l) => lc(l.address) === this.contracts.hook);
-    return hit ? [mk(this, hit, 'routing', { note: 'bags hook present (2% fee)' })] : [];
+    return hit
+      ? [mk(this, ctx, hit, 'routing', { note: 'bags hook present (2% fee)' }, [this.contracts.hook ?? ''])]
+      : [];
   },
 };
 
@@ -170,6 +236,7 @@ const universalRouter: ProtocolAdapter = {
         contract: this.contracts.router,
         eventSig: '',
         logIndex: -1,
+        verified: true,
         note: 'tx destination is the universal router — routing only, not a trade',
       },
     ];
@@ -182,14 +249,23 @@ const ponsLaunch: ProtocolAdapter = {
   name: 'Pons',
   version: 'launchpad',
   adapterVersion: ADAPTER_REGISTRY_VERSION,
-  status: 'supported',
+  // UNVERIFIED until fixtures from real Pons wallet transactions prove the
+  // called contracts, the event signatures, the V3 pool/factory relationship
+  // and the wallet's net asset exchange. "Pons has no bonding curve" is a claim
+  // that has not been tested against a watched-wallet transaction yet, so it
+  // must not be load-bearing.
+  status: 'observed-but-unsupported',
   contracts: { factory: lc(PONS_FACTORY) },
   events: { TokenLaunched: lc(TOKEN_LAUNCHED_TOPIC) },
   interpret(ctx) {
     // Pons has NO bonding curve — it mints straight into a Uniswap V3 pool at
     // fee 10000, so a Pons buy IS a V3 swap. This only TAGS that swap; it never
     // produces a trade finding of its own.
-    return find(ctx, [lc(TOKEN_LAUNCHED_TOPIC)]).map((l) => mk(this, l, 'launch'));
+    return find(ctx, [lc(TOKEN_LAUNCHED_TOPIC)]).map((l) =>
+      mk(this, ctx, l, 'launch', { note: 'UNVERIFIED: no real Pons wallet fixture yet' }, [
+        lc(PONS_FACTORY),
+      ]),
+    );
   },
 };
 
@@ -203,7 +279,7 @@ const permit2: ProtocolAdapter = {
   contracts: { permit2: lc(PERMIT2) },
   events: { Approval: APPROVAL },
   interpret(ctx) {
-    return find(ctx, [APPROVAL]).map((l) => mk(this, l, 'approval'));
+    return find(ctx, [APPROVAL]).map((l) => mk(this, ctx, l, 'approval'));
   },
 };
 
@@ -218,11 +294,16 @@ const wrappedNative: ProtocolAdapter = {
   events: { Deposit: WETH_DEPOSIT, Withdrawal: WETH_WITHDRAWAL },
   interpret(ctx) {
     const out: ProtocolFinding[] = [];
+    const weth = this.contracts.weth;
+    // Only the canonical WETH contract proves a native leg. Any token can emit
+    // Deposit(address,uint256).
     for (const l of find(ctx, [WETH_DEPOSIT])) {
-      out.push(mk(this, l, 'wrap', { beneficiary: topicAddr(l.topic1) }));
+      if (weth && lc(l.address) !== weth) continue;
+      out.push(mk(this, ctx, l, 'wrap', { beneficiary: topicAddr(l.topic1) }, [weth ?? '']));
     }
     for (const l of find(ctx, [WETH_WITHDRAWAL])) {
-      out.push(mk(this, l, 'unwrap', { beneficiary: topicAddr(l.topic1) }));
+      if (weth && lc(l.address) !== weth) continue;
+      out.push(mk(this, ctx, l, 'unwrap', { beneficiary: topicAddr(l.topic1) }, [weth ?? '']));
     }
     return out;
   },
@@ -238,12 +319,13 @@ const rhScaledUi: ProtocolAdapter = {
   contracts: {},
   events: { TransferWithScaledUI: TRANSFER_WITH_SCALED_UI },
   interpret(ctx) {
-    return find(ctx, [TRANSFER_WITH_SCALED_UI]).map((l) => mk(this, l, 'no-op-mirror'));
+    return find(ctx, [TRANSFER_WITH_SCALED_UI]).map((l) => mk(this, ctx, l, 'no-op-mirror'));
   },
 };
 
 export const PROTOCOL_REGISTRY: ProtocolAdapter[] = [
   uniswapV3,
+  genericFeeEvents,
   uniswapV4,
   bagsHook,
   universalRouter,

@@ -105,43 +105,74 @@ export function classifyTransaction(input: ClassifyInput): AttributionResult {
   const fees = findings.filter((f) => f.kind === 'fee');
   const swaps = findings.filter((f) => f.kind === 'swap');
 
-  // 2. LIQUIDITY AND FEES BEFORE SWAP. A single-sided / zap liquidity add swaps
-  //    half the input first and therefore emits a Swap in the same transaction.
-  //    `chain/receipt.ts` checks swap-presence with no liquidity test at all, so
-  //    it accepts exactly this shape and emits it as a wallet BUY. Ordering the
-  //    checks this way is the fix.
+  // Scope every protocol finding to THIS wallet and to a VERIFIED emitter.
   //
-  //    Attribution still matters: in a batched transaction the liquidity may
-  //    belong to someone else, in which case we fall through rather than
-  //    mislabel this wallet's leg.
-  const oursLiq = liq.filter((f) => f.beneficiary == null || isWallet(f.beneficiary, ctx.wallet));
-  if (oursLiq.length > 0) {
-    const removing = oursLiq.some((f) => f.kind === 'liquidity_remove');
-    return result(
-      removing ? 'liquidity_remove' : 'liquidity_add',
-      ev('liquidity event present; checked before swap because zap adds also emit a Swap'),
-    );
-  }
-  const oursFees = fees.filter((f) => f.beneficiary == null || isWallet(f.beneficiary, ctx.wallet));
-  if (oursFees.length > 0 && swaps.length === 0) {
-    return result('fee_collection', ev('fee/collect event with no swap'));
-  }
+  // A topic hash is not an identity — anyone can deploy a contract emitting
+  // `Paid(address,uint256)` or `Swap(...)`. And in a batched transaction the
+  // liquidity may belong to a third party. Both filters are required before a
+  // finding may influence a verdict.
+  const ours = (f: ProtocolFinding): boolean =>
+    f.verified && (f.beneficiary == null || isWallet(f.beneficiary, ctx.wallet));
+  const oursLiq = liq.filter(ours);
+  const oursFees = fees.filter(ours);
+  const oursSwaps = swaps.filter((f) => f.verified);
 
-  // 3. THE ECONOMIC-EXCHANGE GATE.
+  // 2. NET FLOW DECIDES — there is no blanket "liquidity present ⇒ not a trade".
+  //    A zap, a rebalance or a multi-action batch legitimately contains BOTH a
+  //    liquidity modification and a swap. Declaring such a transaction a
+  //    non-trade would hide a real trade; declaring it a trade would resurrect
+  //    the `chain/receipt.ts` defect. So protocol findings are gathered first,
+  //    and the wallet's own net flow is what resolves which it was.
   const up = deltas.filter((d) => BigInt(d.rawDelta) > 0n);
   const down = deltas.filter((d) => BigInt(d.rawDelta) < 0n);
   const wrapped = findings.filter(
-    (f) => (f.kind === 'wrap' || f.kind === 'unwrap') && isWallet(f.beneficiary, ctx.wallet),
+    (f) => (f.kind === 'wrap' || f.kind === 'unwrap') && f.verified && isWallet(f.beneficiary, ctx.wallet),
   );
-  const nativeLeg = wrapped.length > 0 || (ctx.nativeValueWei != null && ctx.nativeValueWei !== '0');
-  const bothSides = up.length > 0 && down.length > 0;
-  const oneSidePlusNative = (up.length > 0 || down.length > 0) && nativeLeg;
 
-  if (swaps.length > 0) {
-    if (bothSides || oneSidePlusNative) {
-      const isPons = findings.some((f) => f.kind === 'launch');
-      const isV4 = swaps.some((f) => f.protocolId === 'uniswap-v4');
-      const hooked = findings.some((f) => f.protocolId === 'uniswap-v4-bags-hook');
+  // Native proof is broader than WETH events. A user may legitimately pay native
+  // ETH straight to a verified protocol entry point, in which case there is no
+  // Deposit/Withdrawal to find. Accepted proofs, in order of directness:
+  //   a) a WETH Deposit/Withdrawal crediting this wallet
+  //   b) top-level tx.value sent BY this wallet TO a verified entry point
+  //   c) an internal native transfer from a trace (delta_source === 'trace')
+  // Anything else leaves the native leg unproven.
+  const paidNativeToProtocol =
+    ctx.nativeValueWei != null &&
+    ctx.nativeValueWei !== '0' &&
+    ctx.txTo != null &&
+    (ctx.verifiedContracts?.has(lc(ctx.txTo)) ?? false);
+  const traceNative = deltas.some((d) => d.source === 'insufficient_trace_data');
+  const nativeLeg = wrapped.length > 0 || paidNativeToProtocol;
+
+  const bothSides = up.length > 0 && down.length > 0;
+  const exchangeProven = bothSides || ((up.length > 0 || down.length > 0) && nativeLeg);
+  const liqOrFee = oursLiq.length > 0 || oursFees.length > 0;
+
+  if (oursSwaps.length > 0 && liqOrFee) {
+    // Both kinds of activity are present and attributable to this wallet.
+    // Genuinely unresolved without decomposing the transaction, so it is
+    // recorded as unresolved — and suppressed for live alerts — rather than
+    // being forced into either bucket.
+    return result(
+      'mixed_or_ambiguous_activity',
+      ev('both liquidity/fee and swap activity attributable to this wallet; net flow does not resolve which'),
+    );
+  }
+
+  if (liqOrFee && oursSwaps.length === 0) {
+    if (oursLiq.length > 0) {
+      const removing = oursLiq.some((f) => f.kind === 'liquidity_remove');
+      return result(removing ? 'liquidity_remove' : 'liquidity_add', ev('liquidity event, no swap'));
+    }
+    return result('fee_collection', ev('verified fee/collect event, no swap'));
+  }
+
+  // 3. THE ECONOMIC-EXCHANGE GATE.
+  if (oursSwaps.length > 0) {
+    if (exchangeProven) {
+      const isPons = findings.some((f) => f.kind === 'launch' && f.verified);
+      const isV4 = oursSwaps.some((f) => f.protocolId === 'uniswap-v4');
+      const hooked = findings.some((f) => f.protocolId === 'uniswap-v4-bags-hook' && f.verified);
       const category = isPons
         ? 'pons_launch_buy'
         : isV4
@@ -149,21 +180,29 @@ export function classifyTransaction(input: ClassifyInput): AttributionResult {
             ? 'swap_v4_hooked'
             : 'swap_v4_poolmanager'
           : 'swap_v3_router';
-      return result(category, ev('swap present and wallet asset deltas demonstrate an exchange'));
+      return result(category, ev('verified swap and wallet asset deltas demonstrate an exchange'));
     }
     if (up.length === 0 && down.length === 0) {
-      // A swap happened; this wallet's balances did not move. Someone else traded.
       return result(
         'ambiguous_multiparty',
         ev('swap present but no net asset movement for this wallet'),
       );
     }
-    // One leg only and no visible native counter-leg. The missing side may have
-    // moved as internal native value, which receipts cannot show — `tx.value`
-    // covers only the top-level call. Refuse to guess in either direction.
     return result(
       'insufficient_trace_data',
-      ev('swap present, only one asset leg visible for this wallet; native/internal flow unprovable from receipts'),
+      ev(
+        traceNative
+          ? 'swap present; native leg known to exist but not readable'
+          : 'swap present, one asset leg only; native/internal flow unprovable from receipts',
+      ),
+    );
+  }
+
+  // An unverified swap is evidence of something, but never of a trade.
+  if (swaps.length > 0 && oursSwaps.length === 0) {
+    return result(
+      'unsupported_protocol',
+      ev('swap-shaped event from an emitter whose protocol identity was not established'),
     );
   }
 
