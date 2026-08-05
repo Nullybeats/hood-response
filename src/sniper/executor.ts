@@ -1106,6 +1106,36 @@ export class SwapExecutor {
     }
   }
 
+  /**
+   * What a hypothetical holding of `tokens` would sell back for, in ETH.
+   *
+   * `valueInEth` cannot do this job: it marks against the wallet's ACTUAL balance and throws when
+   * that is zero, which is every paper position by definition. This quotes the same V3 pool in the
+   * sell direction for an arbitrary size, so a paper position can be marked and exited on real,
+   * executable prices rather than an imagined mid.
+   *
+   * QuoterV2's sell path does not exercise the token's transfer restrictions — the pool pays WETH
+   * out and the quoter reverts in the callback before tokens ever move — so this cannot detect a
+   * sell-side trap. That is acceptable here and only here: every Pons token is deployed from the
+   * factory's fixed creation code, so bespoke honeypot logic is structurally impossible. It would
+   * NOT be safe to reuse this reasoning for a general token.
+   */
+  async quotePonsSellV3(token: string, tokens: number, fee: number): Promise<number | null> {
+    this.init();
+    if (!this.wallet || !(tokens > 0)) return null;
+    try {
+      const decimals = await this.decimalsOf(token);
+      const raw = parseUnits(tokens.toFixed(Math.min(decimals, 18)), decimals);
+      if (raw <= 0n) return null;
+      const out = await this.quoteV3(getAddress(token), getAddress(config.SNIPER_WETH), fee, raw);
+      return Number(formatEther(out));
+    } catch {
+      // A pool that cannot quote a sell is a real signal for the exit ladder (liquidity gone), so
+      // null must stay distinguishable from zero rather than being coerced to it.
+      return null;
+    }
+  }
+
   private async buyV4(
     token: string,
     ethAmount: number,

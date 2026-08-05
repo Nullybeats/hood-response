@@ -18,6 +18,7 @@ import { PerformanceTracker, type TrackedCall } from './engine/performance.js';
 import { SniperRegistry } from './sniper/registry.js';
 import { FeedSubscriber, SNIPER_FEED_URL } from './sniper/feed.js';
 import { PonsWatcher } from './pons/watch.js';
+import { tickPaper, paperEnabled } from './pons/paper.js';
 import { TelegramCommands } from './telegram/commands.js';
 import type { Swarm, SwapEvent } from './types.js';
 import { walletIdSaltMissing } from './walletId.js';
@@ -87,6 +88,17 @@ async function main(): Promise<void> {
   // DRY-RUN by default even then; it polls the free public node, so it adds no metered RPC load.
   const pons = new PonsWatcher((l) => sniper.onPonsLaunch(l));
   pons.start();
+
+  // Paper book monitor. Carries each simulated fill to a real exit on real executable sell quotes,
+  // which is the half that says whether the strategy MAKES MONEY — simulating the buy only proves
+  // it executes. Only runs in dry run; once live, real positions own the exit path instead.
+  if (paperEnabled()) {
+    const quoteSell = async (token: string, tokens: number) => {
+      const engine = sniper.any();
+      return engine ? await engine.quotePonsSell(token, tokens) : null;
+    };
+    setInterval(() => void tickPaper(quoteSell), 20_000);
+  }
   // New heads drive the exit monitor. The engines collapse concurrent samples,
   // so an RPC latency metric update can never create duplicate sell attempts.
   let lastSniperBlock = 0;

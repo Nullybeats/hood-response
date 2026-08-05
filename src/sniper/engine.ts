@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import { parseEther, formatEther } from 'ethers';
 import { config } from '../config/env.js';
 import { recordPonsDecision } from '../pons/journal.js';
+import { openPaperPosition, paperHolds } from '../pons/paper.js';
 import { logger } from '../logger.js';
 import type { PriceOracle } from '../chain/price.js';
 import type { Swarm } from '../types.js';
@@ -584,6 +585,14 @@ export class SniperEngine {
         simulatedTokens: sim.simulatedTokens,
         gas: sim.gas,
       });
+      // A simulated fill opens a PAPER position, carried to a real exit on real quotes. The book is
+      // global rather than per-engine: with several operators unlocked, per-engine books would count
+      // the same launch several times and inflate every aggregate.
+      if (sim.wouldFill && !paperHolds(token)) {
+        openPaperPosition({
+          token, symbol: launch.symbol, deployer: launch.deployer, ethIn: size, tokens: sim.simulatedTokens,
+        });
+      }
       return;
     }
 
@@ -634,6 +643,11 @@ export class SniperEngine {
     } finally {
       this.buying.delete(token);
     }
+  }
+
+  /** Sell-side quote for the paper book — a hypothetical lot, since paper holds no real balance. */
+  async quotePonsSell(token: string, tokens: number): Promise<number | null> {
+    return await this.executor.quotePonsSellV3(token, tokens, 10_000);
   }
 
   /** Pons-only 24h spend, kept separate so the launchpad cap can't be exhausted by feed buys. */

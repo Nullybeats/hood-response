@@ -141,6 +141,12 @@ export class SniperRegistry {
    * Each engine applies its own rails and holds its own wallet, so one operator opting out or
    * hitting a cap never affects another.
    */
+  /** Any engine with a usable wallet — the paper book only needs SOMETHING that can quote. */
+  any(): SniperEngine | null {
+    for (const e of this.engines.values()) return e;
+    return null;
+  }
+
   onPonsLaunch(launch: { token: string; symbol: string; deployer: string; initialBuyWei: bigint; fee: number; seenAt: number }): void {
     for (const engine of this.engines.values()) void engine.onPonsLaunch(launch);
   }

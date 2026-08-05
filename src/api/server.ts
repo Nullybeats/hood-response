@@ -3,6 +3,7 @@ import cors from '@fastify/cors';
 import { z } from 'zod';
 import { config } from '../config/env.js';
 import { ponsDecisions, ponsJournalSummary } from '../pons/journal.js';
+import { paperOpen, paperClosed, paperSummary } from '../pons/paper.js';
 import { logger } from '../logger.js';
 import type { MemoryStore } from '../store/memory.js';
 import { recordWalletUpsert, recordWalletRemove } from '../store/walletOverrides.js';
@@ -264,6 +265,7 @@ export async function buildServer(
       dailyCapEth: config.PONS_DAILY_CAP_ETH,
       summary: ponsJournalSummary(q.owner),
       decisions: ponsDecisions(limit, q.owner),
+      paper: { summary: paperSummary(), open: paperOpen(), closed: paperClosed(50) },
     };
   });
 
