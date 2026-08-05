@@ -24,6 +24,18 @@ export default defineConfig({
       SNIPER_STORE_PATH: '',
       SNIPER_JOURNAL_PATH: '',
       PERF_STORE_PATH: '',
+      // Same rule for the attribution ledger: a test must never write into a
+      // real ledger. Tests that need one pass an explicit tmp path.
+      ATTRIB_LEDGER_PATH: '',
+    },
+    server: {
+      deps: {
+        // Vite rewrites `node:sqlite` to a bare `sqlite` specifier and then
+        // cannot resolve it, so any suite importing the SQLite-backed stores
+        // fails to collect. Externalising it hands the import back to Node,
+        // which has the built-in.
+        external: [/^node:sqlite$/],
+      },
     },
   },
 });

@@ -132,6 +132,25 @@ const schema = z.object({
   FEED_HYPERSYNC_TOKEN: z.string().default(''),
   FEED_SHADOW_INTERVAL_MS: num(5_000),
 
+  // ── Attribution ledger (src/attrib/) ───────────────────────────────────────
+  // Measurement-only accounting of every watched-wallet transaction as exactly
+  // one of confirmed_trade / confirmed_non_trade / unknown_unsupported /
+  // ingestion_or_decoding_failure. Changes no live alert, swarm or sniper
+  // behaviour; the ledger is written, never read by the detection path.
+  //
+  // Its own volume, deliberately NOT the sniper's: the ledger writes orders of
+  // magnitude more rows, and a disk-full here must never brick sniper state.
+  // Empty = disabled, and a disabled ledger reports `degraded` rather than
+  // quietly recording nothing — an empty ledger and an idle chain must never
+  // look the same.
+  ATTRIB_LEDGER_PATH: z.string().default(''),
+  // Rows older than this are prunable. Failures are NEVER auto-pruned: they are
+  // the record of what we could not see, which is the point.
+  ATTRIB_RETENTION_BLOCKS: num(2_000_000),
+  // Row-level detail (tx hashes, wallets) is admin-gated AND off by default —
+  // a tx hash is a one-lookup deanonymiser for a watched wallet.
+  ATTRIB_EXPOSE_DETAIL: bool(false),
+
   ALERT_MIN_WALLETS: num(2),
   ALERT_WINDOW_SECONDS: num(300),
   ALERT_MIN_USD: num(0),
