@@ -17,6 +17,7 @@ import {
 } from 'ethers';
 import { config } from '../config/env.js';
 import { logger } from '../logger.js';
+import { buildTxOverrides, type FeeQuote } from './txOverrides.js';
 // Addresses/ABIs shared with the price oracle, which reads the same pools when
 // DexScreener has not indexed a pair yet — see chain/uniswap.ts.
 import {
@@ -107,6 +108,34 @@ const V3_ROUTER_ABI = [
   'function unwrapWETH9(uint256 amountMinimum, address recipient) payable',
 ];
 
+/**
+ * Where the time inside a buy went, in ms. Measured because `submit` was one opaque number that
+ * ranged 630→4677ms live, and "optimize submit" is a guess until you know which part of it moved.
+ *
+ * The split that matters is BEFORE vs AFTER `send`: the fill price is set when the transaction is
+ * broadcast, so only `route`/`resolve`/`decimals`/`quote`/`balance`/`send` are entry latency.
+ * `confirm` is bookkeeping — shaving it changes when the dashboard updates, not what we paid.
+ *
+ * NOT ADDITIVE: `decimals`, `quote` and `balance` are one `Promise.all`, and each carries the
+ * combined wall time of that round trip. Compare them, never sum them.
+ */
+export interface BuyTimings {
+  /** bestVenue() — the quote race. 0 when the caller supplied a route hint. */
+  route?: number;
+  /** resolvePool() when no route was handed down (cached after first use per token). */
+  resolve?: number;
+  /** ERC-20 decimals — memoised in `decimalsOf`, so ~0 on any token we've quoted before. */
+  decimals?: number;
+  /** The execution quote (fresh; never reused from the gate). */
+  quote?: number;
+  /** Pre-trade balance read, needed for the fill delta. */
+  balance?: number;
+  /** Build + sign + broadcast. Includes ethers' implicit estimateGas/getFeeData/getNonce. */
+  send?: number;
+  /** tx.wait(1) — block inclusion. NOT entry latency; we cannot compress it. */
+  confirm?: number;
+}
+
 export interface BuyResult {
   txHash: string;
   tokensReceived: number;
@@ -119,6 +148,11 @@ export interface BuyResult {
   quotedTokens: number;
   /** Which venue actually executed the fill. */
   venue: 'v4' | 'v3';
+  /** Epoch ms at which the raw transaction was broadcast. The moment the entry price is decided —
+   *  everything after it is accounting. `alertTs → sentAt` is the number to optimise. */
+  sentAt?: number;
+  /** Stage breakdown, for the entry-latency log. */
+  timings?: BuyTimings;
 }
 export interface SellResult {
   txHash: string;
@@ -142,6 +176,10 @@ export interface RoundTrip {
   lossPct: number;
   /** Raw on-chain pool liquidity (uint128 L) at preview time, as a relative depth proxy. */
   poolLiquidity: number | null;
+  /** The venue this preview actually priced — handed straight to `buy()` as its route so the trade
+   *  cannot execute against a different pool than the one the depth gate approved, and so the quote
+   *  race is run once per trade rather than twice. */
+  route?: VenueQuote;
 }
 
 /** The venue that won the quote race, and the quote that won it. Both the gate
@@ -304,6 +342,9 @@ export class SwapExecutor {
   private readonly v3Candidates = new Map<string, { at: number; val: number[] }>();
   /** token → ERC-20 decimals. Read once; needed on every price-sanity check. */
   private readonly decimals = new Map<string, number>();
+  /** Background-refreshed gas fee quote — see `txOverrides`. Null until the first refresh lands. */
+  private fees: FeeQuote | null = null;
+  private feeTimer: ReturnType<typeof setInterval> | null = null;
 
   private key(): string {
     // Server keys must be explicitly unlocked from the encrypted keystore.
@@ -364,6 +405,7 @@ export class SwapExecutor {
     const rpc = config.SNIPER_EXECUTOR_RPC || config.CHAIN_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com';
     this.provider = new JsonRpcProvider(rpc);
     this.wallet = new Wallet(this.key(), this.provider);
+    this.startFeeRefresh(); // no-op unless SNIPER_FEE_CACHE_MS > 0
   }
 
   address(): string | null {
@@ -518,6 +560,50 @@ export class SwapExecutor {
     const d = Number((await token20.getFunction('decimals')()) as bigint);
     this.decimals.set(key, d);
     return d;
+  }
+
+  /**
+   * Gas/fee overrides for a buy — the Phase-2 lever against ethers' *implicit* pre-send round trips.
+   *
+   * `router.execute(...)` looks like one call but issues `eth_estimateGas`, `eth_feeHistory`/
+   * `getFeeData` and `eth_getTransactionCount` before it signs. At the ~117ms RPC latency measured on
+   * this box that is ~350ms sitting in front of every broadcast, on the one stretch of the path where
+   * milliseconds change the fill price.
+   *
+   * Supplying `gasLimit` removes the estimate; supplying fees removes the fee lookup. Both are OFF by
+   * default (`SNIPER_BUY_GAS_LIMIT=0`, `SNIPER_FEE_CACHE_MS=0`) so this deploys behaviourally
+   * identical to today and gets switched on deliberately, with the Phase-0 numbers to judge it by.
+   *
+   * Nonce is deliberately NOT overridden. It is the one of the three that fails catastrophically
+   * rather than expensively: a drifted nonce strands or drops a transaction on a funded wallet
+   * mid-position, and the same wallet issues sells concurrently with buys.
+   */
+  private async txOverrides(): Promise<Record<string, bigint>> {
+    return buildTxOverrides({
+      gasLimit: config.SNIPER_BUY_GAS_LIMIT,
+      feeCacheMs: config.SNIPER_FEE_CACHE_MS,
+      fees: this.fees,
+      now: Date.now(),
+    });
+  }
+
+  /** Keep `this.fees` warm off the critical path. Started by `init()` only when the cache is enabled. */
+  private startFeeRefresh(): void {
+    const ttl = config.SNIPER_FEE_CACHE_MS;
+    if (ttl <= 0 || this.feeTimer || !this.provider) return;
+    const tick = async (): Promise<void> => {
+      try {
+        const fd = await this.provider!.getFeeData();
+        if (fd.maxFeePerGas && fd.maxPriorityFeePerGas) {
+          this.fees = { at: Date.now(), maxFeePerGas: fd.maxFeePerGas, maxPriorityFeePerGas: fd.maxPriorityFeePerGas };
+        }
+      } catch {
+        /* leave the previous quote; cachedFees() ages it out on its own */
+      }
+    };
+    void tick();
+    this.feeTimer = setInterval(tick, ttl);
+    this.feeTimer.unref?.();
   }
 
   /** Every v3 fee tier with a live eth-paired pool. The SET, like
@@ -706,6 +792,7 @@ export class SwapExecutor {
       ethBack,
       lossPct: ethIn > 0 ? (1 - ethBack / ethIn) * 100 : 100,
       poolLiquidity: liq > 0n ? Number(liq) : null,
+      route: entry,
     };
   }
 
@@ -895,16 +982,27 @@ export class SwapExecutor {
     ethAmount: number,
     poolIdHint?: string | null,
     expectedPriceEth?: number | null,
+    routeHint?: VenueQuote | null,
   ): Promise<BuyResult> {
     this.init();
     if (!this.wallet) throw new Error('sniper wallet not configured');
     const amountIn = parseEther(ethAmount.toString());
-    const best = await this.bestVenue(token, amountIn, 'buy', poolIdHint, expectedPriceEth).catch(() => null);
+    // The depth gate ran the quote race milliseconds ago (previewRoundTrip → bestVenue). Re-running it
+    // here re-quotes every candidate pool in both directions for an answer we already have — pure
+    // latency on the stretch that decides the fill price. The hint only chooses WHICH pool; the
+    // execution quote below is always re-read fresh, and `minOut` still bounds the fill, so a hint
+    // that has gone stale costs nothing beyond the fallback path it already had.
+    const routeStart = Date.now();
+    const best = routeHint ?? (await this.bestVenue(token, amountIn, 'buy', poolIdHint, expectedPriceEth).catch(() => null));
+    const routeMs = routeHint ? 0 : Date.now() - routeStart;
     if (best) {
       try {
-        return best.venue === 'v4'
-          ? await this.buyV4(token, ethAmount, poolIdHint, expectedPriceEth, best.pool)
-          : await this.buyV3(token, ethAmount, expectedPriceEth, best.fee!);
+        const res =
+          best.venue === 'v4'
+            ? await this.buyV4(token, ethAmount, poolIdHint, expectedPriceEth, best.pool)
+            : await this.buyV3(token, ethAmount, expectedPriceEth, best.fee!);
+        if (res.timings) res.timings.route = routeMs;
+        return res;
       } catch (err) {
         // The router's pick failed to execute (reverted, or moved under us).
         // Fall through to the legacy try-both path rather than abandon the buy.
@@ -928,18 +1026,35 @@ export class SwapExecutor {
     expectedPriceEth: number | null | undefined,
     routed?: ResolvedPool,
   ): Promise<BuyResult> {
+    const t0 = Date.now();
+    const timings: BuyTimings = {};
     const pool = routed ?? (await this.resolvePool(token, poolIdHint));
+    if (!routed) timings.resolve = Date.now() - t0;
     const amountIn = parseEther(ethAmount.toString());
     const token20 = new Contract(token, ERC20_ABI, this.wallet!);
-    const decimals = Number((await token20.getFunction('decimals')()) as bigint);
 
-    let quoted: bigint;
-    try {
-      quoted = await this.quoteOut(pool, amountIn, true);
-    } catch (err) {
-      throw new Error(`quote reverted (${shortErr(err)})`);
-    }
+    // decimals / quote / pre-trade balance are mutually independent, so they run as one round trip
+    // instead of three. decimals is memoised (`decimalsOf`) and is normally already warm from the
+    // gate's route race — this used to be a raw contract call on every single buy.
+    const parStart = Date.now();
+    const [decimals, quotedRes, before] = await Promise.all([
+      this.decimalsOf(token),
+      this.quoteOut(pool, amountIn, true).then(
+        (v) => ({ ok: true as const, v }),
+        (err) => ({ ok: false as const, err }),
+      ),
+      (token20.getFunction('balanceOf')(this.wallet!.address) as Promise<bigint>).catch(() => null),
+    ]);
+    const parMs = Date.now() - parStart;
+    timings.decimals = parMs;
+    timings.quote = parMs;
+    timings.balance = parMs;
+
+    if (!quotedRes.ok) throw new Error(`quote reverted (${shortErr(quotedRes.err)})`);
+    const quoted = quotedRes.v;
     if (quoted <= 0n) throw new Error('no route (zero quote)');
+    // A failed pre-read would silently become "received everything in the wallet" on the delta below.
+    if (before === null) throw new Error('pre-trade balance read failed (refusing to buy blind)');
 
     if (expectedPriceEth != null && expectedPriceEth > 0) {
       const quotedPriceEth = Number(formatEther(amountIn)) / Number(formatUnits(quoted, decimals));
@@ -966,18 +1081,24 @@ export class SwapExecutor {
       ? [v4Input]
       : [abi.encode(['address', 'uint256'], [ADDRESS_THIS, amountIn]), v4Input];
 
-    const before = (await token20.getFunction('balanceOf')(this.wallet!.address)) as bigint;
-
     const router = new Contract(config.SNIPER_ROUTER, ROUTER_ABI, this.wallet!);
     const deadline = Math.floor(Date.now() / 1000) + 120;
+    const sendStart = Date.now();
     let tx;
     try {
-      tx = await router.getFunction('execute')(commands, inputs, deadline, { value: amountIn });
+      tx = await router.getFunction('execute')(commands, inputs, deadline, {
+        value: amountIn,
+        ...(await this.txOverrides()),
+      });
     } catch (err) {
       throw new Error(`swap reverted (${shortErr(err)})`);
     }
-    logger.info({ token, ethAmount, tx: tx.hash, venue: 'v4' }, 'sniper: buy sent');
+    const sentAt = Date.now();
+    timings.send = sentAt - sendStart;
+    logger.info({ token, ethAmount, tx: tx.hash, venue: 'v4', sendMs: timings.send }, 'sniper: buy sent');
+    const confirmStart = Date.now();
     const receipt = await tx.wait(1);
+    timings.confirm = Date.now() - confirmStart;
 
     let tokensReceived = 0;
     let tokensReceivedRaw: string | undefined;
@@ -998,6 +1119,8 @@ export class SwapExecutor {
       gasEth,
       quotedTokens: Number(formatUnits(quoted, decimals)),
       venue: 'v4',
+      sentAt,
+      timings,
     };
   }
 
@@ -1007,19 +1130,31 @@ export class SwapExecutor {
     expectedPriceEth: number | null | undefined,
     fee: number,
   ): Promise<BuyResult> {
+    const timings: BuyTimings = {};
     const weth = getAddress(config.SNIPER_WETH);
     const t = getAddress(token);
     const amountIn = parseEther(ethAmount.toString());
     const token20 = new Contract(token, ERC20_ABI, this.wallet!);
-    const decimals = Number((await token20.getFunction('decimals')()) as bigint);
 
-    let quoted: bigint;
-    try {
-      quoted = await this.quoteV3(weth, t, fee, amountIn);
-    } catch (err) {
-      throw new Error(`v3 quote reverted (${shortErr(err)})`);
-    }
+    // One round trip instead of three — see the note in buyV4.
+    const parStart = Date.now();
+    const [decimals, quotedRes, before] = await Promise.all([
+      this.decimalsOf(token),
+      this.quoteV3(weth, t, fee, amountIn).then(
+        (v) => ({ ok: true as const, v }),
+        (err) => ({ ok: false as const, err }),
+      ),
+      (token20.getFunction('balanceOf')(this.wallet!.address) as Promise<bigint>).catch(() => null),
+    ]);
+    const parMs = Date.now() - parStart;
+    timings.decimals = parMs;
+    timings.quote = parMs;
+    timings.balance = parMs;
+
+    if (!quotedRes.ok) throw new Error(`v3 quote reverted (${shortErr(quotedRes.err)})`);
+    const quoted = quotedRes.v;
     if (quoted <= 0n) throw new Error('no v3 route (zero quote)');
+    if (before === null) throw new Error('pre-trade balance read failed (refusing to buy blind)');
 
     if (expectedPriceEth != null && expectedPriceEth > 0) {
       const quotedPriceEth = Number(formatEther(amountIn)) / Number(formatUnits(quoted, decimals));
@@ -1031,15 +1166,22 @@ export class SwapExecutor {
     const router = new Contract(V3_ROUTER, V3_ROUTER_ABI, this.wallet!);
     const params = [weth, t, fee, this.wallet!.address, amountIn, amountOutMin, 0n];
 
-    const before = (await token20.getFunction('balanceOf')(this.wallet!.address)) as bigint;
+    const sendStart = Date.now();
     let tx;
     try {
-      tx = await router.getFunction('exactInputSingle')(params, { value: amountIn });
+      tx = await router.getFunction('exactInputSingle')(params, {
+        value: amountIn,
+        ...(await this.txOverrides()),
+      });
     } catch (err) {
       throw new Error(`v3 swap reverted (${shortErr(err)})`);
     }
-    logger.info({ token, ethAmount, tx: tx.hash, venue: 'v3', fee }, 'sniper: buy sent');
+    const sentAt = Date.now();
+    timings.send = sentAt - sendStart;
+    logger.info({ token, ethAmount, tx: tx.hash, venue: 'v3', fee, sendMs: timings.send }, 'sniper: buy sent');
+    const confirmStart = Date.now();
     const receipt = await tx.wait(1);
+    timings.confirm = Date.now() - confirmStart;
 
     let tokensReceived = 0;
     let tokensReceivedRaw: string | undefined;
@@ -1060,6 +1202,8 @@ export class SwapExecutor {
       gasEth,
       quotedTokens: Number(formatUnits(quoted, decimals)),
       venue: 'v3',
+      sentAt,
+      timings,
     };
   }
 

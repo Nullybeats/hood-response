@@ -281,6 +281,16 @@ const schema = z.object({
   // PIPEDOG top). Lenient default (15s) while the blocking price-enrich latency remains; tighten toward
   // ~5s after Wave 2 gets fills sub-2s. 0 = off. Measured breakdown is journaled per buy (gateTimingsMs).
   SNIPER_STALE_MAX_SEC: num(15),
+  // ── Broadcast-latency levers (both OFF by default — see executor.txOverrides) ──────────────────
+  // ethers issues eth_estimateGas + getFeeData + getTransactionCount before it signs, ~350ms of RPC
+  // at the latency measured on this box, sitting in front of every broadcast. Supplying a gas limit
+  // removes the estimate. Set generously: overpaying headroom is noise, an out-of-gas revert is a
+  // lost entry AND lost gas. 0 = estimate as before.
+  SNIPER_BUY_GAS_LIMIT: num(0),
+  // Refresh interval for the background gas-fee quote, ms. Removes the fee lookup from the send path.
+  // A quote older than 3× this is discarded rather than used (an underpriced tx sits unmined, which
+  // costs far more than the round trip it saved). 0 = look fees up inline as before.
+  SNIPER_FEE_CACHE_MS: num(0),
   // Only act on the first time a token appears in the global Signals feed.
   // This is intentionally independent of whether this operator bought it.
   SNIPER_NEW_COINS_ONLY: bool(false),

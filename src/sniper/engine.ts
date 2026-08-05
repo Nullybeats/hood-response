@@ -99,12 +99,36 @@ export interface Position {
   venue?: 'v4' | 'v3';
   /** Raw on-chain pool liquidity (uint128 L) at entry — relative depth proxy. */
   poolLiquidityEntry?: number | null;
-  /** Alert-timestamp → buy-confirmed latency, ms (how late we entered the swarm). */
+  /** Alert-timestamp → buy-confirmed latency, ms (how late we entered the swarm). Includes block
+   *  inclusion, so it is the honest end-to-end number but NOT the one to tune against. */
   buyLatencyMs?: number;
-  /** Breakdown of where the entry latency went (ms), so we can see WHICH stage is the bottleneck
-   *  instead of guessing: sse = Railway→box hop, enrich = blocking Dexscreener price refresh,
-   *  safety = honeypot probe, preview = round-trip depth quote, submit = buy tx build+confirm. */
-  gateTimingsMs?: { sse?: number; enrich?: number; safety?: number; preview?: number; submit?: number };
+  /** Alert-timestamp → raw transaction broadcast, ms. The entry price is set at broadcast, so this
+   *  is the part of the latency that costs money; everything after it is bookkeeping. */
+  broadcastLatencyMs?: number;
+  /**
+   * Breakdown of where the entry latency went (ms), so we can see WHICH stage is the bottleneck
+   * instead of guessing: sse = Railway→box hop, enrich = blocking Dexscreener price refresh,
+   * safety = honeypot probe, preview = round-trip depth quote, submit = buy tx build+confirm.
+   * The rest are `submit` split open (see `BuyTimings` in executor.ts).
+   *
+   * NOT ADDITIVE — several of these are concurrent stages that are each attributed the combined wall
+   * time on purpose: `safety`+`preview` run together, and `decimals`+`quote`+`balance` are one
+   * `Promise.all`. Summing the fields double-counts; compare them, don't add them.
+   */
+  gateTimingsMs?: {
+    sse?: number;
+    enrich?: number;
+    safety?: number;
+    preview?: number;
+    submit?: number;
+    route?: number;
+    resolve?: number;
+    decimals?: number;
+    quote?: number;
+    balance?: number;
+    send?: number;
+    confirm?: number;
+  };
 }
 
 /** Runtime-adjustable knobs (seeded from env, editable via the API). */
@@ -579,7 +603,15 @@ export class SniperEngine {
 
     try {
       const submitStart = Date.now();
-      const res = await this.executor.buy(swarm.token, size, this.price.pairIdOf(swarm.token), expectedPriceEth);
+      // Hand the depth gate's own winning venue to the trade: it was chosen microseconds ago from a
+      // full quote race, and re-deriving it re-quotes every candidate pool before we can broadcast.
+      const res = await this.executor.buy(
+        swarm.token,
+        size,
+        this.price.pairIdOf(swarm.token),
+        expectedPriceEth,
+        roundTrip.route ?? null,
+      );
       const filledAt = Date.now();
       const submitMs = filledAt - submitStart;
       const gateTimingsMs = {
@@ -589,6 +621,8 @@ export class SniperEngine {
         safety: this.settings.requireSafe ? gateMs : undefined,
         preview: gateMs,
         submit: submitMs,
+        // Inside submit, so we can see WHICH part of it moved when we tune it (see BuyTimings).
+        ...(res.timings ?? {}),
       };
       this.buys.push({ at: now, eth: res.ethSpent });
       const [tax, protocolFeePctPerSwap] = await Promise.all([
@@ -623,9 +657,20 @@ export class SniperEngine {
         entryRoundTripPct: roundTrip?.lossPct,
         poolLiquidityEntry: roundTrip?.poolLiquidity ?? null,
         buyLatencyMs: filledAt - alertTs,
+        broadcastLatencyMs: res.sentAt ? res.sentAt - alertTs : undefined,
         gateTimingsMs,
       };
-      logger.info({ token: swarm.tokenSymbol, buyLatencyMs: pos.buyLatencyMs, timings: gateTimingsMs }, 'sniper: entry latency breakdown');
+      logger.info(
+        {
+          token: swarm.tokenSymbol,
+          // buyLatencyMs includes tx.wait(1). broadcastLatencyMs stops at the broadcast — the moment
+          // the entry price is decided — and is therefore the number worth optimising.
+          buyLatencyMs: pos.buyLatencyMs,
+          broadcastLatencyMs: pos.broadcastLatencyMs,
+          timings: gateTimingsMs,
+        },
+        'sniper: entry latency breakdown',
+      );
       this.positions.set(pos.id, pos);
       this.state?.audit(this.owner, 'buy-confirmed', { positionId: pos.id, tx: res.txHash, eth: res.ethSpent });
       this.decide(swarm, 'bought', `bought ${size} Ξ · tx ${res.txHash.slice(0, 10)}`);
