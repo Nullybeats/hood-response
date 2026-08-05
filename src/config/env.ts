@@ -233,6 +233,31 @@ const schema = z.object({
   // UniversalRouter is Robinhood's MODIFIED fork — only this address works.
   SNIPER_ROUTER: z.string().default('0x8876789976deCbfCbBbe364623c63652db8C0904'),
   SNIPER_WETH: z.string().default('0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73'),
+  // ── Pons launchpad strategy ───────────────────────────────────────────────────────────────────
+  // A second, independent entry source: buy a freshly launched Pons token the instant its entry gate
+  // opens, then manage it with the same position/exit machinery as a feed alert.
+  //
+  // OFF by default, and DRY-RUN by default even when enabled — deliberately two switches. The
+  // strategy backtests at roughly BREAK-EVEN over 195 replayed launches (only a wide/runner exit was
+  // positive at +15.8%, and only +1.2% excluding its top 3 trades), so it must prove itself against
+  // live launches without spending before anyone flips it to real money.
+  PONS_ENABLED: bool(false),
+  // Detection source. HyperSync is off-meter and rate-limit-free, and it exposes `l1_block_number`
+  // per block — which IS the entry-gate clock on this Nitro chain. The public RPC cannot do this job:
+  // [verified 2026-08-05] it 429s a plain eth_getBlockByNumber, so a 4s poll never gets off the
+  // ground. Alchemy could, but env.ts already refuses metered RPC for continuous listening.
+  PONS_HYPERSYNC_URL: z.string().default('https://robinhood.hypersync.xyz'),
+  PONS_HYPERSYNC_TOKEN: z.string().default(''),
+  /** 1 = compute and log the exact buy, but never broadcast. Turn OFF only to trade real funds. */
+  PONS_DRY_RUN: bool(true),
+  /** Per-launch buy size. Still clamped by SNIPER_MAX_ETH_PER_TRADE. */
+  PONS_BUY_ETH: num(0.001),
+  /** Concurrency cap for Pons positions specifically — the generic one is not enforced. */
+  PONS_MAX_OPEN: num(3),
+  /** Stop opening new Pons positions once this much has been spent on them in 24h. */
+  PONS_DAILY_CAP_ETH: num(0.02),
+  /** Skip a launch whose deployer self-buy is below this (wei-denominated conviction signal). */
+  PONS_MIN_INITIAL_BUY_ETH: num(0),
   SNIPER_MIN_CONVICTION: num(60),
   SNIPER_MAX_CONVICTION: num(100),
   SNIPER_BUY_ETH: num(0.0005), // per-alert buy size

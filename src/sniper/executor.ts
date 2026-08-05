@@ -18,6 +18,7 @@ import {
 import { config } from '../config/env.js';
 import { logger } from '../logger.js';
 import { buildTxOverrides, type FeeQuote } from './txOverrides.js';
+import { SendLock } from './sendLock.js';
 // Addresses/ABIs shared with the price oracle, which reads the same pools when
 // DexScreener has not indexed a pair yet — see chain/uniswap.ts.
 import {
@@ -330,6 +331,12 @@ const poolIdOf = (p: ResolvedPool): string =>
 export class SwapExecutor {
   private provider: JsonRpcProvider | null = null;
   private wallet: Wallet | null = null;
+  /**
+   * Serializes tx SENDS for this wallet. ethers reads the pending nonce at send time, so two
+   * concurrent sends collide — previously only a per-token `buying` set guarded this, which does
+   * nothing across different tokens. Scoped per executor, which is exactly one wallet.
+   */
+  private readonly sends = new SendLock();
   private runtimeKey: string | null = null;
   private readonly pools = new Map<string, ResolvedPool>();
   /** token → its best v3 fee tier, or null when no v3 pool exists at all. */
@@ -1019,6 +1026,27 @@ export class SwapExecutor {
     }
   }
 
+  /**
+   * Buy a freshly launched Pons token: straight to Uniswap V3 at the launchpad's fee tier, skipping
+   * the venue race entirely.
+   *
+   * `buy()` is wrong for a launch for three separate reasons, all of which cost us the entry:
+   *   1. `bestVenue` quotes every V4 pool AND every V3 fee tier before broadcasting — round trips we
+   *      cannot afford in the one block where the gate is uncontested.
+   *   2. `enumerateV3Fees` requires `pool.liquidity() > 0` and **caches for 5 minutes**, so a probe
+   *      that ran seconds before the launch leaves a negative cached result that blinds the router
+   *      to the only pool that matters.
+   *   3. The entry-price sanity check needs a market price, and a token seconds old has none.
+   *
+   * Pons only ever launches on one venue — [verified] `dexConfigCount() === 1`, Uniswap V3 at fee
+   * 10000 — so there is nothing to race. `expectedPriceEth` is passed null to skip the sanity gate.
+   */
+  async buyPonsV3(token: string, ethAmount: number, fee: number): Promise<BuyResult> {
+    this.init();
+    if (!this.wallet) throw new Error('sniper wallet not configured');
+    return await this.buyV3(token, ethAmount, null, fee);
+  }
+
   private async buyV4(
     token: string,
     ethAmount: number,
@@ -1086,10 +1114,8 @@ export class SwapExecutor {
     const sendStart = Date.now();
     let tx;
     try {
-      tx = await router.getFunction('execute')(commands, inputs, deadline, {
-        value: amountIn,
-        ...(await this.txOverrides()),
-      });
+      const ov = await this.txOverrides();
+      tx = await this.sends.run(() => router.getFunction('execute')(commands, inputs, deadline, { value: amountIn, ...ov }));
     } catch (err) {
       throw new Error(`swap reverted (${shortErr(err)})`);
     }
@@ -1169,10 +1195,8 @@ export class SwapExecutor {
     const sendStart = Date.now();
     let tx;
     try {
-      tx = await router.getFunction('exactInputSingle')(params, {
-        value: amountIn,
-        ...(await this.txOverrides()),
-      });
+      const ov = await this.txOverrides();
+      tx = await this.sends.run(() => router.getFunction('exactInputSingle')(params, { value: amountIn, ...ov }));
     } catch (err) {
       throw new Error(`v3 swap reverted (${shortErr(err)})`);
     }
@@ -1546,7 +1570,7 @@ export class SwapExecutor {
     const balBefore = await this.provider!.getBalance(this.wallet!.address).catch(() => null);
     let tx;
     try {
-      tx = await router.getFunction('execute')(commands, inputs, deadline);
+      tx = await this.sends.run(() => router.getFunction('execute')(commands, inputs, deadline));
     } catch (err) {
       throw new Error(`sell swap reverted (${shortErr(err)})`);
     }
@@ -1650,7 +1674,7 @@ export class SwapExecutor {
     const balBefore = await this.provider!.getBalance(this.wallet!.address).catch(() => null);
     let tx;
     try {
-      tx = await router.getFunction('multicall')([swapCalldata, unwrapCalldata]);
+      tx = await this.sends.run(() => router.getFunction('multicall')([swapCalldata, unwrapCalldata]));
     } catch (err) {
       throw new Error(`v3 sell swap reverted (${shortErr(err)})`);
     }

@@ -17,6 +17,7 @@ import { SafetyChecker } from './chain/safety.js';
 import { PerformanceTracker, type TrackedCall } from './engine/performance.js';
 import { SniperRegistry } from './sniper/registry.js';
 import { FeedSubscriber, SNIPER_FEED_URL } from './sniper/feed.js';
+import { PonsWatcher } from './pons/watch.js';
 import { TelegramCommands } from './telegram/commands.js';
 import type { Swarm, SwapEvent } from './types.js';
 import { walletIdSaltMissing } from './walletId.js';
@@ -81,6 +82,11 @@ async function main(): Promise<void> {
   // subscribes to the feed's SSE stream and drives every operator's engine.
   const feed = new FeedSubscriber(sniper, price, SNIPER_FEED_URL);
   feed.start();
+
+  // Pons launchpad — a second, independent entry source. No-ops unless PONS_ENABLED, and is
+  // DRY-RUN by default even then; it polls the free public node, so it adds no metered RPC load.
+  const pons = new PonsWatcher((l) => sniper.onPonsLaunch(l));
+  pons.start();
   // New heads drive the exit monitor. The engines collapse concurrent samples,
   // so an RPC latency metric update can never create duplicate sell attempts.
   let lastSniperBlock = 0;

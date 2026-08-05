@@ -265,6 +265,8 @@ export class SniperEngine {
   /** Tokens with a buy currently being evaluated/executed — a per-token lock that stops two
    *  simultaneous alerts for the same token from both passing holdsOpen and double-buying. */
   private readonly buying = new Set<string>();
+  /** Pons-only buy ledger for its independent 24h cap. */
+  private ponsBuys: { at: number; eth: number }[] = [];
 
   /** Owner of this engine (a cipherfi admin email, or 'default'). Purely for
    *  logging/telemetry — the engine itself is otherwise identity-agnostic. */
@@ -494,6 +496,116 @@ export class SniperEngine {
   }
 
   /** Alert hook: decide whether to snipe, and buy if so. */
+  /**
+   * Entry point for the Pons launchpad strategy — a freshly launched token whose gate has just
+   * opened. Independent of the Railway feed; see src/pons/.
+   *
+   * Deliberately does NOT reuse `onAlert`'s gates, because none of them mean anything for a token
+   * that is seconds old: there is no conviction score, no alert kind, no freshness window, no market
+   * price to sanity-check against, and the depth gate's `previewRoundTrip` cannot quote a pool the
+   * venue cache has never seen. What it does keep is every rail that protects capital.
+   *
+   * Once the buy lands it constructs an ordinary `Position`, so the existing monitor loop, rug
+   * guard, trailing stop, recoup and `sellFraction` all operate on it unchanged — the sell side
+   * needed no new code at all.
+   */
+  async onPonsLaunch(launch: {
+    token: string;
+    symbol: string;
+    deployer: string;
+    initialBuyWei: bigint;
+    fee: number;
+    seenAt: number;
+  }): Promise<void> {
+    if (!config.PONS_ENABLED) return;
+    if (config.SNIPER_GLOBAL_KILL) return;
+    if (this.settings.enabled !== true) return;
+    if (this.mode === 'off') return;
+
+    const now = Date.now();
+    const token = launch.token.toLowerCase();
+
+    // Rails. Ordered cheapest-first so we never pay for a check a prior one would have vetoed.
+    if (this.buying.has(token)) return; // per-token in-flight lock
+    if (this.holdsOpen(token)) return;
+    const openPons = this.openPositions().filter((p) => p.kind === 'PONS').length;
+    if (openPons >= config.PONS_MAX_OPEN) return;
+    if (this.ponsSpentLast24h(now) >= config.PONS_DAILY_CAP_ETH) {
+      logger.warn({ token }, 'pons: 24h cap reached, skipping');
+      return;
+    }
+    const minInitial = config.PONS_MIN_INITIAL_BUY_ETH;
+    if (minInitial > 0 && Number(launch.initialBuyWei) / 1e18 < minInitial) return;
+
+    // Size is clamped by the same per-trade ceiling as every other buy.
+    const size = Math.min(config.PONS_BUY_ETH, config.SNIPER_MAX_ETH_PER_TRADE);
+
+    // DRY RUN: everything above ran for real; we just don't broadcast. This is the default, and it
+    // is how the strategy proves itself against live launches before any capital moves. The
+    // backtest put it at roughly break-even, so "it detected correctly" is not sufficient evidence
+    // to spend.
+    if (config.PONS_DRY_RUN) {
+      logger.info(
+        { token, symbol: launch.symbol, sizeEth: size, fee: launch.fee, gateLatencyMs: now - launch.seenAt },
+        'pons: DRY RUN — would buy (set PONS_DRY_RUN=0 to trade real funds)',
+      );
+      return;
+    }
+
+    this.buying.add(token);
+    try {
+      const res = await this.executor.buyPonsV3(token, size, launch.fee);
+      const ethUsd = this.price.ethUsdPrice();
+      // Mark in the same units `sample()` uses, so the ratio-based exits are consistent from tick
+      // one: it computes px = (ethOut * ethUsd) / tokens off a live on-chain sell quote.
+      const entryPriceUsd = ethUsd && ethUsd > 0 && res.tokensReceived > 0 ? (res.ethSpent * ethUsd) / res.tokensReceived : 0;
+      this.buys.push({ at: now, eth: res.ethSpent });
+      this.ponsBuys.push({ at: now, eth: res.ethSpent });
+
+      const pos: Position = {
+        id: randomUUID(),
+        token,
+        tokenSymbol: launch.symbol,
+        kind: 'PONS',
+        conviction: 0,
+        ethIn: res.ethSpent,
+        entryPriceUsd,
+        entryMarketCap: null,
+        tokensReceived: res.tokensReceived,
+        tokensReceivedRaw: res.tokensReceivedRaw,
+        buyTx: res.txHash,
+        openedAt: now,
+        lastPriceUsd: entryPriceUsd,
+        updatedAt: now,
+        status: 'open',
+        buyGasEth: res.gasEth,
+        venue: res.venue,
+        buyLatencyMs: now - launch.seenAt,
+        // Exit overrides from the replay evidence: over 195 launches the ONLY positive configuration
+        // was a wide/runner shape (stop 40 / trail 50 / recoup 3x, +15.8%). Bank-early variants lifted
+        // win rate to 40% and still lost 9.7%, because they cap the fat tail that is the entire edge.
+        stopLossPct: 40,
+        trailingStopPct: 50,
+      };
+      this.positions.set(pos.id, pos);
+      this.state?.audit(this.owner, 'buy-confirmed', { positionId: pos.id, tx: res.txHash, eth: res.ethSpent });
+      logger.info({ token, symbol: launch.symbol, eth: res.ethSpent, tx: res.txHash }, 'pons: opened position');
+      void this.prepareExit(pos);
+      void this.persist();
+    } catch (err) {
+      logger.error({ token, err: String(err) }, 'pons: buy failed');
+    } finally {
+      this.buying.delete(token);
+    }
+  }
+
+  /** Pons-only 24h spend, kept separate so the launchpad cap can't be exhausted by feed buys. */
+  private ponsSpentLast24h(now: number): number {
+    const cut = now - 86_400_000;
+    this.ponsBuys = this.ponsBuys.filter((b) => b.at >= cut);
+    return this.ponsBuys.reduce((s, b) => s + b.eth, 0);
+  }
+
   async onAlert(swarm: Swarm): Promise<void> {
     if (config.SNIPER_GLOBAL_KILL) return this.decide(swarm, 'skipped', 'global kill switch is active');
     if (this.mode === 'off' || !this.settings.enabled) return this.decide(swarm, 'skipped', 'sniper is OFF');

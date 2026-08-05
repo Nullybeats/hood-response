@@ -136,6 +136,15 @@ export class SniperRegistry {
     for (const engine of this.engines.values()) void engine.onAlert(annotated);
   }
 
+  /**
+   * Fan a Pons launch out to every operator's engine, exactly as `onAlert` does for feed alerts.
+   * Each engine applies its own rails and holds its own wallet, so one operator opting out or
+   * hitting a cap never affects another.
+   */
+  onPonsLaunch(launch: { token: string; symbol: string; deployer: string; initialBuyWei: bigint; fee: number; seenAt: number }): void {
+    for (const engine of this.engines.values()) void engine.onPonsLaunch(launch);
+  }
+
   private async maybeSeedFromLegacy(owner: string, engine: SniperEngine): Promise<void> {
     const legacyOwner = (process.env.SNIPER_LEGACY_OWNER || '').trim().toLowerCase();
     if (!legacyOwner || owner !== legacyOwner) return;
