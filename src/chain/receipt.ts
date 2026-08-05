@@ -7,8 +7,8 @@ import { logHttpFailure, logRpcError, logRpcThrow } from './rpcLog.js';
 // Both official Uniswap swap event signatures. Receipt evidence is required in
 // addition to a tracked-wallet transfer so airdrops/direct payments never turn
 // into buy signals.
-const V3_SWAP_TOPIC = id('Swap(address,address,int256,int256,uint160,uint128,int24)').toLowerCase();
-const V4_SWAP_TOPIC = id('Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)').toLowerCase();
+export const V3_SWAP_TOPIC = id('Swap(address,address,int256,int256,uint160,uint128,int24)').toLowerCase();
+export const V4_SWAP_TOPIC = id('Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)').toLowerCase();
 
 interface ReceiptLog { topics?: string[]; address?: string; }
 interface Receipt { status?: string; logs?: ReceiptLog[]; }
