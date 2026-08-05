@@ -4,6 +4,14 @@ import { notifyBotState } from '../notify/state.js';
 import type { PriceOracle } from '../chain/price.js';
 import type { SniperRegistry } from './registry.js';
 import type { Alert, Swarm } from '../types.js';
+import { selectCatchUp, remember } from './feedCatchUp.js';
+
+/** How far back a reconnect may replay. Deliberately just wider than the observed ~1.4s gap: this
+ *  recovers what we were blind for, never resurrects history. The engine's own 15s freshness gate is
+ *  the second, independent bound. */
+const CATCHUP_MAX_AGE_MS = 20_000;
+/** Alert ids retained for de-duplication. Far more than any catch-up window can surface. */
+const SEEN_CAP = 500;
 
 /**
  * FeedSubscriber — makes the swarm feed the single source of truth for the sniper.
@@ -37,6 +45,11 @@ export class FeedSubscriber {
   private connected = false;
   /** Whether we're currently in a reported-dead state, so recovery fires once. */
   private feedDead = false;
+  /** Alert ids already dispatched, so a catch-up replay cannot handle one twice. Bounded. */
+  private readonly seen = new Set<string>();
+  private readonly seenOrder: string[] = [];
+  /** False until the first successful connect — the first one seeds the ledger instead. */
+  private hadConnection = false;
 
   constructor(
     private readonly registry: SniperRegistry,
@@ -99,6 +112,33 @@ export class FeedSubscriber {
     }
   }
 
+  /**
+   * Replay alerts that fired while we were reconnecting.
+   *
+   * Best-effort by design: a failure here must never stop the stream we just re-established. The
+   * sniper being live on new alerts matters more than recovering one we may have missed.
+   */
+  private async catchUp(): Promise<void> {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/alerts?limit=50`);
+      if (!res.ok) return;
+      const body = (await res.json()) as Alert[] | { alerts?: Alert[] };
+      const alerts: Alert[] = Array.isArray(body) ? body : body.alerts ?? [];
+      const missed = selectCatchUp(alerts, this.seen, Date.now(), CATCHUP_MAX_AGE_MS);
+      if (missed.length === 0) return;
+      logger.warn(
+        { count: missed.length, tokens: missed.map((a) => a.swarm?.tokenSymbol ?? a.swarm?.token) },
+        'sniper feed: replaying alerts missed during the reconnect gap',
+      );
+      for (const a of missed) {
+        if (a.id) remember(this.seen, this.seenOrder, a.id, SEEN_CAP);
+        if (a.swarm?.token) void this.handle(a.swarm);
+      }
+    } catch (err) {
+      logger.warn({ err: String(err) }, 'sniper feed: catch-up failed (continuing)');
+    }
+  }
+
   private async loop(): Promise<void> {
     while (!this.stopped) {
       this.abort = new AbortController();
@@ -109,13 +149,22 @@ export class FeedSubscriber {
         });
         if (!res.ok || !res.body) throw new Error(`feed /events HTTP ${res.status}`);
         logger.info({ url: this.baseUrl }, 'sniper feed: connected');
-        this.reconnectMs = 1000;
+        // Reset to an IMMEDIATE first retry, not 1s. Railway kills this stream every 900s no matter
+        // what, so the overwhelmingly common "disconnect" is routine and expected — waiting a second
+        // before redialling turns a ~350ms handshake gap into ~1.35s of blindness, 96 times a day.
+        // Backoff still applies from the second consecutive failure, which is the real-outage case.
+        this.reconnectMs = 0;
         this.connected = true;
         this.lastDataAt = Date.now();
         if (this.feedDead) {
           this.feedDead = false;
           notifyBotState('feed-recovered', 'feed reconnected — sniper is live again');
         }
+        // A reconnect means we were blind for the gap. Replay anything that fired in it. Skipped on
+        // the very first connect, where seedLedger() has already read the same history for a
+        // different purpose (marking tokens seen, never buying).
+        if (this.hadConnection) await this.catchUp();
+        this.hadConnection = true;
         await this.consume(res.body);
       } catch (err) {
         this.connected = false;
@@ -126,8 +175,9 @@ export class FeedSubscriber {
         );
       }
       if (this.stopped) return;
-      await new Promise((r) => setTimeout(r, this.reconnectMs));
-      this.reconnectMs = Math.min(this.reconnectMs * 2, 30_000); // capped exponential backoff
+      if (this.reconnectMs > 0) await new Promise((r) => setTimeout(r, this.reconnectMs));
+      // 0 → 1s on the first failed retry, then capped exponential backoff.
+      this.reconnectMs = this.reconnectMs === 0 ? 1000 : Math.min(this.reconnectMs * 2, 30_000);
     }
   }
 
@@ -166,6 +216,8 @@ export class FeedSubscriber {
     }
     const swarm = alert?.swarm;
     if (!swarm?.token) return;
+    // Record before handling so a catch-up replay right after this can tell it was already seen.
+    if (alert.id) remember(this.seen, this.seenOrder, alert.id, SEEN_CAP);
     void this.handle(swarm);
   }
 
