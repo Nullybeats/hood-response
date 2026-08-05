@@ -118,6 +118,17 @@ export async function buildServer(
     lastBlock: store.metrics.lastBlock,
     rpcLatencyMs: store.metrics.rpcLatencyMs,
     totals: store.totals,
+    // Scan health. `lastBlock` is the chain head and advances regardless of
+    // whether we read it, so these are what actually say the feed is keeping
+    // up: cursorLag near 0 and consecutiveFailures 0 is healthy.
+    scan: {
+      cursor: store.metrics.cursor,
+      cursorLag: store.metrics.cursorLag,
+      consecutiveFailures: store.metrics.consecutiveFailures,
+      lastScanAt: store.metrics.lastScanAt,
+      skippedBlocks: store.metrics.skippedBlocks,
+      trackedTokens: store.tokensByAddress.size,
+    },
   }));
 
   // ── Stats / config ──────────────────────────────────────────────────────────

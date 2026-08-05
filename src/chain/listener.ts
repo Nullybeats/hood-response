@@ -20,6 +20,11 @@ export type SwapHandler = (e: SwapEvent) => void;
 export interface ChainListener {
   start(): void;
   stop(): void;
+  /** Resume scanning from a persisted cursor. Only the polling listener
+   *  implements durability; the simulator and WS variants ignore it. */
+  resumeAt?(cursor: number): void;
+  /** Last block fully scanned, for the durable snapshot. */
+  readonly cursor?: number;
 }
 
 /**
@@ -345,23 +350,56 @@ export class SimulatorChainListener implements ChainListener {
  * range via `eth_getLogs`, decoding them into swaps. This is what makes the bot
  * genuinely live without a paid streaming provider.
  */
+export type RpcFn = (method: string, params: unknown[]) => Promise<any>;
+
 export class HttpPollingChainListener implements ChainListener {
   private timer: NodeJS.Timeout | null = null;
   private stopped = false;
+  /** Last block FULLY scanned. Advances only when a range is completely processed. */
   private lastBlock = 0;
   private polling = false;
   private walletTopics: string[] = [];
   private pollCount = 0;
   private readonly enriching = new Set<string>();
   private static readonly MAX_RANGE = 5000;
+  /** Floor for the adaptive range; below this a shrink cannot help. */
+  private static readonly MIN_RANGE = 32;
   /** Heartbeat log cadence in polls (~every 60s at the default interval). */
   private readonly heartbeatEvery = Math.max(1, Math.round(60_000 / config.POLL_INTERVAL_MS));
+
+  // ── Scan health ────────────────────────────────────────────────────────────
+  private consecutiveFailures = 0;
+  private lastScanAt: number | null = null;
+  private skippedBlocks = 0;
+  /** Wall-clock until which polling is backed off after a failure. */
+  private backoffUntil = 0;
+  /**
+   * Adaptive range ceiling. A range the RPC cannot serve within the timeout
+   * would otherwise retry forever at the same width; halving on failure lets it
+   * find a width that works, and doubling on success restores throughput. This
+   * is what makes "never skip" terminate instead of stalling.
+   */
+  private rangeLimit = HttpPollingChainListener.MAX_RANGE;
+  /** Seeded from a durable snapshot before start(); null = begin at chain head. */
+  private resumeFrom: number | null = null;
 
   constructor(
     private readonly store: MemoryStore,
     private readonly price: PriceOracle,
     private readonly onSwap: SwapHandler,
+    /** Injectable transport, for tests. Defaults to the real JSON-RPC call. */
+    private readonly rpcFn?: RpcFn,
   ) {}
+
+  /** Resume the cursor from a persisted snapshot. Must be called before start(). */
+  resumeAt(cursor: number): void {
+    if (Number.isFinite(cursor) && cursor > 0) this.resumeFrom = Math.floor(cursor);
+  }
+
+  /** Last block fully scanned — what gets persisted. */
+  get cursor(): number {
+    return this.lastBlock;
+  }
 
   start(): void {
     this.stopped = false;
@@ -380,12 +418,102 @@ export class HttpPollingChainListener implements ChainListener {
 
   private async init(): Promise<void> {
     const head = await this.blockNumber();
-    this.lastBlock = head ?? 0;
-    this.store.updateMetrics({ wsConnected: head != null, lastBlock: this.lastBlock });
+    if (head == null) {
+      // No head yet: keep any resumed cursor and let poll() retry. Starting at 0
+      // here would make the first successful poll try to scan the entire chain.
+      this.lastBlock = this.resumeFrom ?? 0;
+      this.store.updateMetrics({ wsConnected: false, cursor: this.lastBlock });
+      this.timer = setInterval(() => void this.poll(), config.POLL_INTERVAL_MS);
+      return;
+    }
+
+    if (this.resumeFrom == null) {
+      // Cold start: begin at the head. Nothing before it was ever ours to scan.
+      this.lastBlock = head;
+      logger.info({ head }, 'listener: cold start at chain head');
+    } else if (this.resumeFrom >= head) {
+      // Snapshot from the future (chain reset, or a clock/rollback oddity).
+      this.lastBlock = head;
+      logger.warn(
+        { cursor: this.resumeFrom, head },
+        'listener: persisted cursor is ahead of head — restarting at head',
+      );
+    } else {
+      const lag = head - this.resumeFrom;
+      if (lag > config.FEED_MAX_BACKFILL_BLOCKS) {
+        // Bounded catch-up. Scanning days of blocks would pin the poller in the
+        // past while live alerts went unseen — so we clamp, and we say so.
+        this.lastBlock = head - config.FEED_MAX_BACKFILL_BLOCKS;
+        this.skippedBlocks = this.lastBlock - this.resumeFrom;
+        logger.warn(
+          { cursor: this.resumeFrom, head, lag, skipped: this.skippedBlocks, cap: config.FEED_MAX_BACKFILL_BLOCKS },
+          'listener: cursor too far behind — clamping backfill (blocks SKIPPED)',
+        );
+      } else {
+        this.lastBlock = this.resumeFrom;
+        logger.info({ cursor: this.resumeFrom, head, lag }, 'listener: resuming from persisted cursor');
+      }
+    }
+
+    this.store.updateMetrics({
+      wsConnected: true,
+      lastBlock: head,
+      cursor: this.lastBlock,
+      cursorLag: Math.max(0, head - this.lastBlock),
+      skippedBlocks: this.skippedBlocks,
+    });
     this.timer = setInterval(() => void this.poll(), config.POLL_INTERVAL_MS);
   }
 
+  /** Record a successful scan: clears backoff and widens the range again. */
+  private markSuccess(head: number): void {
+    this.consecutiveFailures = 0;
+    this.backoffUntil = 0;
+    this.lastScanAt = Date.now();
+    this.rangeLimit = Math.min(HttpPollingChainListener.MAX_RANGE, this.rangeLimit * 2);
+    this.store.updateMetrics({
+      cursor: this.lastBlock,
+      cursorLag: Math.max(0, head - this.lastBlock),
+      consecutiveFailures: 0,
+      lastScanAt: this.lastScanAt,
+    });
+  }
+
+  /**
+   * Record a failed scan. The cursor is NOT advanced, so the range is retried
+   * whole on the next poll. Backoff is bounded and the range is narrowed.
+   */
+  private markFailure(what: string, from?: number, to?: number): void {
+    this.consecutiveFailures += 1;
+    const delay = Math.min(
+      config.FEED_BACKOFF_MAX_MS,
+      config.FEED_BACKOFF_MIN_MS * 2 ** (this.consecutiveFailures - 1),
+    );
+    this.backoffUntil = Date.now() + delay;
+    if (from != null && to != null) {
+      this.rangeLimit = Math.max(
+        HttpPollingChainListener.MIN_RANGE,
+        Math.floor(this.rangeLimit / 2),
+      );
+    }
+    this.store.updateMetrics({
+      consecutiveFailures: this.consecutiveFailures,
+      cursor: this.lastBlock,
+    });
+    logger.warn(
+      {
+        what,
+        ...(from != null && to != null ? { retryRange: `${from}-${to}` } : {}),
+        consecutiveFailures: this.consecutiveFailures,
+        backoffMs: delay,
+        nextRangeLimit: this.rangeLimit,
+      },
+      'scan failed — cursor held, range will be retried',
+    );
+  }
+
   private async rpc(method: string, params: unknown[]): Promise<any> {
+    if (this.rpcFn) return this.rpcFn(method, params);
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 8000);
     try {
@@ -418,20 +546,40 @@ export class HttpPollingChainListener implements ChainListener {
     return Number(BigInt(r));
   }
 
+  /**
+   * One scan tick.
+   *
+   * The invariant, and the whole point of this method: **the cursor advances
+   * only after a range has been fetched AND processed in full.** It used to
+   * advance unconditionally, and because a failed `rpc()` returns null which
+   * `flatMap` folded into `[]`, an RPC timeout was indistinguishable from "no
+   * activity in these blocks". Every timeout permanently skipped its range —
+   * measured at 14 of 40 log lines on the Railway feed, 2026-08-05.
+   *
+   * Nothing is emitted before both log sets are known-good, so a retry of a
+   * failed range re-processes it exactly once rather than double-emitting the
+   * half that had already succeeded.
+   */
   private async poll(): Promise<void> {
     if (this.stopped || this.polling) return;
+    if (Date.now() < this.backoffUntil) return;
     this.polling = true;
     try {
       const head = await this.blockNumber();
       if (head == null) {
         this.store.updateMetrics({ wsConnected: false });
+        this.markFailure('eth_blockNumber');
         return;
       }
       this.store.updateMetrics({ wsConnected: true, lastBlock: head });
-      if (head <= this.lastBlock) return;
+      if (head <= this.lastBlock) {
+        // Caught up — a real success, so it clears any prior failure state.
+        this.markSuccess(head);
+        return;
+      }
 
       const from = this.lastBlock + 1;
-      const to = Math.min(head, from + HttpPollingChainListener.MAX_RANGE - 1);
+      const to = Math.min(head, from + this.rangeLimit - 1);
       const fromHex = '0x' + from.toString(16);
       const toHex = '0x' + to.toString(16);
       const base: Record<string, unknown> = config.DISCOVERY_MODE
@@ -447,25 +595,42 @@ export class HttpPollingChainListener implements ChainListener {
         ]) as Promise<EthLog[] | null>,
       ]);
 
+      // ATOMIC GATE. Both sides must be real arrays. A null (timeout, !res.ok,
+      // JSON-RPC error) or a non-array body from a proxy means we do not know
+      // what happened in these blocks — which is not the same as nothing having
+      // happened. Hold the cursor and retry the whole range.
+      if (!Array.isArray(buys) || !Array.isArray(sells)) {
+        this.markFailure('eth_getLogs', from, to);
+        return;
+      }
+
       const seen = new Set<string>();
       let hits = 0;
-      // A well-behaved node returns an array from eth_getLogs, but some RPCs /
-      // proxies can return a non-array result (e.g. {}). Coerce defensively so a
-      // bad response never throws "{} is not iterable" and kills the poll loop.
-      const logs = [buys, sells].flatMap((v) => (Array.isArray(v) ? (v as EthLog[]) : []));
+      const logs = [...(buys as EthLog[]), ...(sells as EthLog[])];
       for (const log of logs) {
         const key = `${log.transactionHash}:${(log as { logIndex?: string }).logIndex}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        const swap = await buildSwapFromLog(this.store, this.price, log, (a) =>
-          enrichToken(this.store, a, this.enriching),
-        );
-        if (swap) {
-          hits += 1;
-          this.onSwap(swap);
+        // One malformed log must not abort the range: an exception here would
+        // leave the cursor un-advanced with swaps already emitted, so the retry
+        // would re-emit them. Skip the bad log, keep the range atomic.
+        try {
+          const swap = await buildSwapFromLog(this.store, this.price, log, (a) =>
+            enrichToken(this.store, a, this.enriching),
+          );
+          if (swap) {
+            hits += 1;
+            this.onSwap(swap);
+          }
+        } catch (err) {
+          logger.warn(
+            { err: String(err), tx: log.transactionHash },
+            'scan: skipping undecodable log',
+          );
         }
       }
       this.lastBlock = to;
+      this.markSuccess(head);
 
       // Visible proof of life: log when a scan finds tracked-wallet activity,
       // and a periodic heartbeat so the logs show it is actively watching.
@@ -474,7 +639,12 @@ export class HttpPollingChainListener implements ChainListener {
         logger.info({ blocks: `${from}-${to}`, trackedWalletTxs: hits }, 'scan: tracked-wallet activity');
       } else if (this.pollCount % this.heartbeatEvery === 0) {
         logger.info(
-          { watchingWallets: this.walletTopics.length, block: to, totalSwaps: this.store.totals.swaps },
+          {
+            watchingWallets: this.walletTopics.length,
+            block: to,
+            cursorLag: Math.max(0, head - this.lastBlock),
+            totalSwaps: this.store.totals.swaps,
+          },
           'heartbeat: watching wallets, no new tracked-wallet buys/sells this window',
         );
       }

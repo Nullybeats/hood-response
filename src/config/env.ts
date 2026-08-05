@@ -95,6 +95,26 @@ const schema = z.object({
   // Fraction of simulated swarms that target a brand-new (unseen) token.
   SIM_DISCOVERY_CHANCE: num(0.4),
 
+  // ── Feed durability (see store/feedState.ts) ────────────────────────────────
+  // The HTTP listener's cursor and the discovered-token registry are the two
+  // pieces of state whose loss actually costs detection: without them a restart
+  // rescans from the chain head (losing every block in between) and re-discovers
+  // tokens from zero, so the feed is near-blind until the registry rebuilds.
+  // Point at a mounted Railway Volume (e.g. /data/feed-state.json); empty =
+  // in-memory only, which is the pre-existing behaviour.
+  FEED_STATE_PATH: z.string().default(''),
+  // How often the snapshot is written while running. The cursor also flushes on
+  // shutdown; this bounds the loss when the process dies without a signal.
+  FEED_STATE_SAVE_MS: num(30_000),
+  // Ceiling on catch-up after a long outage. A cursor further behind the head
+  // than this is clamped forward — scanning days of blocks at MAX_RANGE would
+  // pin the poller in the past for hours while live alerts went unseen. The
+  // skip is loud (logged + surfaced as a metric), never silent.
+  FEED_MAX_BACKFILL_BLOCKS: num(50_000),
+  // Backoff bounds applied after a failed scan, doubling per consecutive failure.
+  FEED_BACKOFF_MIN_MS: num(1_000),
+  FEED_BACKOFF_MAX_MS: num(30_000),
+
   ALERT_MIN_WALLETS: num(2),
   ALERT_WINDOW_SECONDS: num(300),
   ALERT_MIN_USD: num(0),

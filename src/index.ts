@@ -1,6 +1,7 @@
 import { config } from './config/env.js';
 import { logger } from './logger.js';
 import { MemoryStore } from './store/memory.js';
+import { loadFeedState, saveFeedState, toPersistedToken } from './store/feedState.js';
 import { PriceOracle } from './chain/price.js';
 import { createListener } from './chain/listener.js';
 import { Aggregator } from './engine/aggregator.js';
@@ -43,6 +44,31 @@ async function main(): Promise<void> {
 
   const store = new MemoryStore();
   await store.loadSettings();
+
+  // Durable feed state. Restored BEFORE the price oracle is constructed, since
+  // the oracle is seeded from the token map — a registry restored after it would
+  // leave every recovered token unpriced until the next refresh.
+  const feedState = await loadFeedState(config.FEED_STATE_PATH);
+  let resumeCursor: number | null = null;
+  if (feedState) {
+    const added = store.importTokens(feedState.tokens);
+    store.restoreHistory(feedState.swarms, feedState.alerts);
+    resumeCursor = feedState.cursor;
+    logger.info(
+      {
+        cursor: feedState.cursor,
+        tokensRestored: added,
+        swarms: feedState.swarms.length,
+        alerts: feedState.alerts.length,
+        ageSeconds: feedState.savedAt ? Math.round((Date.now() - feedState.savedAt) / 1000) : null,
+        path: config.FEED_STATE_PATH,
+      },
+      'feed state: restored snapshot',
+    );
+  } else if (config.FEED_STATE_PATH) {
+    logger.info({ path: config.FEED_STATE_PATH }, 'feed state: no usable snapshot — cold start');
+  }
+
   const price = new PriceOracle([...store.tokensByAddress.values()], store);
   price.start();
   const aggregator = new Aggregator(store, price);
@@ -311,7 +337,26 @@ async function main(): Promise<void> {
   };
 
   const listener = createListener(store, price, (swap) => void handleSwap(swap));
+  if (resumeCursor != null) listener.resumeAt?.(resumeCursor);
   listener.start();
+
+  // Periodic snapshot. The cursor is the part that matters — a process killed
+  // without a signal (OOM, platform restart) never reaches shutdown(), and the
+  // gap between the last write and the death is the only window still lost.
+  const persistFeedState = async (): Promise<void> => {
+    if (!config.FEED_STATE_PATH) return;
+    const history = store.exportHistory();
+    await saveFeedState(config.FEED_STATE_PATH, {
+      cursor: listener.cursor ?? 0,
+      tokens: store.exportDiscoveredTokens().map(toPersistedToken),
+      swarms: history.swarms,
+      alerts: history.alerts,
+    });
+  };
+  const feedStateTimer = config.FEED_STATE_PATH
+    ? setInterval(() => void persistFeedState(), config.FEED_STATE_SAVE_MS)
+    : null;
+  feedStateTimer?.unref();
 
   const app = await buildServer(store, engine, aggregator, performance, sniper);
   await app.listen({ port: config.PORT, host: config.HOST });
@@ -326,6 +371,10 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info({ signal }, 'shutting down gracefully');
     listener.stop();
+    if (feedStateTimer) clearInterval(feedStateTimer);
+    // Flush the cursor before anything else can take time — this is the write
+    // that decides whether the restart resumes or rescans from the head.
+    await persistFeedState().catch(() => undefined);
     price.stop();
     performance.stop();
     feed.stop();
