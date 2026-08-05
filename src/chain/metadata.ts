@@ -1,4 +1,5 @@
 import type { TrackedToken } from '../types.js';
+import { logHttpFailure, logRpcError, logRpcThrow } from './rpcLog.js';
 
 /**
  * Best-effort ERC-20 metadata reader over HTTP JSON-RPC (`eth_call`).
@@ -29,10 +30,19 @@ async function ethCall(rpcUrl: string, to: string, data: string): Promise<string
       }),
       signal: ctrl.signal,
     });
-    if (!res.ok) return null;
-    const json = (await res.json()) as { result?: string };
+    const ctx = { op: 'metadata', url: rpcUrl, method: 'eth_call' };
+    if (!res.ok) {
+      logHttpFailure(ctx, res.status, res.statusText);
+      return null;
+    }
+    const json = (await res.json()) as { result?: string; error?: unknown };
+    if (json.error) {
+      logRpcError(ctx, json.error);
+      return null;
+    }
     return json.result ?? null;
-  } catch {
+  } catch (err) {
+    logRpcThrow({ op: 'metadata', url: rpcUrl, method: 'eth_call' }, err);
     return null;
   } finally {
     clearTimeout(t);

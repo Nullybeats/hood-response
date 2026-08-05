@@ -14,6 +14,7 @@ import {
 } from './decoder.js';
 import { fetchTokenMetadata } from './metadata.js';
 import { receiptConfirmsSwap, receiptDiagnostic } from './receipt.js';
+import { logHttpFailure, logRpcError, logRpcThrow, rpcHost } from './rpcLog.js';
 
 export type SwapHandler = (e: SwapEvent) => void;
 
@@ -124,7 +125,8 @@ export class LiveChainListener implements ChainListener {
   private connect(): void {
     if (this.stopped) return;
     const url = config.CHAIN_WS_URL;
-    logger.info({ url }, 'connecting to Robinhood Chain RPC');
+    // Host only: a WSS endpoint can carry its API key in the path.
+    logger.info({ host: rpcHost(url) }, 'connecting to Robinhood Chain RPC');
     const ws = new WebSocket(url);
     this.ws = ws;
 
@@ -405,7 +407,7 @@ export class HttpPollingChainListener implements ChainListener {
     this.stopped = false;
     this.walletTopics = [...this.store.wallets.keys()].map(addressToTopic);
     this.store.updateMetrics({ mode: 'live' });
-    logger.info({ rpc: config.CHAIN_HTTP_URL }, 'HTTP polling listener started');
+    logger.info({ host: rpcHost(config.CHAIN_HTTP_URL) }, 'HTTP polling listener started');
     void this.init();
   }
 
@@ -514,6 +516,18 @@ export class HttpPollingChainListener implements ChainListener {
 
   private async rpc(method: string, params: unknown[]): Promise<any> {
     if (this.rpcFn) return this.rpcFn(method, params);
+    // Range, when this is a log query — so a failure says WHICH blocks were lost.
+    const p0 = params[0] as { fromBlock?: string; toBlock?: string } | undefined;
+    const range =
+      p0?.fromBlock && p0?.toBlock
+        ? `${Number(BigInt(p0.fromBlock))}-${Number(BigInt(p0.toBlock))}`
+        : undefined;
+    const ctx = {
+      op: method === 'eth_getLogs' ? 'logs' : 'chain',
+      url: config.CHAIN_HTTP_URL,
+      method,
+      ...(range ? { range } : {}),
+    };
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 8000);
     try {
@@ -523,15 +537,20 @@ export class HttpPollingChainListener implements ChainListener {
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
         signal: ctrl.signal,
       });
-      if (!res.ok) return null;
+      // A 429 here is the single most consequential failure this service has,
+      // and it used to return null with no trace at all.
+      if (!res.ok) {
+        logHttpFailure(ctx, res.status, res.statusText);
+        return null;
+      }
       const json = (await res.json()) as { result?: unknown; error?: unknown };
       if (json.error) {
-        logger.warn({ method, error: json.error }, 'rpc error');
+        logRpcError(ctx, json.error);
         return null;
       }
       return json.result ?? null;
     } catch (err) {
-      logger.warn({ method, err: String(err) }, 'rpc call failed');
+      logRpcThrow(ctx, err);
       return null;
     } finally {
       clearTimeout(t);
