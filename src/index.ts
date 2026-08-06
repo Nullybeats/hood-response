@@ -5,6 +5,7 @@ import { loadFeedState, saveFeedState, toPersistedToken } from './store/feedStat
 import { PriceOracle } from './chain/price.js';
 import { createListener } from './chain/listener.js';
 import { HyperSyncShadow } from './chain/shadow.js';
+import { AttributionShadow } from './attrib/runtime.js';
 import { Aggregator } from './engine/aggregator.js';
 import { AlertEngine } from './engine/alertEngine.js';
 import { attachPersistence } from './store/persistence.js';
@@ -352,6 +353,12 @@ async function main(): Promise<void> {
   const shadow = new HyperSyncShadow([...store.wallets.keys()]);
   shadow.start();
 
+  // A second, durable measurement lane.  It is default-off and has no path
+  // into handleSwap/alerts/sniper; it exists solely to account for what the
+  // live detector did and did not observe.
+  const attribution = new AttributionShadow([...store.wallets.keys()]);
+  attribution.start();
+
   // Periodic snapshot. The cursor is the part that matters — a process killed
   // without a signal (OOM, platform restart) never reaches shutdown(), and the
   // gap between the last write and the death is the only window still lost.
@@ -370,7 +377,7 @@ async function main(): Promise<void> {
     : null;
   feedStateTimer?.unref();
 
-  const app = await buildServer(store, engine, aggregator, performance, sniper, shadow);
+  const app = await buildServer(store, engine, aggregator, performance, sniper, shadow, attribution);
   await app.listen({ port: config.PORT, host: config.HOST });
   logger.info(
     { url: `http://${config.HOST}:${config.PORT}`, wallets: store.wallets.size },
@@ -384,6 +391,7 @@ async function main(): Promise<void> {
     logger.info({ signal }, 'shutting down gracefully');
     listener.stop();
     shadow.stop();
+    attribution.stop();
     if (feedStateTimer) clearInterval(feedStateTimer);
     // Flush the cursor before anything else can take time — this is the write
     // that decides whether the restart resumes or rescans from the head.

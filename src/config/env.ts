@@ -144,6 +144,13 @@ const schema = z.object({
   // quietly recording nothing — an empty ledger and an idle chain must never
   // look the same.
   ATTRIB_LEDGER_PATH: z.string().default(''),
+  // Default-off runtime switch.  A ledger path alone is not permission to add a
+  // new chain reader on a deployed feed; enable the shadow explicitly after its
+  // volume and credentials are configured.
+  ATTRIB_ENABLED: bool(false),
+  ATTRIB_INTERVAL_MS: num(10_000),
+  ATTRIB_INITIAL_BACKFILL_BLOCKS: num(30_000),
+  ATTRIB_BATCH_SIZE: num(250),
   // Rows older than this are prunable. Failures are NEVER auto-pruned: they are
   // the record of what we could not see, which is the point.
   ATTRIB_RETENTION_BLOCKS: num(2_000_000),

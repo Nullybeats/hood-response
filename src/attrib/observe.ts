@@ -2,6 +2,7 @@ import { logger } from '../logger.js';
 import { addressToTopic, TRANSFER_TOPIC } from '../chain/decoder.js';
 import type { HsLog, HsTransaction, HyperSyncClient } from '../chain/hypersync.js';
 import type { AttributionLedger } from './ledger.js';
+import { checkContinuity } from './finality.js';
 
 /**
  * The observation layer: establish the COVERAGE UNIVERSE.
@@ -79,6 +80,17 @@ async function observeTxSide(
     (res) => (res.data ?? []).flatMap((d) => d.transactions ?? []),
   );
   if (!r) return null;
+  const continuity = checkContinuity(ledger, streamId, r.firstGuard);
+  if (!continuity.ok) {
+    ledger.rollbackTo(
+      streamId,
+      continuity.brokenAt!,
+      continuity.expectedHash ?? null,
+      continuity.actualParentHash ?? null,
+    );
+    logger.warn({ streamId, brokenAt: continuity.brokenAt }, 'observe: reorg detected — rolled back before writing');
+    return null;
+  }
 
   let written = 0;
   for (const t of r.items as HsTransaction[]) {
@@ -156,6 +168,17 @@ export async function observeTransferLogs(
     ['topic0', 'topic1', 'topic2', 'block_number', 'transaction_hash', 'address', 'log_index'],
   );
   if (!r) return null;
+  const continuity = checkContinuity(ledger, STREAM_TRANSFERS, r.firstGuard);
+  if (!continuity.ok) {
+    ledger.rollbackTo(
+      STREAM_TRANSFERS,
+      continuity.brokenAt!,
+      continuity.expectedHash ?? null,
+      continuity.actualParentHash ?? null,
+    );
+    logger.warn({ streamId: STREAM_TRANSFERS, brokenAt: continuity.brokenAt }, 'observe: reorg detected — rolled back before writing');
+    return null;
+  }
 
   let written = 0;
   for (const l of r.items as HsLog[]) {

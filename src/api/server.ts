@@ -12,6 +12,7 @@ import type { Aggregator } from '../engine/aggregator.js';
 import type { PerformanceTracker } from '../engine/performance.js';
 import type { SniperRegistry } from '../sniper/registry.js';
 import type { HyperSyncShadow } from '../chain/shadow.js';
+import type { AttributionShadow } from '../attrib/runtime.js';
 import { addressOfPrivateKey } from '../sniper/executor.js';
 import { configuredChannels, dispatch } from '../notify/index.js';
 import { walletId } from '../walletId.js';
@@ -106,6 +107,7 @@ export async function buildServer(
   performance?: PerformanceTracker,
   sniper?: SniperRegistry,
   shadow?: HyperSyncShadow,
+  attribution?: AttributionShadow,
 ): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
   await app.register(cors, { origin: true });
@@ -149,6 +151,16 @@ export async function buildServer(
       note: 'swap-cooccurrence = a V3/V4 Swap event shares the transaction; it is evidence, not proof',
       live: { swaps: store.totals.swaps, swarms: store.totals.swarms, alerts: store.totals.alerts },
     };
+  });
+
+  // ── Attribution accounting (aggregate, measurement-only) ─────────────────
+  // This endpoint intentionally exposes no tx hashes or wallet addresses. The
+  // ledger is an audit tool, not a new public wallet-tracking feed; aggregate
+  // numbers are enough to distinguish ingestion failure, unsupported venues,
+  // and genuinely quiet wallets without deanonymising the watched set.
+  app.get('/api/attrib', async () => {
+    if (!attribution) return { enabled: false, reason: 'attribution shadow not constructed' };
+    return { status: attribution.status(), report: attribution.report() };
   });
 
   // ── Stats / config ──────────────────────────────────────────────────────────

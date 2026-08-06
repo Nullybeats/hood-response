@@ -46,7 +46,7 @@ type DatabaseSync = InstanceType<typeof DatabaseSync>;
  */
 
 /** Bumped when the schema changes; recorded via `PRAGMA user_version`. */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const sqlList = (vals: string[]): string => vals.map((v) => `'${v}'`).join(',');
 const OUTCOMES = sqlList([...new Set(Object.values(OUTCOME_OF))]);
@@ -117,8 +117,19 @@ export interface AccountedFor {
   drift: number;
 }
 
+/** One canonical `(tx, wallet)` observation awaiting attribution. */
+export interface UnsettledObservation {
+  txHash: string;
+  wallet: string;
+  blockNumber: number;
+  logIndex: number;
+  triggerSource: 'transfer_log' | 'tx_sender' | 'tx_recipient' | 'trace';
+  token: string | null;
+}
+
 export class AttributionLedger {
   private readonly db: DatabaseSync | null;
+  private txDepth = 0;
   /** True when persistence is OFF — surfaced so an empty ledger is never read
    *  as a quiet chain. */
   readonly degraded: boolean;
@@ -257,6 +268,44 @@ export class AttributionLedger {
         attributions_removed INTEGER NOT NULL
       );
 
+      -- ENRICHMENT STATE, per pair. What we have FETCHED, as distinct from what
+      -- we have CONCLUDED.
+      --
+      -- Without this a restart cannot tell "receipt fetched, classifier ran,
+      -- verdict is unknown" from "receipt never fetched" — both look like an
+      -- absent attribution. The first is settled work; the second is a gap, and
+      -- re-fetching the first wastes the rate limit we are trying to protect.
+      CREATE TABLE IF NOT EXISTS attrib_enrichment (
+        tx_hash TEXT NOT NULL,
+        watched_wallet TEXT NOT NULL,
+        receipt_fetched INTEGER NOT NULL DEFAULT 0 CHECK (receipt_fetched IN (0,1)),
+        pools_seen INTEGER NOT NULL DEFAULT 0,
+        pools_unresolved INTEGER NOT NULL DEFAULT 0,
+        classifier_version INTEGER,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (tx_hash, watched_wallet)
+      );
+
+      -- DURABLE single-flight for pool verification.
+      --
+      -- The in-process coalescing map dies with the process. Across a restart,
+      -- a pool that was mid-verification would be requested again by every
+      -- pair referencing it — the same stampede, just once per boot. This table
+      -- is what makes "one queued verification per unknown pool" survive.
+      --
+      -- state 'pending' is NEVER a conclusion: it is cleared and retried. Only
+      -- 'verified'/'unverified' are settled answers about an immutable fact.
+      CREATE TABLE IF NOT EXISTS attrib_pool_verification (
+        pool TEXT PRIMARY KEY,
+        protocol TEXT,
+        state TEXT NOT NULL CHECK (state IN ('pending','verified','unverified')),
+        reason TEXT,
+        evidence_json TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        first_seen_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS attrib_cursor (
         stream_id TEXT PRIMARY KEY,
         covered_through_block INTEGER NOT NULL,
@@ -268,6 +317,7 @@ export class AttributionLedger {
       CREATE INDEX IF NOT EXISTS idx_obs_block ON attrib_observation (block_number);
       CREATE INDEX IF NOT EXISTS idx_hit_sig ON attrib_protocol_hit (event_sig, verified);
       CREATE INDEX IF NOT EXISTS idx_failure_kind ON attrib_failure (failure_kind, at);
+      CREATE INDEX IF NOT EXISTS idx_pool_state ON attrib_pool_verification (state);
     `);
     this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     logger.info({ schemaVersion: SCHEMA_VERSION }, 'attrib: ledger open');
@@ -277,10 +327,27 @@ export class AttributionLedger {
     this.db?.close();
   }
 
-  /** Run a unit of work atomically. Multi-table writes must not half-apply. */
+  /**
+   * Run a unit of work atomically. Multi-table writes must not half-apply.
+   *
+   * NESTING-SAFE: an inner call JOINS the outer transaction rather than opening
+   * a second one (SQLite would throw) or committing early. That matters because
+   * the per-pair settle wraps helpers like `recordAttribution` which are
+   * themselves transactional — an inner COMMIT would publish a half-written
+   * pair, which is exactly the atomicity this exists to provide.
+   */
   transaction<T>(fn: () => T): T {
     if (!this.db) return fn();
+    if (this.txDepth > 0) {
+      this.txDepth += 1;
+      try {
+        return fn();
+      } finally {
+        this.txDepth -= 1;
+      }
+    }
     this.db.exec('BEGIN IMMEDIATE');
+    this.txDepth = 1;
     try {
       const out = fn();
       this.db.exec('COMMIT');
@@ -288,6 +355,8 @@ export class AttributionLedger {
     } catch (err) {
       this.db.exec('ROLLBACK');
       throw err;
+    } finally {
+      this.txDepth = 0;
     }
   }
 
@@ -388,7 +457,7 @@ export class AttributionLedger {
    * deleted, so a pair that later resolves still shows it took N attempts and
    * why — both the failure record and the eventual classification survive.
    */
-  markPending(key: ObservationKey, reason: FailureCategory): void {
+  markPending(key: ObservationKey, reason: FailureCategory | 'verification_pending'): void {
     if (!this.db) return;
     const now = Date.now();
     this.db
@@ -411,6 +480,188 @@ export class AttributionLedger {
          ORDER BY attempts ASC, last_failed_at ASC LIMIT ?`,
       )
       .all(limit) as unknown as { tx_hash: string; watched_wallet: string; attempts: number }[];
+  }
+
+  /**
+   * Has this pair already reached a verdict at this classifier version?
+   *
+   * The restart-idempotency check. A re-run must not write a second attribution
+   * for settled work, and must not spend the rate limit re-fetching its receipt.
+   */
+  isAttributed(key: ObservationKey, classifierVersion: number): boolean {
+    if (!this.db) return false;
+    const r = this.db
+      .prepare(
+        `SELECT 1 FROM attrib_attribution
+         WHERE tx_hash = ? AND watched_wallet = ? AND classifier_version = ?`,
+      )
+      .get(key.txHash.toLowerCase(), key.wallet.toLowerCase(), classifierVersion);
+    return r != null;
+  }
+
+  /** Enrichment progress for a pair, so a restart knows what it already fetched. */
+  recordEnrichment(
+    key: ObservationKey,
+    e: { receiptFetched: boolean; poolsSeen: number; poolsUnresolved: number; classifierVersion?: number },
+  ): void {
+    if (!this.db) return;
+    this.db
+      .prepare(
+        `INSERT INTO attrib_enrichment
+         (tx_hash, watched_wallet, receipt_fetched, pools_seen, pools_unresolved,
+          classifier_version, updated_at)
+         VALUES (?,?,?,?,?,?,?)
+         ON CONFLICT(tx_hash, watched_wallet) DO UPDATE SET
+           receipt_fetched = excluded.receipt_fetched,
+           pools_seen = excluded.pools_seen,
+           pools_unresolved = excluded.pools_unresolved,
+           classifier_version = excluded.classifier_version,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        key.txHash.toLowerCase(),
+        key.wallet.toLowerCase(),
+        e.receiptFetched ? 1 : 0,
+        e.poolsSeen,
+        e.poolsUnresolved,
+        e.classifierVersion ?? null,
+        Date.now(),
+      );
+  }
+
+  enrichment(key: ObservationKey): {
+    receipt_fetched: number;
+    pools_seen: number;
+    pools_unresolved: number;
+  } | null {
+    if (!this.db) return null;
+    return (this.db
+      .prepare(
+        `SELECT receipt_fetched, pools_seen, pools_unresolved FROM attrib_enrichment
+         WHERE tx_hash = ? AND watched_wallet = ?`,
+      )
+      .get(key.txHash.toLowerCase(), key.wallet.toLowerCase()) ?? null) as unknown as {
+      receipt_fetched: number;
+      pools_seen: number;
+      pools_unresolved: number;
+    } | null;
+  }
+
+  /**
+   * Claim the right to verify a pool. Returns false when someone already holds
+   * it or the answer is already settled.
+   *
+   * DURABLE single-flight: the in-process coalescing map dies with the process,
+   * so without this a restart re-requests every pool that was mid-flight — the
+   * same stampede, once per boot.
+   */
+  claimPoolVerification(pool: string): boolean {
+    if (!this.db) return true;
+    const p = pool.toLowerCase();
+    const now = Date.now();
+    const r = this.db
+      .prepare(
+        `INSERT INTO attrib_pool_verification (pool, state, attempts, first_seen_at, updated_at)
+         VALUES (?, 'pending', 1, ?, ?)
+         ON CONFLICT(pool) DO NOTHING`,
+      )
+      .run(p, now, now);
+    return Number(r.changes) > 0;
+  }
+
+  poolVerificationState(pool: string): 'pending' | 'verified' | 'unverified' | null {
+    if (!this.db) return null;
+    const r = this.db
+      .prepare('SELECT state FROM attrib_pool_verification WHERE pool = ?')
+      .get(pool.toLowerCase()) as unknown as { state: string } | undefined;
+    return (r?.state as 'pending' | 'verified' | 'unverified') ?? null;
+  }
+
+  /**
+   * Record a verification outcome.
+   *
+   * A `pending` result bumps attempts and stays claimed — it is not an answer.
+   * Only verified/unverified settle the row.
+   */
+  resolvePoolVerification(
+    pool: string,
+    state: 'pending' | 'verified' | 'unverified',
+    protocol: string | null,
+    reason: string,
+    evidence: unknown,
+  ): void {
+    if (!this.db) return;
+    const p = pool.toLowerCase();
+    if (state === 'pending') {
+      this.db
+        .prepare(
+          `UPDATE attrib_pool_verification
+           SET attempts = attempts + 1, reason = ?, updated_at = ? WHERE pool = ?`,
+        )
+        .run(reason, Date.now(), p);
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO attrib_pool_verification
+         (pool, protocol, state, reason, evidence_json, attempts, first_seen_at, updated_at)
+         VALUES (?,?,?,?,?,1,?,?)
+         ON CONFLICT(pool) DO UPDATE SET
+           protocol = excluded.protocol, state = excluded.state,
+           reason = excluded.reason, evidence_json = excluded.evidence_json,
+           updated_at = excluded.updated_at`,
+      )
+      .run(p, protocol, state, reason, JSON.stringify(evidence ?? null), Date.now(), Date.now());
+  }
+
+  /** Pools with a settled `verified` answer — safe as `verifiedContracts`. */
+  verifiedPools(): Set<string> {
+    if (!this.db) return new Set();
+    const rows = this.db
+      .prepare("SELECT pool FROM attrib_pool_verification WHERE state = 'verified'")
+      .all() as unknown as { pool: string }[];
+    return new Set(rows.map((r) => r.pool));
+  }
+
+  /** Pools still awaiting an answer — `pendingContracts`, never `unsupported`. */
+  pendingPools(): Set<string> {
+    if (!this.db) return new Set();
+    const rows = this.db
+      .prepare("SELECT pool FROM attrib_pool_verification WHERE state = 'pending'")
+      .all() as unknown as { pool: string }[];
+    return new Set(rows.map((r) => r.pool));
+  }
+
+  poolVerificationStats(): { verified: number; unverified: number; pending: number } {
+    const out = { verified: 0, unverified: 0, pending: 0 };
+    if (!this.db) return out;
+    const rows = this.db
+      .prepare('SELECT state, COUNT(*) AS n FROM attrib_pool_verification GROUP BY state')
+      .all() as unknown as { state: string; n: number }[];
+    for (const r of rows) {
+      if (r.state === 'verified') out.verified = r.n;
+      else if (r.state === 'unverified') out.unverified = r.n;
+      else out.pending = r.n;
+    }
+    return out;
+  }
+
+  /**
+   * The block a pending pair sits at, so the cursor can be held behind it.
+   *
+   * MIN, not MAX: a pair may be observed by several streams at different
+   * blocks, and the cursor must be held behind the EARLIEST of them or the
+   * later stream's cursor would advance past unresolved work.
+   */
+  pendingBlock(txHash: string, wallet: string): number | null {
+    if (!this.db) return null;
+    const r = this.db
+      .prepare(
+        `SELECT MIN(block_number) AS b FROM attrib_observation
+         WHERE tx_hash = ? AND watched_wallet = ?`,
+      )
+      .get(txHash.toLowerCase(), wallet.toLowerCase()) as unknown as { b: number | null } | undefined;
+    return r?.b ?? null;
   }
 
   recordEmission(
@@ -553,8 +804,72 @@ export class AttributionLedger {
       )
       .get() as unknown as { b: number | null } | undefined;
     const oldestPending = row?.b ?? null;
-    if (oldestPending == null) return streams;
-    return Math.min(streams, oldestPending - 1);
+    // Observation and cursor advancement occur in different operations: a
+    // process can die after recording an observation but before the ingester
+    // writes either its attribution or retriable pending marker.  Treat that
+    // "drift" as a cursor hold, not merely a metric, or a restart would start
+    // after work the ledger knows it never finished.
+    const drift = this.db
+      .prepare(
+        `SELECT MIN(o.block_number) AS b FROM attrib_observation o
+         WHERE NOT EXISTS (
+           SELECT 1 FROM attrib_attribution a
+           WHERE a.tx_hash = o.tx_hash AND a.watched_wallet = o.watched_wallet
+         ) AND NOT EXISTS (
+           SELECT 1 FROM attrib_pending p
+           WHERE p.tx_hash = o.tx_hash AND p.watched_wallet = o.watched_wallet
+         )`,
+      )
+      .get() as unknown as { b: number | null } | undefined;
+    const oldestDrift = drift?.b ?? null;
+    const heldAt = [oldestPending, oldestDrift].filter((b): b is number => b != null);
+    if (heldAt.length === 0) return streams;
+    return Math.min(streams, Math.min(...heldAt) - 1);
+  }
+
+  /**
+   * Canonical pairs that need the current classifier version.  We select one
+   * representative observation for each pair because log indices are
+   * provenance, not the unit of economic truth.
+   */
+  unsettledObservations(
+    classifierVersion: number,
+    limit = 500,
+    beforeBlockExclusive?: number,
+  ): UnsettledObservation[] {
+    if (!this.db) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT o.tx_hash, o.watched_wallet, MIN(o.block_number) AS block_number,
+                MIN(o.log_index) AS log_index, MIN(o.trigger_source) AS trigger_source,
+                MIN(o.token) AS token
+         FROM attrib_observation o
+         WHERE (? IS NULL OR o.block_number < ?)
+           AND NOT EXISTS (
+           SELECT 1 FROM attrib_attribution a
+           WHERE a.tx_hash = o.tx_hash AND a.watched_wallet = o.watched_wallet
+             AND a.classifier_version = ?
+         )
+         GROUP BY o.tx_hash, o.watched_wallet
+         ORDER BY block_number ASC
+         LIMIT ?`,
+      )
+      .all(beforeBlockExclusive ?? null, beforeBlockExclusive ?? null, classifierVersion, limit) as unknown as {
+        tx_hash: string;
+        watched_wallet: string;
+        block_number: number;
+        log_index: number;
+        trigger_source: UnsettledObservation['triggerSource'];
+        token: string | null;
+      }[];
+    return rows.map((r) => ({
+      txHash: r.tx_hash,
+      wallet: r.watched_wallet,
+      blockNumber: r.block_number,
+      logIndex: r.log_index,
+      triggerSource: r.trigger_source,
+      token: r.token,
+    }));
   }
 
   // ── Readers ────────────────────────────────────────────────────────────────
@@ -567,6 +882,22 @@ export class AttributionLedger {
          WHERE classifier_version = ? GROUP BY outcome, category ORDER BY n DESC`,
       )
       .all(classifierVersion) as unknown as CoverageRow[];
+  }
+
+  /** Category totals constrained to the report's observed block window. */
+  coverageRange(classifierVersion: number, fromBlock: number, toBlock: number): CoverageRow[] {
+    if (!this.db) return [];
+    return this.db
+      .prepare(
+        `SELECT a.outcome, a.category, COUNT(*) AS n
+         FROM attrib_attribution a
+         WHERE a.classifier_version = ?
+           AND EXISTS (SELECT 1 FROM attrib_observation o
+             WHERE o.tx_hash = a.tx_hash AND o.watched_wallet = a.watched_wallet
+               AND o.block_number >= ? AND o.block_number <= ?)
+         GROUP BY a.outcome, a.category ORDER BY n DESC`,
+      )
+      .all(classifierVersion, fromBlock, toBlock) as unknown as CoverageRow[];
   }
 
   /** Unclaimed OR unverified signatures, ranked — the adapter work queue. */
@@ -783,26 +1114,45 @@ export class AttributionLedger {
    * "how many LIVE SIGNALS would change", which is the number the decision
    * actually rests on.
    */
-  traceGapRows(classifierVersion: number): { evidence_json: string; liveEmitted: number }[] {
+  traceGapRows(
+    classifierVersion: number,
+    fromBlock?: number,
+    toBlock?: number,
+  ): { evidence_json: string; liveEmitted: number }[] {
     if (!this.db) return [];
+    const inRange = fromBlock != null && toBlock != null;
     return this.db
       .prepare(
         `SELECT a.evidence_json AS evidence_json,
                 EXISTS (SELECT 1 FROM attrib_emission e
                   WHERE e.tx_hash = a.tx_hash AND e.watched_wallet = a.watched_wallet) AS liveEmitted
          FROM attrib_attribution a
-         WHERE a.classifier_version = ? AND a.category = 'insufficient_trace_data'`,
+         WHERE a.classifier_version = ? AND a.category = 'insufficient_trace_data'
+           AND (? = 0 OR EXISTS (SELECT 1 FROM attrib_observation o
+             WHERE o.tx_hash = a.tx_hash AND o.watched_wallet = a.watched_wallet
+               AND o.block_number >= ? AND o.block_number <= ?))`,
       )
-      .all(classifierVersion) as unknown as { evidence_json: string; liveEmitted: number }[];
+      .all(classifierVersion, inRange ? 1 : 0, fromBlock ?? 0, toBlock ?? 0) as unknown as {
+        evidence_json: string;
+        liveEmitted: number;
+      }[];
   }
 
   /** How many attributed pairs the live listener also emitted a swap for. */
-  liveEmittedCount(): number {
+  liveEmittedCount(fromBlock?: number, toBlock?: number): number {
     if (!this.db) return 0;
+    const inRange = fromBlock != null && toBlock != null;
     return (
       this.db
-        .prepare('SELECT COUNT(*) AS n FROM (SELECT DISTINCT tx_hash, watched_wallet FROM attrib_emission)')
-        .get() as unknown as { n: number }
+        .prepare(
+          `SELECT COUNT(*) AS n FROM (
+             SELECT DISTINCT e.tx_hash, e.watched_wallet FROM attrib_emission e
+             WHERE (? = 0 OR EXISTS (SELECT 1 FROM attrib_observation o
+               WHERE o.tx_hash = e.tx_hash AND o.watched_wallet = e.watched_wallet
+                 AND o.block_number >= ? AND o.block_number <= ?))
+           )`,
+        )
+        .get(inRange ? 1 : 0, fromBlock ?? 0, toBlock ?? 0) as unknown as { n: number }
     ).n;
   }
 

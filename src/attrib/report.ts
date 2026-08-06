@@ -177,7 +177,7 @@ export function buildReport(input: BuildReportInput): AccountingReport {
   const cv = input.classifierVersion ?? CLASSIFIER_VERSION;
   const { ledger } = input;
   const a = ledger.accountedForRange(cv, input.fromBlock, input.toBlock);
-  const byCategory = ledger.coverage(cv);
+  const byCategory = ledger.coverageRange(cv, input.fromBlock, input.toBlock);
   const total = byCategory.reduce((s, r) => s + r.n, 0);
   const trades = byCategory
     .filter((r) => r.outcome === 'confirmed_trade')
@@ -192,6 +192,7 @@ export function buildReport(input: BuildReportInput): AccountingReport {
   const failures = ledger.failureRates();
   const denom = a.attributed + a.pending + a.drift;
   const usable = tracesUsable(input.traceMatrix);
+  const traceProbed = input.traceMatrix.length > 0;
 
   const catCount = (c: Category): number =>
     byCategory.filter((r) => r.category === c).reduce((s, r) => s + r.n, 0);
@@ -201,7 +202,9 @@ export function buildReport(input: BuildReportInput): AccountingReport {
 
   const caveats: string[] = [
     'SCOPE: top-level transaction coverage (sender + recipient) plus ERC-20 Transfer-log coverage. Not "full coverage".',
-    usable
+    !traceProbed
+      ? 'Trace capability has not been probed for this source. Native/internal value flow must remain unproven; do not read this as trace support being unavailable.'
+      : usable
       ? 'Traces are available on this source; native/internal flow is resolvable.'
       : 'Traces are UNAVAILABLE on this source, so native/internal value flow is PERMANENTLY unprovable here. `insufficient_trace_data` is a structural floor, not a backlog.',
     'These are ACCOUNTING COVERAGE numbers. They are not trade recall and not precision — neither is measurable without an independently adjudicated set.',
@@ -244,7 +247,7 @@ export function buildReport(input: BuildReportInput): AccountingReport {
   return {
     scope:
       'top-level transaction coverage (sender + recipient) + ERC-20 Transfer-log coverage; trace coverage: ' +
-      (usable ? 'available' : 'unavailable'),
+      (!traceProbed ? 'not probed' : usable ? 'available' : 'unavailable'),
     classifierVersion: cv,
     window: { fromBlock: input.fromBlock, toBlock: input.toBlock },
     observed: a.pairs,
