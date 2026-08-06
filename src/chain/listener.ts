@@ -14,7 +14,7 @@ import {
 } from './decoder.js';
 import { fetchTokenMetadata } from './metadata.js';
 import { receiptConfirmsSwap, receiptDiagnostic } from './receipt.js';
-import { LiveTradeVerifier, logLiveTradeShadow } from './liveTradeVerifier.js';
+import { LiveTradeVerifier, logLiveTradeShadow, type V4PoolMembershipResolver } from './liveTradeVerifier.js';
 import { logHttpFailure, logRpcError, logRpcThrow, rpcHost } from './rpcLog.js';
 import { schedulerFor } from '../attrib/scheduler.js';
 
@@ -23,8 +23,6 @@ export type SwapHandler = (e: SwapEvent) => void;
 // Shared by both WS and polling listeners. The verifier memoizes immutable
 // receipt/transaction context by hash, so one multi-log transaction never pays
 // for the same proof repeatedly.
-const liveTradeVerifier = new LiveTradeVerifier();
-
 /**
  * Bounded retry queue for a discovery race: a token Transfer can land before a
  * flaky RPC answers decimals().  The old path returned null and the polling
@@ -121,6 +119,7 @@ async function buildSwapFromLog(
   store: MemoryStore,
   price: PriceOracle,
   log: EthLog,
+  liveTradeVerifier: LiveTradeVerifier,
   onNewToken?: (addr: string) => void,
   onMetadataPending?: (token: string, log: EthLog) => void,
 ): Promise<SwapEvent | null> {
@@ -203,12 +202,15 @@ export class LiveChainListener implements ChainListener {
   private readonly pendingLatency = new Map<number, number>();
   private readonly enriching = new Set<string>();
   private readonly metadataRetries: MetadataRetryQueue;
+  private readonly liveTradeVerifier: LiveTradeVerifier;
 
   constructor(
     private readonly store: MemoryStore,
     private readonly price: PriceOracle,
     private readonly onSwap: SwapHandler,
+    v4PoolContainsToken?: V4PoolMembershipResolver,
   ) {
+    this.liveTradeVerifier = new LiveTradeVerifier(v4PoolContainsToken);
     this.metadataRetries = new MetadataRetryQueue(store, (log) => this.handleLog(log).then(() => undefined));
   }
 
@@ -328,7 +330,7 @@ export class LiveChainListener implements ChainListener {
   }
 
   private async handleLog(log: EthLog): Promise<void> {
-    const swap = await buildSwapFromLog(this.store, this.price, log, (a) =>
+    const swap = await buildSwapFromLog(this.store, this.price, log, this.liveTradeVerifier, (a) =>
       enrichToken(this.store, a, this.enriching),
       (token, retryLog) => this.metadataRetries.enqueue(token, retryLog),
     );
@@ -473,6 +475,7 @@ export class HttpPollingChainListener implements ChainListener {
   private pollCount = 0;
   private readonly enriching = new Set<string>();
   private readonly metadataRetries: MetadataRetryQueue;
+  private readonly liveTradeVerifier: LiveTradeVerifier;
   private static readonly MAX_RANGE = 5000;
   /** Floor for the adaptive range; below this a shrink cannot help. */
   private static readonly MIN_RANGE = 32;
@@ -501,7 +504,9 @@ export class HttpPollingChainListener implements ChainListener {
     private readonly onSwap: SwapHandler,
     /** Injectable transport, for tests. Defaults to the real JSON-RPC call. */
     private readonly rpcFn?: RpcFn,
+    v4PoolContainsToken?: V4PoolMembershipResolver,
   ) {
+    this.liveTradeVerifier = new LiveTradeVerifier(v4PoolContainsToken);
     this.metadataRetries = new MetadataRetryQueue(store, (log) => this.handleLog(log).then(() => undefined));
   }
 
@@ -533,7 +538,7 @@ export class HttpPollingChainListener implements ChainListener {
   }
 
   private async handleLog(log: EthLog): Promise<boolean> {
-    const swap = await buildSwapFromLog(this.store, this.price, log, (a) =>
+    const swap = await buildSwapFromLog(this.store, this.price, log, this.liveTradeVerifier, (a) =>
       enrichToken(this.store, a, this.enriching),
       (token, retryLog) => this.metadataRetries.enqueue(token, retryLog),
     );
@@ -807,10 +812,11 @@ export function createListener(
   store: MemoryStore,
   price: PriceOracle,
   onSwap: SwapHandler,
+  v4PoolContainsToken?: V4PoolMembershipResolver,
 ): ChainListener {
   if (config.chainMode !== 'live') return new SimulatorChainListener(store, price, onSwap);
   // Prefer a streaming WS endpoint; otherwise poll the HTTP RPC.
   return config.CHAIN_WS_URL
-    ? new LiveChainListener(store, price, onSwap)
-    : new HttpPollingChainListener(store, price, onSwap);
+    ? new LiveChainListener(store, price, onSwap, v4PoolContainsToken)
+    : new HttpPollingChainListener(store, price, onSwap, undefined, v4PoolContainsToken);
 }

@@ -370,7 +370,7 @@ async function main(): Promise<void> {
     // and returns no value, so it cannot alter the live handler's control flow.
     attribution.recordLiveEmission(swap);
     void handleSwap(swap);
-  });
+  }, (poolId, token) => attribution.v4PoolContainsToken(poolId, token));
   if (resumeCursor != null) listener.resumeAt?.(resumeCursor);
   if (feedState?.pendingMetadata?.length) listener.restorePendingMetadata?.(feedState.pendingMetadata);
   listener.start();

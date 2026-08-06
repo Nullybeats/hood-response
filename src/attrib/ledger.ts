@@ -117,6 +117,19 @@ export interface AccountedFor {
   drift: number;
 }
 
+/** Canonical V4 PoolKey provenance recovered from PoolManager.Initialize. */
+export interface V4PoolInitialization {
+  poolId: string;
+  currency0: string;
+  currency1: string;
+  fee: number | null;
+  tickSpacing: number | null;
+  hooks: string | null;
+  blockNumber: number;
+  logIndex: number;
+  txHash: string | null;
+}
+
 /** One canonical `(tx, wallet)` observation awaiting attribution. */
 export interface UnsettledObservation {
   txHash: string;
@@ -688,6 +701,39 @@ export class AttributionLedger {
   v4InitializationCount(): number {
     if (!this.db) return 0;
     return (this.db.prepare('SELECT COUNT(*) AS n FROM attrib_v4_pool_initialization').get() as unknown as { n: number }).n;
+  }
+
+  /**
+   * Read a canonical V4 PoolKey proof. PoolId is a hash and cannot be reversed;
+   * the persisted Initialize event is therefore the only safe source for its
+   * currencies. Invalid historic rows read as absent rather than guessed.
+   */
+  v4PoolInitialization(poolId: string): V4PoolInitialization | null {
+    if (!this.db) return null;
+    const row = this.db.prepare(
+      `SELECT pool_id, block_number, log_index, tx_hash, evidence_json
+       FROM attrib_v4_pool_initialization WHERE pool_id = ?`,
+    ).get(poolId.toLowerCase()) as unknown as {
+      pool_id: string; block_number: number; log_index: number; tx_hash: string | null; evidence_json: string;
+    } | undefined;
+    if (!row) return null;
+    try {
+      const evidence = JSON.parse(row.evidence_json) as Record<string, unknown>;
+      const address = (v: unknown): string | null =>
+        typeof v === 'string' && /^0x[0-9a-f]{40}$/i.test(v) ? v.toLowerCase() : null;
+      const currency0 = address(evidence.currency0);
+      const currency1 = address(evidence.currency1);
+      if (!currency0 || !currency1) return null;
+      return {
+        poolId: row.pool_id.toLowerCase(), currency0, currency1,
+        fee: typeof evidence.fee === 'number' && Number.isFinite(evidence.fee) ? evidence.fee : null,
+        tickSpacing: typeof evidence.tickSpacing === 'number' && Number.isFinite(evidence.tickSpacing) ? evidence.tickSpacing : null,
+        hooks: address(evidence.hooks), blockNumber: row.block_number, logIndex: row.log_index,
+        txHash: row.tx_hash?.toLowerCase() ?? null,
+      };
+    } catch {
+      return null;
+    }
   }
 
   /**

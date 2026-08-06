@@ -13,6 +13,7 @@ import { PoolVerifier, makeEthCall, verifyV4Pool } from './poolVerify.js';
 import { buildReport, type AccountingReport } from './report.js';
 import { schedulerFor } from './scheduler.js';
 import { isValidCallTrace, nativeDeltasFromCallTrace, TraceCapabilityMatrix } from './traces.js';
+import { V4PoolRegistry, type V4PoolMembership } from './v4Registry.js';
 import { CLASSIFIER_VERSION, type Evidence, type FailureCategory } from './taxonomy.js';
 import type { SwapEvent } from '../types.js';
 
@@ -24,6 +25,7 @@ import type { SwapEvent } from '../types.js';
 export class AttributionShadow {
   readonly ledger = new AttributionLedger();
   private readonly verifier = new PoolVerifier(makeEthCall(config.CHAIN_HTTP_URL));
+  private readonly v4Pools = new V4PoolRegistry(this.ledger, config.CHAIN_HTTP_URL);
   private readonly hs = new HyperSyncClient({
     url: config.FEED_HYPERSYNC_URL,
     token: config.FEED_HYPERSYNC_TOKEN,
@@ -149,6 +151,15 @@ export class AttributionShadow {
     } catch (err) {
       logger.warn({ err: String(err).slice(0, 160), tx: swap.txHash }, 'attrib: emission observer failed');
     }
+  }
+
+  /**
+   * Live-gate seam: prove that a V4 PoolId's canonical Initialize key contains
+   * the trigger token. It shares the attribution ledger's durable registry but
+   * returns a three-way answer so an RPC failure cannot become a false claim.
+   */
+  v4PoolContainsToken(poolId: string, token: string): Promise<V4PoolMembership> {
+    return this.v4Pools.containsToken(poolId, token);
   }
 
   private async tick(): Promise<void> {

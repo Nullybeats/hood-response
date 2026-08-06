@@ -24,6 +24,8 @@ export interface LiveTradeVerdict {
   reason: string;
 }
 
+export type V4PoolMembershipResolver = (poolId: string, token: string) => Promise<'verified' | 'mismatch' | 'pending'>;
+
 interface Bundle {
   receipt: Exclude<RawReceipt, null>;
   tx: Exclude<RawTx, null>;
@@ -144,6 +146,8 @@ export class LiveTradeVerifier {
   private readonly traceWork = new BoundedWork(2);
   private readonly maxBundles = 2_048;
 
+  constructor(private readonly v4PoolContainsToken?: V4PoolMembershipResolver) {}
+
   async verify(log: EthLog, transfer: DecodedTransfer, wallet: string, direction: Direction): Promise<LiveTradeVerdict> {
     const bundle = await this.bundle(transfer.txHash);
     if (!bundle) return { legacyCandidate: false, confirmed: false, category: 'no_receipt_available', reason: 'receipt or transaction unavailable' };
@@ -166,6 +170,32 @@ export class LiveTradeVerifier {
     let ctx = toContext(bundle, transfer, wallet, verified);
     ctx.pendingContracts = this.pools.pendingSet();
     let verdict = verifiedTransferVerdict(ctx, transfer, direction, exact);
+
+    // The V4 Swap event carries a PoolId but not its currencies. Verify the
+    // token against the canonical Initialize key before a V4 result can become
+    // a live trade: a nearby Manager swap in another pool must not bless an
+    // unrelated wallet transfer in a batched transaction.
+    if (verdict.confirmed && this.v4PoolContainsToken && ctx.logs.some((l) => l.topic0 === V4_SWAP_TOPIC)) {
+      const ids = [...new Set(ctx.logs
+        .filter((l) => l.topic0 === V4_SWAP_TOPIC && /^0x[0-9a-f]{64}$/.test(l.topic1 ?? ''))
+        .map((l) => lc(l.topic1)))];
+      // A routed V4 trade can legitimately cross several pools; the output
+      // token belongs to the final pool, not every hop. Require it to appear
+      // in AT LEAST one canonical key. A missing proof stays pending unless a
+      // different hop has already established the association.
+      const memberships = await Promise.all(ids.map((id) => this.v4PoolContainsToken!(id, transfer.token)));
+      if (!memberships.includes('verified')) {
+        const pending = memberships.includes('pending');
+        return {
+          legacyCandidate: verdict.legacyCandidate,
+          confirmed: false,
+          category: pending ? 'v4_pool_key_pending' : 'v4_pool_token_mismatch',
+          reason: pending
+            ? 'canonical V4 PoolKey provenance is not available yet'
+            : 'no canonical V4 PoolKey in this transaction contains the trigger token',
+        };
+      }
+    }
 
     // Receipt logs prove two ERC-20 legs themselves. Trace only the narrow
     // one-leg bucket, where native ETH may be the missing payment proof.
