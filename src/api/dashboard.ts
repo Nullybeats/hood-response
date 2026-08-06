@@ -199,6 +199,35 @@ let DEX_CHAIN=null;
 let EXPLORER_BASE=null;
 let SIGMA_REF=null;
 let BASED_REF=null;
+// Railway's shared egress IP can be rate-limited by DexScreener while the
+// operator's browser is not. This is DISPLAY ONLY: it supplements a visible
+// row with a current quote; server-side alert gates remain fail-closed.
+const browserQuotes=new Map();
+const browserQuoteInflight=new Map();
+const BROWSER_QUOTE_TTL=60_000;
+async function fetchBrowserQuote(token){
+  const key=(token||'').toLowerCase(); if(!key||!DEX_CHAIN) return;
+  const cached=browserQuotes.get(key);
+  if(cached&&Date.now()-cached.at<BROWSER_QUOTE_TTL) return;
+  if(browserQuoteInflight.has(key)) return browserQuoteInflight.get(key);
+  const task=fetch('https://api.dexscreener.com/token-pairs/v1/'+encodeURIComponent(DEX_CHAIN)+'/'+key)
+    .then(r=>r.ok?r.json():[])
+    .then(pairs=>{
+      const best=(Array.isArray(pairs)?pairs:[])
+        .filter(p=>p&&p.baseToken&&String(p.baseToken.address||'').toLowerCase()===key)
+        .sort((a,b)=>(b.liquidity?.usd||0)-(a.liquidity?.usd||0))[0];
+      browserQuotes.set(key,{at:Date.now(),state:best?'live':'unavailable',priceUsd:best?Number(best.priceUsd)||null:null,marketCap:best?(best.marketCap??best.fdv??null):null});
+    })
+    .catch(()=>browserQuotes.set(key,{at:Date.now(),state:'unavailable',priceUsd:null,marketCap:null}))
+    .finally(()=>{ browserQuoteInflight.delete(key); void loadFeeds(); });
+  browserQuoteInflight.set(key,task); return task;
+}
+const quoteFor=(s)=>{
+  const key=(s.token||'').toLowerCase(); const local=browserQuotes.get(key);
+  const server=s.quote;
+  if((!server||server.state!=='live')&&(!local||local.state!=='live')) void fetchBrowserQuote(s.token);
+  return local&&local.state==='live'?local:server||local;
+};
 const txLink=(h)=>h&&EXPLORER_BASE?'<a href="'+EXPLORER_BASE+'/tx/'+h+'" target="_blank" rel="noopener" class="dex">'+h.slice(0,8)+'…</a>':(h?h.slice(0,8)+'…':'');
 const dexUrl = (addr) => DEX_CHAIN ? 'https://dexscreener.com/'+DEX_CHAIN+'/'+addr : 'https://dexscreener.com/search?q='+addr;
 const dexLink = (addr,label) => '<a href="'+dexUrl(addr)+'" target="_blank" rel="noopener" class="dex">'+label+'</a>';
@@ -220,8 +249,9 @@ const mcLabel = (s) => {
   if(s.marketCap!=null) return (s.kind==='SELL' ? 'sold @ ' : 'bought @ ') + usd(s.marketCap) + ' MC' + srcLabel(s) + athLabel(s);
   // A later quote is useful, but never rewrite history and call it the entry
   // cap. The qualifier is what prevents that new kind of false precision.
-  if(s.quote&&s.quote.marketCap!=null) return 'now '+usd(s.quote.marketCap)+' MC (after signal)';
-  return quoteLabel(s.quote);
+  const q=quoteFor(s);
+  if(q&&q.marketCap!=null) return 'now '+usd(q.marketCap)+' MC (after signal)';
+  return quoteLabel(q);
 };
 const srcLabel = (s) => !s.priceLive ? ' (no price)' : s.priceSource==='pool' ? ' (on-chain px)' : '';
 const athLabel = (s) => {
@@ -232,8 +262,9 @@ const athLabel = (s) => {
 
 function feedRow(s){
   const d=document.createElement('div'); d.className='row flash';
-  const value=s.usdValue!=null ? usd(s.usdValue) : s.quote&&s.quote.priceUsd!=null
-    ? '~'+usd(s.quote.priceUsd*s.amount) : quoteLabel(s.quote);
+  const q=quoteFor(s);
+  const value=s.usdValue!=null ? usd(s.usdValue) : q&&q.priceUsd!=null
+    ? '~'+usd(q.priceUsd*s.amount) : quoteLabel(q);
   d.innerHTML='<span class="tag '+s.direction+'">'+s.direction+'</span>'+
     '<span class="sym">'+s.tokenSymbol+'</span>'+
     '<span class="grow mono">tracked wallet</span>'+
@@ -255,12 +286,13 @@ const repeatBadge = (s) => { if(!(s.repeatCount && s.repeatCount>1)) return '';
 
 function swarmRow(s){
   const d=document.createElement('div'); d.className='row flash'+(s.prime?' primerow':'');
+  const q=quoteFor(s);
   const into = s.kind==='ROTATION' ? ' → '+(s.rotatedIntoSymbol||'?') : '';
   d.innerHTML='<span class="tag '+s.kind+'">'+s.kind+'</span>'+primeBadge(s)+newBadge(s)+repeatBadge(s)+freshBadge(s)+safeBadge(s)+momBadge(s)+
     '<span class="sym">'+dexA(s.dexUrl,s.tokenSymbol)+into+'</span>'+
     '<span class="grow mono">'+(s.walletSummary||s.walletCount+' wallets')+' · '+mcLabel(s)+'</span>'+
     buyLinks(s.token)+
-    '<span class="usd">'+(s.totalUsd>0?usd(s.totalUsd):quoteLabel(s.quote))+'</span>'+
+    '<span class="usd">'+(s.totalUsd>0?usd(s.totalUsd):quoteLabel(q))+'</span>'+
     '<span class="conv '+convClass(s.conviction)+'">'+s.conviction+'</span>';
   return d;
 }
@@ -277,12 +309,13 @@ function alertRow(a){
 }
 function newCoinRow(s){
   const d=document.createElement('div'); d.className='row flash';
+  const q=quoteFor(s);
   d.innerHTML='<span class="tag NEW">NEW</span>'+safeBadge(s)+
     '<span class="sym">'+dexA(s.dexUrl,s.tokenSymbol)+'</span>'+
     '<span class="grow addr" title="'+s.token+'">'+dexA(s.dexUrl,s.token)+'</span>'+
     '<span class="mono">'+s.walletCount+'w · '+mcLabel(s)+'</span>'+
     buyLinks(s.token)+
-    '<span class="usd">'+(s.totalUsd>0?usd(s.totalUsd):quoteLabel(s.quote))+'</span>'+
+    '<span class="usd">'+(s.totalUsd>0?usd(s.totalUsd):quoteLabel(q))+'</span>'+
     '<span class="conv '+convClass(s.conviction)+'">'+s.conviction+'</span>';
   return d;
 }
