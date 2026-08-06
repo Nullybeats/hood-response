@@ -41,6 +41,18 @@ describe('PriceOracle ATH tracking', () => {
     expect(oracle.quoteState(TOKEN)).toBe('live');
   });
 
+  it('warms visible tokens immediately without waiting for the broad refresh tick', async () => {
+    const oracle = new PriceOracle([]);
+    const fetchMock = vi.fn().mockResolvedValue(dexResponse(100_000));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await oracle.warmVisible([TOKEN, TOKEN]);
+
+    expect(oracle.quoteState(TOKEN)).toBe('live');
+    // A repeated durable swarm does not create repeated price work.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('tracks the highest market cap seen and never lowers it on a dip', async () => {
     const oracle = new PriceOracle([]);
     const fetchMock = vi

@@ -75,9 +75,15 @@ async function main(): Promise<void> {
   // The durable UI may contain a handful of signals created while a new pair
   // was still unindexed. Give those visible tokens priority over the broad
   // restored-token sweep; this is display enrichment only, never alert input.
-  for (const swarm of store.recentSwarms(50)) price.requestRefresh(swarm.token);
-  for (const alert of store.recentAlerts(30)) price.requestRefresh(alert.swarm.token);
+  const visibleTokens = [
+    ...store.recentSwarms(50).map((swarm) => swarm.token),
+    ...store.recentAlerts(30).map((alert) => alert.swarm.token),
+  ];
+  for (const token of visibleTokens) price.requestRefresh(token);
   price.start();
+  void price.warmVisible(visibleTokens).then(() => {
+    if (visibleTokens.length) logger.info({ tokens: new Set(visibleTokens).size }, 'price: visible feed warm-up complete');
+  });
   const aggregator = new Aggregator(store, price);
   const engine = new AlertEngine(store, aggregator);
 

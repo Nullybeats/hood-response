@@ -416,6 +416,19 @@ export class PriceOracle {
     this.priorityQueue.add(key);
   }
 
+  /**
+   * Warm a small set of already-visible signals on boot. This is separate from
+   * the broad scheduler because a durable feed can contain hundreds of tokens,
+   * while the handful actually on screen should not wait behind that backlog.
+   */
+  async warmVisible(tokens: Iterable<string>, limit = 24): Promise<void> {
+    const unique = [...new Set([...tokens].map((t) => t.toLowerCase()))].slice(0, limit);
+    const concurrency = 4;
+    for (let i = 0; i < unique.length; i += concurrency) {
+      await Promise.all(unique.slice(i, i + concurrency).map((token) => this.refreshNow(token)));
+    }
+  }
+
   /** The display may say either how the price was established or why it is absent. */
   quoteState(tokenAddress: string): 'live' | 'pricing' | 'unavailable' {
     const key = tokenAddress.toLowerCase();
