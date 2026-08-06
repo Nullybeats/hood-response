@@ -1,6 +1,6 @@
 import { config } from '../config/env.js';
-import { addressToTopic } from '../chain/decoder.js';
-import { V3_SWAP_TOPIC } from '../chain/receipt.js';
+import { addressToTopic, TRANSFER_TOPIC } from '../chain/decoder.js';
+import { V3_SWAP_TOPIC, V4_SWAP_TOPIC } from '../chain/receipt.js';
 import { INIT_TOPIC } from '../chain/uniswap.js';
 import { logHttpFailure, logRpcError, logRpcThrow, rpcHost } from '../chain/rpcLog.js';
 import { HyperSyncClient, type HyperSyncFailure } from '../chain/hypersync.js';
@@ -12,6 +12,7 @@ import { observeUniverse } from './observe.js';
 import { PoolVerifier, makeEthCall, verifyV4Pool } from './poolVerify.js';
 import { buildReport, type AccountingReport } from './report.js';
 import { schedulerFor } from './scheduler.js';
+import { isValidCallTrace, nativeDeltasFromCallTrace, TraceCapabilityMatrix } from './traces.js';
 import { CLASSIFIER_VERSION, type Evidence, type FailureCategory } from './taxonomy.js';
 import type { SwapEvent } from '../types.js';
 
@@ -35,6 +36,7 @@ export class AttributionShadow {
     enrich: (txHash, wallet) => this.enrich(txHash, wallet),
     sourceHost: config.CHAIN_HTTP_URL,
   });
+  private readonly traceMatrix = new TraceCapabilityMatrix();
   private timer: NodeJS.Timeout | null = null;
   private running = false;
   private observedHead: number | null = null;
@@ -97,6 +99,7 @@ export class AttributionShadow {
       },
       pools: this.ledger.poolVerificationStats(),
       v4InitializedPools: this.ledger.v4InitializationCount(),
+      traceCapability: this.traceMatrix.entries(),
     };
   }
 
@@ -108,7 +111,7 @@ export class AttributionShadow {
     const report = buildReport({
       ledger: this.ledger,
       finality,
-      traceMatrix: [], // The configured public RPC is known trace-unavailable; a future trace source is probed separately.
+      traceMatrix: this.traceMatrix.entries(),
       traceRows: this.ledger.traceGapRows(CLASSIFIER_VERSION, this.lastWindow.from, this.lastWindow.to).flatMap((row) => {
         try {
           return [{ evidence: JSON.parse(row.evidence_json) as Evidence, liveEmitted: row.liveEmitted === 1 }];
@@ -248,6 +251,103 @@ export class AttributionShadow {
     }
   }
 
+  /**
+   * Call traces are optional evidence, never a dependency of receipt ingestion.
+   * A trace outage therefore produces an honest unproven verdict for a one-leg
+   * swap rather than stalling the shadow or changing the live listener.
+   */
+  private async traceNativeDeltas(txHash: string, blockNumber: number, wallet: string) {
+    const url = config.ATTRIB_TRACE_RPC_URL;
+    if (!url) return [];
+    const target = {
+      chainId: config.CHAIN_ID,
+      rpcUrl: url,
+      probeTxHash: txHash,
+      probeBlockHex: `0x${blockNumber.toString(16)}`,
+    };
+    const caps = await this.traceMatrix.probeAll(target);
+    if (caps.find((c) => c.method === 'debug_traceTransaction')?.status !== 'available') return [];
+
+    const sched = schedulerFor(url);
+    try {
+      return await sched.run(async () => {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'debug_traceTransaction',
+            params: [txHash, { tracer: 'callTracer' }],
+          }),
+          signal: AbortSignal.timeout(20_000),
+        });
+        const ctx = { op: 'attrib-trace', url, method: 'debug_traceTransaction' };
+        if (!res.ok) {
+          logHttpFailure(ctx, res.status, res.statusText);
+          if (res.status === 429 || res.status === 503) sched.penalise(1_000);
+          this.ledger.recordFailure({
+            operation: 'trace', fromBlock: blockNumber, toBlock: blockNumber, sourceUrl: url,
+            kind: 'rpc_http_error', detail: `http ${res.status}`,
+          });
+          this.traceMatrix.invalidateHost(url); // the cached capability is stale after an outage
+          return [];
+        }
+        const body = (await res.json()) as { result?: unknown; error?: unknown };
+        if (body.error) {
+          logRpcError(ctx, body.error);
+          this.ledger.recordFailure({
+            operation: 'trace', fromBlock: blockNumber, toBlock: blockNumber, sourceUrl: url,
+            kind: 'rpc_jsonrpc_error', detail: 'json-rpc error',
+          });
+          this.traceMatrix.invalidateHost(url);
+          return [];
+        }
+        if (!isValidCallTrace(body.result)) {
+          logger.warn({ host: rpcHost(url), tx: txHash }, 'attrib: trace provider returned malformed call trace');
+          this.ledger.recordFailure({
+            operation: 'trace', fromBlock: blockNumber, toBlock: blockNumber, sourceUrl: url,
+            kind: 'decode_error', detail: 'malformed call trace',
+          });
+          this.traceMatrix.invalidateHost(url);
+          return [];
+        }
+        return nativeDeltasFromCallTrace(body.result, wallet);
+      });
+    } catch (err) {
+      logRpcThrow({ op: 'attrib-trace', url, method: 'debug_traceTransaction' }, err);
+      this.ledger.recordFailure({
+        operation: 'trace', fromBlock: blockNumber, toBlock: blockNumber, sourceUrl: url,
+        kind: 'rpc_transport_error', detail: String(err).slice(0, 160),
+      });
+      this.traceMatrix.invalidateHost(url);
+      return [];
+    }
+  }
+
+  /** Trace only the receipt shapes for which it can change a verdict. */
+  private traceNeeded(
+    logs: { address: string; topic0: string | null; topic1: string | null; topic2: string | null; data: string | null }[],
+    wallet: string,
+  ): boolean {
+    if (!logs.some((l) => l.topic0 === V3_SWAP_TOPIC || l.topic0 === V4_SWAP_TOPIC)) return false;
+    const topic = addressToTopic(wallet).toLowerCase();
+    const net = new Map<string, bigint>();
+    for (const l of logs) {
+      if (l.topic0 !== TRANSFER_TOPIC || !l.topic1 || !l.topic2) continue;
+      let value: bigint;
+      try {
+        value = BigInt(l.data && l.data !== '0x' ? l.data : '0x0');
+      } catch {
+        continue;
+      }
+      if (l.topic2 === topic) net.set(l.address, (net.get(l.address) ?? 0n) + value);
+      if (l.topic1 === topic) net.set(l.address, (net.get(l.address) ?? 0n) - value);
+    }
+    // Two visible ERC-20 legs already prove an exchange; traces cannot improve it.
+    return [...net.values()].filter((v) => v !== 0n).length === 1;
+  }
+
   private async enrich(txHash: string, wallet: string): ReturnType<Enricher> {
     type RawLog = { address?: string; topics?: string[]; data?: string; logIndex?: string | number };
     type RawReceipt = { status?: string; blockNumber?: string; logs?: RawLog[] } | null;
@@ -289,6 +389,9 @@ export class AttributionShadow {
           transactionHash: txHash,
         }),
       );
+    const extraDeltas = this.traceNeeded(logs, wallet)
+      ? await this.traceNativeDeltas(txHash, blockNumber, wallet)
+      : [];
     const value: EnrichedTx = {
       tx: {
         txHash,
@@ -314,6 +417,7 @@ export class AttributionShadow {
       },
       candidatePools,
       v4Initializations,
+      extraDeltas,
     };
     return { ok: true, value };
   }

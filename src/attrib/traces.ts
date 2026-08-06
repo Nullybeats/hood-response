@@ -1,5 +1,6 @@
 import { logger } from '../logger.js';
 import { logHttpFailure, logRpcThrow, redact, rpcHost } from '../chain/rpcLog.js';
+import type { WalletDelta } from './taxonomy.js';
 
 /**
  * Trace capability, as a per-source MATRIX rather than a boolean.
@@ -71,6 +72,46 @@ export function isValidCallTrace(result: unknown): boolean {
   if (!hasType || !hasFrom) return false;
   if (r.calls !== undefined && !Array.isArray(r.calls)) return false;
   return true;
+}
+
+/**
+ * Reduce a `callTracer` tree to the watched wallet's net native-ETH movement.
+ *
+ * The trace contains every internal call, so we deliberately count only frames
+ * incident to the wallet. Counting the router → pool legs would double-count
+ * a single user payment. A reverted subcall moved no value and is ignored.
+ */
+export function nativeDeltasFromCallTrace(trace: unknown, wallet: string): WalletDelta[] {
+  if (!isValidCallTrace(trace)) return [];
+  const watched = wallet.toLowerCase();
+  let net = 0n;
+
+  const quantity = (value: unknown): bigint => {
+    if (typeof value !== 'string' || !/^0x[0-9a-f]+$/i.test(value)) return 0n;
+    try {
+      return BigInt(value);
+    } catch {
+      return 0n;
+    }
+  };
+  const walk = (frame: unknown): void => {
+    if (!frame || typeof frame !== 'object' || Array.isArray(frame)) return;
+    const f = frame as Record<string, unknown>;
+    // A failed nested call is rolled back. Its value is not a settled native leg.
+    if (f.error != null) return;
+    const value = quantity(f.value);
+    const from = typeof f.from === 'string' ? f.from.toLowerCase() : '';
+    const to = typeof f.to === 'string' ? f.to.toLowerCase() : '';
+    if (value > 0n && from !== to) {
+      if (from === watched) net -= value;
+      if (to === watched) net += value;
+    }
+    if (Array.isArray(f.calls)) for (const child of f.calls) walk(child);
+  };
+  walk(trace);
+  return net === 0n
+    ? []
+    : [{ token: 'native', rawDelta: net.toString(), decimals: 18, source: 'trace_native' }];
 }
 
 /** trace_block returns an ARRAY of frames, each with an action and a type. */

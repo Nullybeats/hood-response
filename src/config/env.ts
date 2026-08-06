@@ -157,6 +157,11 @@ const schema = z.object({
   // Row-level detail (tx hashes, wallets) is admin-gated AND off by default —
   // a tx hash is a one-lookup deanonymiser for a watched wallet.
   ATTRIB_EXPOSE_DETAIL: bool(false),
+  // Optional archive/debug RPC used only by attribution for native/internal
+  // value traces. It is intentionally separate from CHAIN_HTTP_URL: discovery
+  // stays on HyperSync/public RPC, while this lower-volume evidence path may
+  // use a keyed provider without changing live detection behaviour.
+  ATTRIB_TRACE_RPC_URL: z.string().default(''),
   // Blocks below the observed head treated as settled. Above this the
   // accounting window is PROVISIONAL and reported as such — a scanned block is
   // not a final block, and a reorg must not silently invalidate published

@@ -3,6 +3,7 @@ import {
   TraceCapabilityMatrix,
   isValidBlockTrace,
   isValidCallTrace,
+  nativeDeltasFromCallTrace,
   probeMethod,
   traceCoverageLabel,
   tracesUsable,
@@ -39,6 +40,51 @@ const http = (status: number) => {
 };
 
 describe('trace capability — a matrix, not a boolean', () => {
+  describe('native delta extraction', () => {
+    it('nets only frames incident to the watched wallet', () => {
+      const deltas = nativeDeltasFromCallTrace(
+        {
+          type: 'CALL', from: '0xwallet', to: '0xrouter', value: '0x64', calls: [
+            { type: 'CALL', from: '0xrouter', to: '0xpool', value: '0x64' },
+            { type: 'CALL', from: '0xpool', to: '0xwallet', value: '0x19' },
+          ],
+        },
+        '0xwallet',
+      );
+      // Router → pool is the same payment continuing internally, not another
+      // wallet leg. The wallet sent 100 and received 25: net −75.
+      expect(deltas).toEqual([
+        { token: 'native', rawDelta: '-75', decimals: 18, source: 'trace_native' },
+      ]);
+    });
+
+    it('does not count reverted internal calls as settled value movement', () => {
+      expect(
+        nativeDeltasFromCallTrace(
+          { type: 'CALL', from: '0xrouter', to: '0xwallet', value: '0x64', error: 'execution reverted' },
+          '0xwallet',
+        ),
+      ).toEqual([]);
+    });
+
+    it('does not walk children of a reverted call', () => {
+      expect(
+        nativeDeltasFromCallTrace(
+          {
+            type: 'CALL', from: '0xrouter', to: '0xpool', error: 'reverted', calls: [
+              { type: 'CALL', from: '0xpool', to: '0xwallet', value: '0x64' },
+            ],
+          },
+          '0xwallet',
+        ),
+      ).toEqual([]);
+    });
+
+    it('refuses malformed traces rather than extracting a made-up leg', () => {
+      expect(nativeDeltasFromCallTrace({ from: '0xwallet', value: '0x1' }, '0xwallet')).toEqual([]);
+    });
+  });
+
   describe('structure validation (a 200 is not a trace)', () => {
     it('accepts a real callTracer frame', () => {
       expect(isValidCallTrace({ type: 'CALL', from: '0xaaa', to: '0xbbb', gas: '0x1' })).toBe(true);
