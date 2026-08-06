@@ -10,6 +10,7 @@ export interface EthLog {
   data: string;
   blockNumber?: string;
   transactionHash?: string;
+  logIndex?: string;
 }
 
 /** A 32-byte topic word encodes an address in its low 20 bytes. */
@@ -36,6 +37,8 @@ export interface DecodedTransfer {
   rawValue: bigint;
   txHash: string;
   blockNumber: number;
+  /** Receipt-log identity for attribution reconciliation. */
+  logIndex: number;
 }
 
 /**
@@ -52,6 +55,7 @@ export function decodeTransfer(log: EthLog): DecodedTransfer | null {
     rawValue: hexToBigInt(log.data),
     txHash: log.transactionHash ?? '',
     blockNumber: log.blockNumber ? Number(hexToBigInt(log.blockNumber)) : 0,
+    logIndex: log.logIndex ? Number(hexToBigInt(log.logIndex)) : -1,
   };
 }
 

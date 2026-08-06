@@ -12,6 +12,7 @@ import { PoolVerifier, makeEthCall } from './poolVerify.js';
 import { buildReport, type AccountingReport } from './report.js';
 import { schedulerFor } from './scheduler.js';
 import { CLASSIFIER_VERSION, type Evidence, type FailureCategory } from './taxonomy.js';
+import type { SwapEvent } from '../types.js';
 
 /**
  * The attribution runtime is deliberately a SHADOW service.  It has a durable
@@ -126,6 +127,26 @@ export class AttributionShadow {
       'V4 PoolManager/Initialize provenance is not wired into this runtime yet. V4 activity may be observed, but cannot become `confirmed_trade` here.',
     );
     return report;
+  }
+
+  /**
+   * Record what the existing live detector emitted for later reconciliation.
+   * This observer deliberately catches every failure: the callback's result is
+   * never read by the live listener, so accounting can never suppress a swap,
+   * an alert, or a sniper decision.
+   */
+  recordLiveEmission(swap: SwapEvent): void {
+    try {
+      this.ledger.recordEmission(
+        swap.txHash,
+        swap.logIndex ?? -1,
+        swap.wallet,
+        swap.direction,
+        swap.token,
+      );
+    } catch (err) {
+      logger.warn({ err: String(err).slice(0, 160), tx: swap.txHash }, 'attrib: emission observer failed');
+    }
   }
 
   private async tick(): Promise<void> {

@@ -72,6 +72,7 @@ async function buildSwapFromLog(
     amount,
     usdValue: price.usdValue(transfer.token, amount),
     blockNumber: transfer.blockNumber || store.metrics.lastBlock,
+    logIndex: transfer.logIndex,
     timestamp: Date.now(),
   };
 }

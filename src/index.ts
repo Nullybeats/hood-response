@@ -344,7 +344,18 @@ async function main(): Promise<void> {
     }
   };
 
-  const listener = createListener(store, price, (swap) => void handleSwap(swap));
+  // A second, durable measurement lane.  It is default-off and has no path
+  // into handleSwap/alerts/sniper; it exists solely to account for what the
+  // live detector did and did not observe.
+  const attribution = new AttributionShadow([...store.wallets.keys()]);
+  attribution.start();
+
+  const listener = createListener(store, price, (swap) => {
+    // Measurement-only observer.  `recordLiveEmission` is exception-contained
+    // and returns no value, so it cannot alter the live handler's control flow.
+    attribution.recordLiveEmission(swap);
+    void handleSwap(swap);
+  });
   if (resumeCursor != null) listener.resumeAt?.(resumeCursor);
   listener.start();
 
@@ -352,12 +363,6 @@ async function main(): Promise<void> {
   // finds; it is handed NOTHING from the live pipeline and hands nothing back.
   const shadow = new HyperSyncShadow([...store.wallets.keys()]);
   shadow.start();
-
-  // A second, durable measurement lane.  It is default-off and has no path
-  // into handleSwap/alerts/sniper; it exists solely to account for what the
-  // live detector did and did not observe.
-  const attribution = new AttributionShadow([...store.wallets.keys()]);
-  attribution.start();
 
   // Periodic snapshot. The cursor is the part that matters — a process killed
   // without a signal (OOM, platform restart) never reaches shutdown(), and the

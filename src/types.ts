@@ -71,6 +71,8 @@ export interface SwapEvent {
    *  can verify. Null is not 0: an unvalued swap is unknown, not dust. */
   usdValue: number | null;
   blockNumber: number;
+  /** Original receipt log index when the source is a chain log. */
+  logIndex?: number;
   /** Unix ms. */
   timestamp: number;
 }
