@@ -527,7 +527,10 @@ export class PriceOracle {
       const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`, {
         signal: ctrl.signal,
       });
-      if (!res.ok) return;
+      if (!res.ok) {
+        logger.warn({ token: address, status: res.status }, 'price: DexScreener request failed');
+        return;
+      }
       const json = (await res.json()) as { pairs?: DexPair[] };
 
       // Highest-liquidity pair on the configured chain where this is the base token.
@@ -540,6 +543,7 @@ export class PriceOracle {
       // Not indexed yet (the normal state for a pair minutes old) — go to the
       // pool itself rather than leaving the token priceless.
       if (!best) {
+        logger.debug({ token: address, chain }, 'price: no matching DexScreener pair; trying on-chain pool');
         await this.fetchFromPool(address);
         return;
       }
