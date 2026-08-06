@@ -65,6 +65,8 @@ export type FindingKind =
   | 'swap'
   | 'liquidity_add'
   | 'liquidity_remove'
+  /** A V4 PoolManager Donate action. Not liquidity and never a trade. */
+  | 'donation'
   | 'fee'
   | 'no-op-mirror'
   | 'launch'

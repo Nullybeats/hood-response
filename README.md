@@ -102,6 +102,16 @@ have no pool and no DexScreener pair, so without a fabricated price they are
 correctly unvalued and the dust filter drops every swap. That flag is for this
 case and no other.
 
+### Uniswap attribution status
+
+The legacy live listener currently uses receipt-level V3/V4 swap co-occurrence
+as a **candidate** gate. It is not yet the final proof that a watched wallet
+economically bought or sold a token. The production promotion contract, real
+fixture matrix, and reconciliation gate are documented in
+[Uniswap V3/V4 attribution](docs/uniswap-v3-v4-attribution.md). Until that
+contract is promoted, the conservative attribution ledger remains a shadow
+measurement path and alerts/sniper behaviour are unchanged.
+
 ## Quick start
 
 ```bash

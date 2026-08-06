@@ -34,7 +34,7 @@
  */
 
 /** Bump on ANY change to classifier rules. Written on every attribution row. */
-export const CLASSIFIER_VERSION = 2;
+export const CLASSIFIER_VERSION = 3;
 
 /**
  * Unknown categories that are NOT a settled answer about the transaction — they
@@ -48,7 +48,7 @@ export const RETRIABLE_UNKNOWN: ReadonlySet<Category> = new Set<Category>([
 ]);
 
 /** Bump when an adapter's interpretation changes. Written alongside the above. */
-export const ADAPTER_REGISTRY_VERSION = 1;
+export const ADAPTER_REGISTRY_VERSION = 2;
 
 /** The four mutually exclusive, collectively exhaustive outcomes. */
 export type Outcome =
@@ -71,6 +71,8 @@ export type TradeCategory =
 export type NonTradeCategory =
   | 'liquidity_add'
   | 'liquidity_remove'
+  /** V4 PoolManager Donate. A transfer into a pool is not a token purchase. */
+  | 'pool_donation'
   /** Collect (pool + position manager), FeesClaimed, Paid. The largest
    *  previously-unhandled class: 415+ events in a 30k-block sample. */
   | 'fee_collection'
@@ -191,6 +193,7 @@ export const OUTCOME_OF: Record<Category, Outcome> = {
 
   liquidity_add: 'confirmed_non_trade',
   liquidity_remove: 'confirmed_non_trade',
+  pool_donation: 'confirmed_non_trade',
   fee_collection: 'confirmed_non_trade',
   airdrop_receive: 'confirmed_non_trade',
   plain_transfer: 'confirmed_non_trade',

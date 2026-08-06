@@ -109,6 +109,7 @@ export function classifyTransaction(input: ClassifyInput): AttributionResult {
   }
 
   const liq = findings.filter((f) => f.kind === 'liquidity_add' || f.kind === 'liquidity_remove');
+  const donations = findings.filter((f) => f.kind === 'donation');
   const fees = findings.filter((f) => f.kind === 'fee');
   const swaps = findings.filter((f) => f.kind === 'swap');
 
@@ -124,6 +125,7 @@ export function classifyTransaction(input: ClassifyInput): AttributionResult {
   // explicit beneficiary, it cannot be charged to this wallet; otherwise a
   // third party adding liquidity in the same batch would suppress a real swap.
   const oursLiq = liq.filter((f) => ours(f) && !(f.protocolId === 'uniswap-v4' && f.beneficiary == null));
+  const oursDonations = donations.filter(ours);
   const oursFees = fees.filter(ours);
   const oursSwaps = swaps.filter((f) => f.verified);
 
@@ -171,9 +173,17 @@ export function classifyTransaction(input: ClassifyInput): AttributionResult {
 
   const bothSides = up.length > 0 && down.length > 0;
   const exchangeProven = bothSides || ((up.length > 0 || down.length > 0) && nativeLeg);
-  const liqOrFee = oursLiq.length > 0 || oursFees.length > 0;
+  const liqOrFee = oursLiq.length > 0 || oursDonations.length > 0 || oursFees.length > 0;
+  // V4's unlock model permits multiple pool actions under a router. When a
+  // verified manager liquidity/donation action shares a receipt with a swap,
+  // even an un-attributable `sender` is enough to make wallet-level deltas
+  // ambiguous. Suppress it until we can decompose actions, rather than letting
+  // a zap or router batch through as a clean trade.
+  const undecomposedV4Action = [...liq, ...donations].some(
+    (f) => f.verified && f.protocolId === 'uniswap-v4',
+  );
 
-  if (oursSwaps.length > 0 && liqOrFee) {
+  if (oursSwaps.length > 0 && (liqOrFee || undecomposedV4Action)) {
     // MIXED PROTOCOL ACTIONS ARE CURRENTLY SUPPRESSED PENDING ACTION-LEVEL
     // DECOMPOSITION.
     //
@@ -199,6 +209,9 @@ export function classifyTransaction(input: ClassifyInput): AttributionResult {
     if (oursLiq.length > 0) {
       const removing = oursLiq.some((f) => f.kind === 'liquidity_remove');
       return result(removing ? 'liquidity_remove' : 'liquidity_add', ev('liquidity event, no swap'));
+    }
+    if (oursDonations.length > 0) {
+      return result('pool_donation', ev('verified V4 donation, no swap'));
     }
     return result('fee_collection', ev('verified fee/collect event, no swap'));
   }

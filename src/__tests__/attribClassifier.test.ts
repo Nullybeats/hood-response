@@ -21,9 +21,12 @@ const V3_BURN = id('Burn(address,int24,int24,uint128,uint256,uint256)').toLowerC
 const NPM_INCREASE = id('IncreaseLiquidity(uint256,uint128,uint256,uint256)').toLowerCase();
 const NPM_COLLECT = id('Collect(uint256,address,uint256,uint256)').toLowerCase();
 const WETH_DEPOSIT = id('Deposit(address,uint256)').toLowerCase();
+const V4_MODIFY_LIQUIDITY = id('ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)').toLowerCase();
+const V4_DONATE = id('Donate(bytes32,address,uint256,uint256)').toLowerCase();
 
 let idx = 0;
 const hex = (n: bigint) => '0x' + n.toString(16).padStart(64, '0');
+const words = (...values: bigint[]) => `0x${values.map((v) => (v < 0n ? (1n << 256n) + v : v).toString(16).padStart(64, '0')).join('')}`;
 
 function log(address: string, topic0: string, t1?: string, t2?: string, data = '0x0'): TxLogView {
   return {
@@ -87,6 +90,47 @@ describe('attribution classifier — a trade requires a demonstrated exchange', 
       ]),
     });
     expect(r.category).toBe('swap_v4_poolmanager');
+  });
+
+  it('suppresses a V4 swap bundled with ModifyLiquidity, even when the manager sender is a router', () => {
+    // The official V4 manager supports multiple actions inside `unlock`.
+    // Wallet-level flow cannot separate a zap's swap leg from its LP leg.
+    const r = classifyTransaction({
+      ctx: ctx([
+        xfer(WETH, WALLET, POOL, 10n ** 18n),
+        xfer(TOKEN, POOL, WALLET, 42n * 10n ** 18n),
+        log(POOL_MANAGER, V4_SWAP_TOPIC, V4_POOL_ID, addressToTopic(OTHER)),
+        log(POOL_MANAGER, V4_MODIFY_LIQUIDITY, V4_POOL_ID, addressToTopic(OTHER), words(0n, 0n, 1n, 0n)),
+      ]),
+    });
+    expect(r.category).toBe('mixed_or_ambiguous_activity');
+  });
+
+  it('classifies a direct V4 donation as a non-trade and suppresses donation plus swap', () => {
+    const donationOnly = classifyTransaction({
+      ctx: ctx([log(POOL_MANAGER, V4_DONATE, V4_POOL_ID, addressToTopic(WALLET))]),
+    });
+    expect(donationOnly.category).toBe('pool_donation');
+    expect(donationOnly.outcome).toBe('confirmed_non_trade');
+
+    const mixed = classifyTransaction({
+      ctx: ctx([
+        xfer(WETH, WALLET, POOL, 10n ** 18n),
+        xfer(TOKEN, POOL, WALLET, 42n * 10n ** 18n),
+        log(POOL_MANAGER, V4_SWAP_TOPIC, V4_POOL_ID, addressToTopic(OTHER)),
+        log(POOL_MANAGER, V4_DONATE, V4_POOL_ID, addressToTopic(WALLET)),
+      ]),
+    });
+    expect(mixed.category).toBe('mixed_or_ambiguous_activity');
+  });
+
+  it('uses the signed V4 liquidity delta to report a direct liquidity removal', () => {
+    const r = classifyTransaction({
+      ctx: ctx([
+        log(POOL_MANAGER, V4_MODIFY_LIQUIDITY, V4_POOL_ID, addressToTopic(WALLET), words(0n, 0n, -1n, 0n)),
+      ]),
+    });
+    expect(r.category).toBe('liquidity_remove');
   });
 
   it('REGRESSION: a zap (liquidity + swap) is neither a trade nor a non-trade', () => {

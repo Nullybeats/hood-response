@@ -30,6 +30,7 @@ const V3_COLLECT = id('Collect(address,address,int24,int24,uint128,uint128)').to
 const V4_MODIFY_LIQUIDITY = id(
   'ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)',
 ).toLowerCase();
+const V4_DONATE = id('Donate(bytes32,address,uint256,uint256)').toLowerCase();
 const NPM_INCREASE = id('IncreaseLiquidity(uint256,uint128,uint256,uint256)').toLowerCase();
 const NPM_DECREASE = id('DecreaseLiquidity(uint256,uint128,uint256,uint256)').toLowerCase();
 const NPM_COLLECT = id('Collect(uint256,address,uint256,uint256)').toLowerCase();
@@ -52,6 +53,24 @@ export const TRANSFER_WITH_SCALED_UI = id(
 const find = (ctx: TxContext, sigs: string[]): TxLogView[] =>
   ctx.logs.filter((l) => sigs.includes(lc(l.topic0)));
 const isBytes32 = (v: string | null | undefined): v is string => !!v && /^0x[0-9a-f]{64}$/i.test(v);
+
+/**
+ * The third non-indexed word of V4 ModifyLiquidity is `int256 liquidityDelta`.
+ * Its sign distinguishes an add from a removal. Do not call every manager
+ * modification an add: that would turn LP exits into a misleading label.
+ */
+function v4LiquidityKind(data: string | null | undefined): 'liquidity_add' | 'liquidity_remove' {
+  if (!data || !/^0x[0-9a-f]*$/i.test(data) || data.length < 2 + 64 * 3) return 'liquidity_add';
+  try {
+    const raw = BigInt(`0x${data.slice(2 + 64 * 2, 2 + 64 * 3)}`);
+    const signed = raw >= (1n << 255n) ? raw - (1n << 256n) : raw;
+    return signed < 0n ? 'liquidity_remove' : 'liquidity_add';
+  } catch {
+    // An event shape we cannot decode is still non-trade evidence. Defaulting
+    // the subtype affects reporting only; it never permits a BUY/SELL.
+    return 'liquidity_add';
+  }
+}
 
 /** Was this emitter's protocol identity actually established for this tx? */
 function isVerified(ctx: TxContext, address: string, canonical: string[] = []): boolean {
@@ -171,7 +190,7 @@ const uniswapV4: ProtocolAdapter = {
   adapterVersion: ADAPTER_REGISTRY_VERSION,
   status: 'supported',
   contracts: { poolManager: lc(POOL_MANAGER) },
-  events: { Swap: V4_SWAP_TOPIC, ModifyLiquidity: V4_MODIFY_LIQUIDITY },
+  events: { Swap: V4_SWAP_TOPIC, ModifyLiquidity: V4_MODIFY_LIQUIDITY, Donate: V4_DONATE },
   interpret(ctx) {
     const out: ProtocolFinding[] = [];
     // V4 is a singleton.  topic1 is the PoolId and topic2 is the sender (often
@@ -200,11 +219,26 @@ const uniswapV4: ProtocolAdapter = {
       const poolId = isBytes32(l.topic1) ? lc(l.topic1) : null;
       const manager = lc(l.address) === lc(POOL_MANAGER);
       out.push(
-        mk(this, ctx, l, 'liquidity_add', {
-          beneficiary: null,
+        mk(this, ctx, l, v4LiquidityKind(l.data), {
+          // IPoolManager calls this the address that modified the pool. It is
+          // frequently a router, so it is never *assumed* to be the wallet;
+          // classifier.ts only treats it as ours when it exactly matches.
+          beneficiary: topicAddr(l.topic2),
           poolId,
           verified: manager && poolId != null,
           note: 'v4 ModifyLiquidity sender is not assumed to be the user',
+        }),
+      );
+    }
+    for (const l of find(ctx, [V4_DONATE])) {
+      const poolId = isBytes32(l.topic1) ? lc(l.topic1) : null;
+      const manager = lc(l.address) === lc(POOL_MANAGER);
+      out.push(
+        mk(this, ctx, l, 'donation', {
+          beneficiary: topicAddr(l.topic2),
+          poolId,
+          verified: manager && poolId != null,
+          note: 'v4 PoolManager Donate; sender is not assumed to be the user',
         }),
       );
     }
