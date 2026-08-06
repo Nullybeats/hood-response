@@ -1,4 +1,6 @@
-import { CLASSIFIER_VERSION, type Evidence } from './taxonomy.js';
+import { CLASSIFIER_VERSION, RETRIABLE_UNKNOWN, type Category, type Evidence } from './taxonomy.js';
+import { allSchedulerStats, type SchedulerStats } from './scheduler.js';
+import type { PoolVerifierStats } from './poolVerify.js';
 import type { AttributionLedger } from './ledger.js';
 import type { FinalityStatus } from './finality.js';
 import { traceCoverageLabel, tracesUsable, type TraceCapability } from './traces.js';
@@ -53,6 +55,27 @@ export interface TraceDecision {
   recommendation: string;
 }
 
+/**
+ * First-run operational picture.
+ *
+ * These exist to answer the question a first run always raises: is a low
+ * confirmed-trade count a fact about the chain, or about how hard we were
+ * throttling ourselves? Without queue depth and cache hit rate recorded while
+ * they happen, that is unanswerable afterwards.
+ */
+export interface PipelineHealth {
+  schedulers: SchedulerStats[];
+  pools: PoolVerifierStats | null;
+  /**
+   * Pairs whose verdict is retriable — `verification_pending` and
+   * `no_receipt_available`. NOT settled unknowns. Reported separately so a
+   * backlog is never read as a conclusion.
+   */
+  retriableUnknownPairs: number;
+  /** Settled unknowns: verification ran, no trusted provenance. */
+  unsupportedProtocolPairs: number;
+}
+
 export interface SourceHealth {
   /** Per (operation, host, kind) failure counts. */
   failures: { operation: string; source_host: string; failure_kind: string; disposition: string; n: number }[];
@@ -86,6 +109,7 @@ export interface AccountingReport {
   traceCapability: { label: string; usable: boolean; matrix: TraceCapability[] };
   traceDecision: TraceDecision;
   source: SourceHealth;
+  pipeline: PipelineHealth;
 
   /** Everything this report does NOT establish. Read before the numbers. */
   caveats: string[];
@@ -144,6 +168,9 @@ export interface BuildReportInput {
   toBlock: number;
   liveEmitted: number;
   classifierVersion?: number;
+  /** Omitted in offline/replay runs, where no scheduler ran. */
+  poolStats?: PoolVerifierStats | null;
+  schedulerStats?: SchedulerStats[];
 }
 
 export function buildReport(input: BuildReportInput): AccountingReport {
@@ -166,6 +193,12 @@ export function buildReport(input: BuildReportInput): AccountingReport {
   const denom = a.attributed + a.pending + a.drift;
   const usable = tracesUsable(input.traceMatrix);
 
+  const catCount = (c: Category): number =>
+    byCategory.filter((r) => r.category === c).reduce((s, r) => s + r.n, 0);
+  const retriableUnknownPairs = [...RETRIABLE_UNKNOWN].reduce((s, c) => s + catCount(c), 0);
+  const unsupportedProtocolPairs = catCount('unsupported_protocol');
+  const pools = input.poolStats ?? null;
+
   const caveats: string[] = [
     'SCOPE: top-level transaction coverage (sender + recipient) plus ERC-20 Transfer-log coverage. Not "full coverage".',
     usable
@@ -183,6 +216,25 @@ export function buildReport(input: BuildReportInput): AccountingReport {
   if (a.pending > 0) {
     caveats.push(
       `${a.pending} pairs are awaiting a retriable fetch. They are counted in the denominator, not excluded.`,
+    );
+  }
+  if (retriableUnknownPairs > 0) {
+    caveats.push(
+      `${retriableUnknownPairs} pairs are unknown because VERIFICATION OR FETCH HAS NOT COMPLETED (throttle, timeout, queue lag) — this is a backlog, NOT a finding about those contracts. It is reported separately from the ${unsupportedProtocolPairs} pairs where verification ran and established no trusted provenance.`,
+    );
+  }
+  if (pools && pools.uniqueAwaitingVerification > 0) {
+    caveats.push(
+      `${pools.uniqueAwaitingVerification} unique pools still await verification; their swaps cannot yet be confirmed or denied.`,
+    );
+  }
+  const throttled = (input.schedulerStats ?? allSchedulerStats()).reduce(
+    (s, x) => s + x.rateLimitRetries,
+    0,
+  );
+  if (throttled > 0) {
+    caveats.push(
+      `${throttled} rate-limit retries occurred. A depressed confirmed-trade count in this window may reflect ingestion throughput, not market activity.`,
     );
   }
   if (a.drift !== 0) {
@@ -217,6 +269,12 @@ export function buildReport(input: BuildReportInput): AccountingReport {
       retriableFailures: failures.filter((f) => f.disposition === 'retriable').reduce((s, f) => s + f.n, 0),
       terminalFailures: failures.filter((f) => f.disposition === 'terminal').reduce((s, f) => s + f.n, 0),
       pendingPairs: a.pending,
+    },
+    pipeline: {
+      schedulers: input.schedulerStats ?? allSchedulerStats(),
+      pools,
+      retriableUnknownPairs,
+      unsupportedProtocolPairs,
     },
     caveats,
   };

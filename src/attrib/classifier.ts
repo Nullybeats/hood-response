@@ -236,10 +236,31 @@ export function classifyTransaction(input: ClassifyInput): AttributionResult {
   }
 
   // An unverified swap is evidence of something, but never of a trade.
+  //
+  // WHY THIS SPLITS IN TWO. Both branches decline to confirm a trade, so the
+  // live behaviour is identical — but they are opposite claims about why, and
+  // only one of them is an answer. `unsupported_protocol` says verification ran
+  // and the trusted anchor disowned this emitter; that is settled and cacheable.
+  // `verification_pending` says we never got to ask, because of a throttle, a
+  // timeout, or queue lag. Reporting the second as the first would convert an
+  // infrastructure backlog into a permanent verdict about a contract's identity
+  // — the same absence-as-data error the old engine made, with the sign flipped.
   if (swaps.length > 0 && oursSwaps.length === 0) {
+    const stillPending = ctx.pendingContracts;
+    const unresolved = stillPending
+      ? swaps.filter((f) => !f.verified && stillPending.has(lc(f.contract)))
+      : [];
+    if (unresolved.length > 0) {
+      return result(
+        'verification_pending',
+        ev(
+          `swap-shaped event from ${unresolved.length} emitter(s) whose verification has not completed — retry, do not conclude`,
+        ),
+      );
+    }
     return result(
       'unsupported_protocol',
-      ev('swap-shaped event from an emitter whose protocol identity was not established'),
+      ev('swap-shaped event from an emitter whose protocol identity was checked and not established'),
     );
   }
 

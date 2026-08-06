@@ -48,6 +48,17 @@ export interface TxContext {
    * unverified and can never support a `confirmed_trade`.
    */
   verifiedContracts?: Set<string>;
+  /**
+   * Contracts whose verification has NOT COMPLETED — throttled, timed out, or
+   * still queued. Deliberately a separate set from `verifiedContracts` rather
+   * than an absence from it.
+   *
+   * Absence from `verifiedContracts` alone cannot distinguish "the trusted
+   * factory disowned this pool" from "we got a 429 on the way to asking". The
+   * first is a settled answer; the second is a backlog. Merging them would let
+   * a rate limit permanently mark a legitimate pool unsupported.
+   */
+  pendingContracts?: Set<string>;
 }
 
 export type FindingKind =

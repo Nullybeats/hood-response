@@ -2,6 +2,7 @@ import { AbiCoder } from 'ethers';
 import { logger } from '../logger.js';
 import { logHttpFailure, logRpcThrow, redact, rpcHost } from '../chain/rpcLog.js';
 import { INIT_TOPIC, POOL_MANAGER, V3_FACTORY } from '../chain/uniswap.js';
+import { schedulerFor } from './scheduler.js';
 
 /**
  * Pool verification: establishing CONTRACT IDENTITY, not obtaining a response.
@@ -111,10 +112,18 @@ type CallResult = { ok: true; result: string | null } | { ok: false; detail: str
 
 export type EthCall = (to: string, data: string) => Promise<CallResult>;
 
-/** Default transport. Any non-2xx, JSON-RPC error or throw is a FAILURE, never
- *  a negative answer — the distinction decides whether we cache. */
+/**
+ * Default transport. Any non-2xx, JSON-RPC error or throw is a FAILURE, never
+ * a negative answer — the distinction decides whether we cache.
+ *
+ * Runs under the SHARED per-host scheduler, the same one receipts and
+ * transaction context use. Pool verification with its own limiter would simply
+ * add its burst on top of theirs; the host counts the total either way.
+ */
 export function makeEthCall(rpcUrl: string): EthCall {
-  return async (to, data) => {
+  const sched = schedulerFor(rpcUrl);
+  return async (to, data) =>
+    sched.run(async () => {
     try {
       const res = await fetch(rpcUrl, {
         method: 'POST',
@@ -129,6 +138,13 @@ export function makeEthCall(rpcUrl: string): EthCall {
       });
       if (!res.ok) {
         logHttpFailure({ op: 'pool-verify', url: rpcUrl, method: 'eth_call' }, res.status, res.statusText);
+        // Slow EVERY caller on this host, not just this one. A limiter that
+        // only penalises the rejected request leaves the aggregate rate exactly
+        // where it was — which is what earned the 429.
+        if (res.status === 429 || res.status === 503) {
+          const ra = Number(res.headers.get('retry-after'));
+          sched.penalise(Number.isFinite(ra) && ra > 0 ? ra * 1000 : 1000);
+        }
         return { ok: false, detail: `http ${res.status}` };
       }
       const body = (await res.json()) as { result?: string; error?: { message?: string } };
@@ -138,7 +154,7 @@ export function makeEthCall(rpcUrl: string): EthCall {
       logRpcThrow({ op: 'pool-verify', url: rpcUrl, method: 'eth_call' }, err);
       return { ok: false, detail: redact(String(err)).slice(0, 120) };
     }
-  };
+    });
 }
 
 /**
@@ -334,6 +350,21 @@ export class PoolVerifier {
   private readonly cache = new Map<string, PoolVerification>();
   /** Pools we failed to reach, with their last failure. Retried, not concluded. */
   private readonly pendingPools = new Map<string, PoolVerification>();
+  /**
+   * SINGLE FLIGHT. One in-progress verification per pool address, shared by
+   * every concurrent caller.
+   *
+   * Without this, a popular pool appearing in 40 candidate transactions in one
+   * batch issues 40 identical verification runs — 200 RPC calls for one
+   * immutable fact — and they arrive as a burst, which is precisely what earns
+   * a 429. The cache alone does not prevent it: nothing is cached until the
+   * first run RETURNS, so every caller that starts before then misses.
+   */
+  private readonly inflight = new Map<string, Promise<PoolVerification>>();
+
+  private cacheHits = 0;
+  private cacheMisses = 0;
+  private coalesced = 0;
 
   constructor(private readonly call: EthCall) {}
 
@@ -344,16 +375,36 @@ export class PoolVerifier {
   async verifyV3(pool: string, trustedFactory = V3_FACTORY): Promise<PoolVerification> {
     const p = lc(pool);
     const hit = this.cache.get(p);
-    if (hit) return hit;
-    const v = await verifyV3Pool(p, this.call, trustedFactory);
-    if (v.status === 'pending') {
-      this.pendingPools.set(p, v);
-      logger.debug({ pool: p, failure: v.evidence.failure }, 'pool verify: pending, will retry');
-      return v;
+    if (hit) {
+      this.cacheHits += 1;
+      return hit;
     }
-    this.pendingPools.delete(p);
-    this.cache.set(p, v);
-    return v;
+    const flight = this.inflight.get(p);
+    if (flight) {
+      this.coalesced += 1;
+      return flight;
+    }
+
+    this.cacheMisses += 1;
+    const run = (async (): Promise<PoolVerification> => {
+      const v = await verifyV3Pool(p, this.call, trustedFactory);
+      if (v.status === 'pending') {
+        this.pendingPools.set(p, v);
+        logger.debug({ pool: p, failure: v.evidence.failure }, 'pool verify: pending, will retry');
+        return v;
+      }
+      this.pendingPools.delete(p);
+      this.cache.set(p, v);
+      return v;
+    })();
+    this.inflight.set(p, run);
+    try {
+      return await run;
+    } finally {
+      // Cleared unconditionally: leaving a settled (or rejected) promise here
+      // would make a transient failure permanent for the process lifetime.
+      this.inflight.delete(p);
+    }
   }
 
   recordV4(log: InitializeLog, trustedManager = POOL_MANAGER): PoolVerification {
@@ -373,15 +424,53 @@ export class PoolVerifier {
     return [...this.pendingPools.values()];
   }
 
-  stats(): { verified: number; unverified: number; pending: number } {
+  /**
+   * Pools awaiting verification, for `TxContext.pendingContracts`.
+   *
+   * A swap from one of these is `verification_pending`, not
+   * `unsupported_protocol` — we have not finished asking.
+   */
+  pendingSet(): Set<string> {
+    return new Set(this.pendingPools.keys());
+  }
+
+  stats(): PoolVerifierStats {
     let verified = 0;
     let unverified = 0;
     for (const v of this.cache.values()) {
       if (v.status === 'verified') verified += 1;
       else unverified += 1;
     }
-    return { verified, unverified, pending: this.pendingPools.size };
+    const lookups = this.cacheHits + this.cacheMisses + this.coalesced;
+    return {
+      verified,
+      unverified,
+      pending: this.pendingPools.size,
+      uniqueAwaitingVerification: this.pendingPools.size,
+      inflight: this.inflight.size,
+      cacheHits: this.cacheHits,
+      cacheMisses: this.cacheMisses,
+      coalesced: this.coalesced,
+      // Coalesced calls count as hits: like a cache hit, they cost no RPC.
+      hitRate: lookups > 0 ? (this.cacheHits + this.coalesced) / lookups : 0,
+    };
   }
+}
+
+export interface PoolVerifierStats {
+  verified: number;
+  unverified: number;
+  pending: number;
+  /** Distinct pools with no settled verdict yet. */
+  uniqueAwaitingVerification: number;
+  /** Verifications running right now. */
+  inflight: number;
+  cacheHits: number;
+  cacheMisses: number;
+  /** Callers that joined an in-flight verification instead of starting one. */
+  coalesced: number;
+  /** (hits + coalesced) / lookups — the share of lookups that cost no RPC. */
+  hitRate: number;
 }
 
 /** Host-safe summary for a report. */

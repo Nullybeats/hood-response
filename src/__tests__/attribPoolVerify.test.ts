@@ -116,7 +116,7 @@ describe('pool verification — identity, not a non-zero response', () => {
       await v.verifyV3(POOL);
       await v.verifyV3(POOL);
       expect(calls).toBeGreaterThan(1); // retried, not concluded
-      expect(v.stats()).toEqual({ verified: 0, unverified: 0, pending: 1 });
+      expect(v.stats()).toMatchObject({ verified: 0, unverified: 0, pending: 1 });
     });
 
     it('caches a verified pool and exposes it for the classifier', async () => {

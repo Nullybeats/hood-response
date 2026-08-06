@@ -34,7 +34,18 @@
  */
 
 /** Bump on ANY change to classifier rules. Written on every attribution row. */
-export const CLASSIFIER_VERSION = 1;
+export const CLASSIFIER_VERSION = 2;
+
+/**
+ * Unknown categories that are NOT a settled answer about the transaction — they
+ * record that we have not finished looking. They must be re-attempted and must
+ * never be reported alongside terminal unknowns, or an infrastructure backlog
+ * reads as a conclusion about the chain.
+ */
+export const RETRIABLE_UNKNOWN: ReadonlySet<Category> = new Set<Category>([
+  'verification_pending',
+  'no_receipt_available',
+]);
 
 /** Bump when an adapter's interpretation changes. Written alongside the above. */
 export const ADAPTER_REGISTRY_VERSION = 1;
@@ -85,7 +96,28 @@ export type NonTradeCategory =
 export type UnknownCategory =
   /** An event signature no adapter claims. Drives the unknown-topic leaderboard. */
   | 'unknown_topic'
+  /**
+   * Verification COMPLETED and did not establish trusted provenance. A real,
+   * deterministic answer: the emitter claimed the wrong factory, or the trusted
+   * factory disowned it. Safe to cache; will not change on retry.
+   */
   | 'unsupported_protocol'
+  /**
+   * Verification HAS NOT COMPLETED — a 429, a timeout, or the pool is still
+   * sitting in the verification queue.
+   *
+   * THIS IS NOT `unsupported_protocol`, and collapsing the two would rebuild the
+   * exact defect this subsystem exists to remove, only harder to see. The old
+   * engine turned an absence of evidence into a positive label (BUY); turning
+   * "we have not looked yet" into "verification says no" is the same error with
+   * the sign flipped — an infrastructure hiccup laundered into a permanent
+   * verdict about a contract's identity. A throttle would silently and durably
+   * disqualify a legitimate pool.
+   *
+   * So this category is explicitly RETRIABLE: it holds its cursor, it is
+   * re-attempted, and it is reported separately from every terminal verdict.
+   */
+  | 'verification_pending'
   /**
    * The transaction legitimately contains BOTH a liquidity/fee action and a
    * swap, and the wallet's net flow does not resolve which the wallet was
@@ -174,6 +206,7 @@ export const OUTCOME_OF: Record<Category, Outcome> = {
   unknown_topic: 'unknown_unsupported',
   mixed_or_ambiguous_activity: 'unknown_unsupported',
   unsupported_protocol: 'unknown_unsupported',
+  verification_pending: 'unknown_unsupported',
   ambiguous_multiparty: 'unknown_unsupported',
   insufficient_trace_data: 'unknown_unsupported',
   ambiguous_asset_flow: 'unknown_unsupported',
