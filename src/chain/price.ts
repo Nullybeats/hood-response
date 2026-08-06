@@ -57,6 +57,8 @@ interface DexPair {
   txns?: { h24?: { buys?: number; sells?: number } };
 }
 
+type DexTokenResponse = { pairs?: DexPair[] } | DexPair[];
+
 const TTL_MS = 60_000;
 // Tokens re-priced per refresh tick. Each is a separate request because the
 // multi-token endpoint caps at 30 pairs *total*, which starves busy tokens.
@@ -529,7 +531,12 @@ export class PriceOracle {
   private async fetchOne(address: string): Promise<void> {
     const chain = config.DEXSCREENER_CHAIN.toLowerCase();
     try {
-      const res = await this.fetchDexScreener(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
+      // This chain-specific endpoint avoids the globally throttled
+      // `latest/dex/tokens` fan-out route. It returns the same pair records,
+      // but only for the chain we actually observe.
+      const res = await this.fetchDexScreener(
+        `https://api.dexscreener.com/token-pairs/v1/${encodeURIComponent(chain)}/${address}`,
+      );
       if (!res.ok) {
         logger.warn({ token: address, status: res.status }, 'price: DexScreener request failed');
         // A throttle is not evidence the token lacks a price. Keep this visible
@@ -537,11 +544,12 @@ export class PriceOracle {
         if (res.status === 429) this.requestRefresh(address);
         return;
       }
-      const json = (await res.json()) as { pairs?: DexPair[] };
+      const json = (await res.json()) as DexTokenResponse;
+      const pairs = Array.isArray(json) ? json : json.pairs ?? [];
 
       // Highest-liquidity pair on the configured chain where this is the base token.
       let best: DexPair | null = null;
-      for (const p of json.pairs ?? []) {
+      for (const p of pairs) {
         if ((p.chainId ?? '').toLowerCase() !== chain) continue;
         if (p.baseToken?.address?.toLowerCase() !== address) continue;
         if (!best || (p.liquidity?.usd ?? 0) > (best.liquidity?.usd ?? 0)) best = p;

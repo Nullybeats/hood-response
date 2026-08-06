@@ -62,6 +62,17 @@ describe('PriceOracle ATH tracking', () => {
     expect(oracle.quoteState(TOKEN)).toBe('pricing');
   });
 
+  it('accepts the chain-specific token-pairs response shape', async () => {
+    const oracle = new PriceOracle([]);
+    const body = await dexResponse(123_456).json();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => body.pairs }));
+
+    await oracle.refreshNow(TOKEN);
+
+    expect(oracle.priceOf(TOKEN)).toBe(1);
+    expect(oracle.marketCap({ address: TOKEN, symbol: 'GEM', name: 'GEM', totalSupply: 1 })).toBe(123_456);
+  });
+
   it('tracks the highest market cap seen and never lowers it on a dip', async () => {
     const oracle = new PriceOracle([]);
     const fetchMock = vi
