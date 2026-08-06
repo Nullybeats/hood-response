@@ -191,7 +191,15 @@ const $ = (id) => document.getElementById(id);
 const short = (a) => a ? a.slice(0,6)+'…'+a.slice(-4) : '';
 // null/undefined = unknown, and must not render as "$0.00" — an unmeasured
 // figure that looks measured is the whole bug class this guards against.
-const usd = (n) => n==null ? 'unpriced' : n>=1e6 ? '$'+(n/1e6).toFixed(2)+'M' : n>=1e3 ? '$'+(n/1e3).toFixed(1)+'k' : '$'+n.toFixed(2);
+const usd = (n) => {
+  if(n==null || !Number.isFinite(Number(n))) return 'unpriced';
+  n=Number(n);
+  if(n>=1e6) return '$'+(n/1e6).toFixed(2)+'M';
+  if(n>=1e3) return '$'+(n/1e3).toFixed(1)+'k';
+  if(n>=1) return '$'+n.toFixed(2);
+  if(n>=0.01) return '$'+n.toFixed(4);
+  return '$'+n.toPrecision(3);
+};
 const quoteLabel = (q) => q&&q.state==='pricing' ? 'pricing…' : 'price unavailable';
 const convClass = (c) => c>=70?'hi':c>=40?'mid':'lo';
 const time = (t) => new Date(t).toLocaleTimeString();
@@ -228,6 +236,10 @@ const quoteFor=(s)=>{
   if((!server||server.state!=='live')&&(!local||local.state!=='live')) void fetchBrowserQuote(s.token);
   return local&&local.state==='live'?local:server||local;
 };
+// A swarm's historical dollar total is deliberately not reconstructed from a
+// later quote. When it is absent, show the current unit price instead of
+// incorrectly calling a valid quote unavailable.
+const currentPriceLabel=(q)=>q&&q.priceUsd!=null?'px '+usd(q.priceUsd):quoteLabel(q);
 const txLink=(h)=>h&&EXPLORER_BASE?'<a href="'+EXPLORER_BASE+'/tx/'+h+'" target="_blank" rel="noopener" class="dex">'+h.slice(0,8)+'…</a>':(h?h.slice(0,8)+'…':'');
 const dexUrl = (addr) => DEX_CHAIN ? 'https://dexscreener.com/'+DEX_CHAIN+'/'+addr : 'https://dexscreener.com/search?q='+addr;
 const dexLink = (addr,label) => '<a href="'+dexUrl(addr)+'" target="_blank" rel="noopener" class="dex">'+label+'</a>';
@@ -292,7 +304,7 @@ function swarmRow(s){
     '<span class="sym">'+dexA(s.dexUrl,s.tokenSymbol)+into+'</span>'+
     '<span class="grow mono">'+(s.walletSummary||s.walletCount+' wallets')+' · '+mcLabel(s)+'</span>'+
     buyLinks(s.token)+
-    '<span class="usd">'+(s.totalUsd>0?usd(s.totalUsd):quoteLabel(q))+'</span>'+
+    '<span class="usd">'+(s.totalUsd>0?usd(s.totalUsd):currentPriceLabel(q))+'</span>'+
     '<span class="conv '+convClass(s.conviction)+'">'+s.conviction+'</span>';
   return d;
 }
@@ -315,7 +327,7 @@ function newCoinRow(s){
     '<span class="grow addr" title="'+s.token+'">'+dexA(s.dexUrl,s.token)+'</span>'+
     '<span class="mono">'+s.walletCount+'w · '+mcLabel(s)+'</span>'+
     buyLinks(s.token)+
-    '<span class="usd">'+(s.totalUsd>0?usd(s.totalUsd):quoteLabel(q))+'</span>'+
+    '<span class="usd">'+(s.totalUsd>0?usd(s.totalUsd):currentPriceLabel(q))+'</span>'+
     '<span class="conv '+convClass(s.conviction)+'">'+s.conviction+'</span>';
   return d;
 }

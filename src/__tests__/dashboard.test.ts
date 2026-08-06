@@ -6,6 +6,7 @@ describe('dashboard quote fallback', () => {
     expect(DASHBOARD_HTML).toContain('const browserQuotes=new Map()');
     expect(DASHBOARD_HTML).toContain('https://api.dexscreener.com/token-pairs/v1/');
     expect(DASHBOARD_HTML).toContain('const quoteFor=(s)=>');
+    expect(DASHBOARD_HTML).toContain('const currentPriceLabel=');
     expect(DASHBOARD_HTML).toContain('MC (after signal)');
   });
 });
