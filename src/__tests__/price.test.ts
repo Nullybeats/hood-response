@@ -53,6 +53,15 @@ describe('PriceOracle ATH tracking', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps a throttled visible token pending instead of calling it unpriced', async () => {
+    const oracle = new PriceOracle([]);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 429 }));
+
+    await oracle.refreshNow(TOKEN);
+
+    expect(oracle.quoteState(TOKEN)).toBe('pricing');
+  });
+
   it('tracks the highest market cap seen and never lowers it on a dip', async () => {
     const oracle = new PriceOracle([]);
     const fetchMock = vi

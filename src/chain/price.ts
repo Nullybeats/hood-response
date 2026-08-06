@@ -60,7 +60,10 @@ interface DexPair {
 const TTL_MS = 60_000;
 // Tokens re-priced per refresh tick. Each is a separate request because the
 // multi-token endpoint caps at 30 pairs *total*, which starves busy tokens.
-const MAX_PER_TICK = 12;
+const MAX_PER_TICK = 1;
+/** Shared-IP friendly spacing for DexScreener's public endpoint. */
+const DEX_MIN_INTERVAL_MS = 1_500;
+const DEX_429_COOLDOWN_MS = 60_000;
 // Bound the caches on a long-running process (many discovered tokens).
 const MAX_CACHE = 5_000;
 /** On-chain supply backfills per refresh tick — 3 eth_calls each, so kept small. */
@@ -85,6 +88,8 @@ function capMap<T>(map: Map<string, T>, max: number): void {
     map.delete(oldest);
   }
 }
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * USD price / market-cap oracle.
@@ -113,6 +118,11 @@ export class PriceOracle {
   private readonly queue = new Set<string>();
   /** Recently displayed tokens jump ahead of the long restored-token backlog. */
   private readonly priorityQueue = new Set<string>();
+  /** Coalesce simultaneous requests for one token before any HTTP work starts. */
+  private readonly inflight = new Map<string, Promise<void>>();
+  /** One public-DexScreener request at a time; Railway shares this egress IP. */
+  private dexTail: Promise<void> = Promise.resolve();
+  private dexNextAt = 0;
   /** Tokens awaiting an on-chain supply read (see drainSupplyQueue). */
   private readonly supplyQueue = new Set<string>();
   /** Failed supply-read counts, so a hopeless contract is not retried forever. */
@@ -353,13 +363,8 @@ export class PriceOracle {
     const cached = this.ethUsdPrice();
     if (cached != null && cached > 0) return cached;
     if (!config.SNIPER_WETH) return null;
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 6000);
     try {
-      const res = await fetch(
-        `https://api.dexscreener.com/latest/dex/tokens/${config.SNIPER_WETH}`,
-        { signal: ctrl.signal },
-      );
+      const res = await this.fetchDexScreener(`https://api.dexscreener.com/latest/dex/tokens/${config.SNIPER_WETH}`);
       if (!res.ok) return null;
       const json = (await res.json()) as { pairs?: DexPair[] };
       const chain = config.DEXSCREENER_CHAIN.toLowerCase();
@@ -378,8 +383,6 @@ export class PriceOracle {
     } catch (err) {
       logger.debug({ err: String(err) }, 'eth/usd reference fetch failed');
       return null;
-    } finally {
-      clearTimeout(t);
     }
   }
 
@@ -400,7 +403,11 @@ export class PriceOracle {
     if (!this.liveEnabled) return;
     const key = tokenAddress.toLowerCase();
     if (this.fresh(key)) return;
-    await this.fetchOne(key);
+    const existing = this.inflight.get(key);
+    if (existing) return existing;
+    const work = this.fetchOne(key).finally(() => this.inflight.delete(key));
+    this.inflight.set(key, work);
+    await work;
   }
 
   /**
@@ -423,7 +430,7 @@ export class PriceOracle {
    */
   async warmVisible(tokens: Iterable<string>, limit = 24): Promise<void> {
     const unique = [...new Set([...tokens].map((t) => t.toLowerCase()))].slice(0, limit);
-    const concurrency = 4;
+    const concurrency = 1;
     for (let i = 0; i < unique.length; i += concurrency) {
       await Promise.all(unique.slice(i, i + concurrency).map((token) => this.refreshNow(token)));
     }
@@ -490,7 +497,7 @@ export class PriceOracle {
       this.priorityQueue.delete(a);
       this.queue.delete(a);
     }
-    await Promise.all(batch.map((a) => this.fetchOne(a)));
+    await Promise.all(batch.map((a) => this.refreshNow(a)));
   }
 
   /**
@@ -521,14 +528,13 @@ export class PriceOracle {
 
   private async fetchOne(address: string): Promise<void> {
     const chain = config.DEXSCREENER_CHAIN.toLowerCase();
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 6000);
     try {
-      const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`, {
-        signal: ctrl.signal,
-      });
+      const res = await this.fetchDexScreener(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
       if (!res.ok) {
         logger.warn({ token: address, status: res.status }, 'price: DexScreener request failed');
+        // A throttle is not evidence the token lacks a price. Keep this visible
+        // token at the head of the bounded retry lane after the global cooldown.
+        if (res.status === 429) this.requestRefresh(address);
         return;
       }
       const json = (await res.json()) as { pairs?: DexPair[] };
@@ -583,8 +589,34 @@ export class PriceOracle {
     } catch (err) {
       logger.debug({ err: String(err) }, 'dexscreener price fetch failed');
       await this.fetchFromPool(address).catch(() => undefined);
+    }
+  }
+
+  /**
+   * DexScreener's public endpoint is quotaed by egress IP. Railway services
+   * share one, so parallel fetches look like an abusive burst even when this
+   * process is modest. A 429 pauses the entire lane instead of immediately
+   * retrying the same failing pattern.
+   */
+  private async fetchDexScreener(url: string): Promise<Response> {
+    let release: () => void = () => undefined;
+    const previous = this.dexTail;
+    this.dexTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      const delay = Math.max(0, this.dexNextAt - Date.now());
+      if (delay) await sleep(delay);
+      const ctrl = new AbortController();
+      const timeout = setTimeout(() => ctrl.abort(), 6_000);
+      try {
+        const res = await fetch(url, { signal: ctrl.signal });
+        this.dexNextAt = Date.now() + (res.status === 429 ? DEX_429_COOLDOWN_MS : DEX_MIN_INTERVAL_MS);
+        return res;
+      } finally {
+        clearTimeout(timeout);
+      }
     } finally {
-      clearTimeout(t);
+      release();
     }
   }
 
