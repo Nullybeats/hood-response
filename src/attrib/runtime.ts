@@ -256,7 +256,7 @@ export class AttributionShadow {
    * A trace outage therefore produces an honest unproven verdict for a one-leg
    * swap rather than stalling the shadow or changing the live listener.
    */
-  private async traceNativeDeltas(txHash: string, blockNumber: number, wallet: string) {
+  private async probeTraceCapability(txHash: string, blockNumber: number) {
     const url = config.ATTRIB_TRACE_RPC_URL;
     if (!url) return [];
     const target = {
@@ -265,7 +265,13 @@ export class AttributionShadow {
       probeTxHash: txHash,
       probeBlockHex: `0x${blockNumber.toString(16)}`,
     };
-    const caps = await this.traceMatrix.probeAll(target);
+    return this.traceMatrix.probeAll(target);
+  }
+
+  private async traceNativeDeltas(txHash: string, blockNumber: number, wallet: string) {
+    const url = config.ATTRIB_TRACE_RPC_URL;
+    if (!url) return [];
+    const caps = await this.probeTraceCapability(txHash, blockNumber);
     if (caps.find((c) => c.method === 'debug_traceTransaction')?.status !== 'available') return [];
 
     const sched = schedulerFor(url);
@@ -373,6 +379,10 @@ export class AttributionShadow {
       data: l.data ?? null,
       logIndex: logIndexOf(l, index),
     }));
+    // Probe against the next observed transaction even when this particular
+    // receipt needs no trace. Otherwise a quiet watched set could leave a newly
+    // configured provider at "not probed" for hours, which is not actionable.
+    await this.probeTraceCapability(txHash, blockNumber);
     const candidatePools = logs
       .filter((l) => l.topic0 === V3_SWAP_TOPIC && l.address)
       .map((l) => l.address);
