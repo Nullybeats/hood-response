@@ -189,8 +189,9 @@ function enrichToken(store: MemoryStore, tokenAddr: string, inflight: Set<string
 /**
  * Live listener: subscribes to ERC-20 Transfer logs for the tracked tokens over
  * a JSON-RPC WebSocket, decodes them into BUY/SELL swaps for tracked wallets,
- * and auto-reconnects with exponential backoff. New heads drive block/latency
- * metrics.
+ * and auto-reconnects with exponential backoff. Transfer logs already carry a
+ * block number; block-head and latency telemetry are optional because a fast
+ * L2's all-head stream is needlessly expensive on a metered WebSocket.
  */
 export class LiveChainListener implements ChainListener {
   private ws: WebSocket | null = null;
@@ -261,8 +262,8 @@ export class LiveChainListener implements ChainListener {
         const addresses = [...this.store.tokensByAddress.keys()];
         this.send('eth_subscribe', ['logs', { address: addresses, topics: [TRANSFER_TOPIC] }]);
       }
-      this.send('eth_subscribe', ['newHeads']);
-      this.startLatencyProbe();
+      if (config.CHAIN_WS_INCLUDE_HEADS) this.send('eth_subscribe', ['newHeads']);
+      if (config.CHAIN_WS_LATENCY_PROBE_MS > 0) this.startLatencyProbe();
     });
 
     ws.on('message', (data) => this.onMessage(data.toString()));
@@ -297,7 +298,7 @@ export class LiveChainListener implements ChainListener {
       if (this.ws?.readyState !== WebSocket.OPEN) return;
       const id = this.send('eth_blockNumber', []);
       this.pendingLatency.set(id, Date.now());
-    }, 5000);
+    }, config.CHAIN_WS_LATENCY_PROBE_MS);
   }
 
   private onMessage(raw: string): void {

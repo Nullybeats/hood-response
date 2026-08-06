@@ -82,6 +82,18 @@ const schema = z.object({
   // listener and for token metadata. Override with a dedicated provider
   // (Alchemy/QuickNode) for production throughput.
   CHAIN_HTTP_URL: z.string().default('https://rpc.mainnet.chain.robinhood.com'),
+  // A metered provider is intentionally opt-in for the continuous listener.
+  // This prevents an endpoint copied into CHAIN_WS_URL from silently creating
+  // billable traffic. Before enabling it, set the provider's own hard billing
+  // limit as well; this flag is a deployment guard, not a spending cap.
+  CHAIN_ALLOW_METERED_LISTENER: bool(false),
+  // A wallet-transfer log includes its block number, so subscribing to every
+  // block is only useful for dashboard telemetry. Keep the expensive stream
+  // off by default on fast L2s.
+  CHAIN_WS_INCLUDE_HEADS: bool(false),
+  // An optional websocket round-trip metric. Zero avoids continuous probe
+  // requests; enable only while investigating latency.
+  CHAIN_WS_LATENCY_PROBE_MS: num(0),
   CHAIN_ID: z.string().default('4663'),
   CHAIN_MODE: z.enum(['live', 'simulator', 'auto']).default('auto'),
   // HTTP polling cadence (ms) when using the HTTP listener.
@@ -536,12 +548,11 @@ const env = parsed.data;
 /**
  * Metered-RPC guard for the LISTENER lanes.
  *
- * The chain listener runs forever. The WS variant subscribes to `newHeads`, which bills one
- * delivery per block — ~36k blocks/hour on this 0.1s chain — and the HTTP variant polls
- * `eth_getLogs` on a loop. Pointing either at a metered provider silently turns a background loop
- * into a monthly bill: on 2026-08-01 a 16-minute run with CHAIN_WS_URL on Alchemy burned 627,535
- * compute units, a ~$200/month run-rate. Only SNIPER_EXECUTOR_RPC may be metered — tx SENDS need a
- * reliable node because the public one 429s under execution.
+ * The chain listener runs forever. On 2026-08-01, an unfiltered Alchemy test
+ * that subscribed to `newHeads` burned 627,535 compute units in 16 minutes.
+ * A keyed listener therefore needs both narrow subscriptions and an explicit
+ * deployment opt-in. Only SNIPER_EXECUTOR_RPC may be metered by default — tx
+ * sends need a reliable node because the public one 429s under execution.
  *
  * So a listener URL on a known metered host is dropped and replaced with the free public node.
  * Loud, never fatal: an RPC misconfiguration must not stop the sniper from booting.
@@ -558,12 +569,12 @@ const rpcHost = (url: string): string => {
   }
 };
 const rejectMeteredListenerRpc = (url: string, name: string, fallback: string): string => {
-  if (!url || !METERED_RPC_HOST.test(rpcHost(url))) return url;
+  if (!url || !METERED_RPC_HOST.test(rpcHost(url)) || env.CHAIN_ALLOW_METERED_LISTENER) return url;
   // eslint-disable-next-line no-console
   console.warn(
     `[env] ${name}=${rpcHost(url)} is a METERED RPC — ignoring it. The chain listener runs forever ` +
       `and would bill every block/log. Falling back to ${fallback || '(no ws listener)'}. ` +
-      `Put the metered node in SNIPER_EXECUTOR_RPC instead — only tx sends belong on the meter.`,
+      `Set CHAIN_ALLOW_METERED_LISTENER=true only after the provider's hard spend limit is set.`,
   );
   return fallback;
 };
