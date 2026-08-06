@@ -245,11 +245,12 @@ export async function observeUniverse(
   from: number,
   to: number,
 ): Promise<UniverseResult> {
-  const [sender, recipient, transfers] = await Promise.all([
-    observeSenderTransactions(hs, ledger, watched, from, to),
-    observeRecipientTransactions(hs, ledger, watched, from, to),
-    observeTransferLogs(hs, ledger, watched, from, to),
-  ]);
+  // Keep these sequential.  A continuity check may roll back every stream;
+  // concurrent writers could otherwise commit fresh observations after another
+  // stream has detected and rolled back a reorg.
+  const sender = await observeSenderTransactions(hs, ledger, watched, from, to);
+  const recipient = await observeRecipientTransactions(hs, ledger, watched, from, to);
+  const transfers = await observeTransferLogs(hs, ledger, watched, from, to);
   const covereds = [sender, recipient, transfers].map((r) => r?.covered ?? from - 1);
   const safeCovered = Math.min(...covereds);
   const anyTruncated = [sender, recipient, transfers].some((r) => r === null || r.truncated);

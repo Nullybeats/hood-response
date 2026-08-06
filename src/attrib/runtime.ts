@@ -94,7 +94,7 @@ export class AttributionShadow {
       return { enabled: false, reason: this.ledger.degraded ? 'ledger disabled' : 'shadow has not completed a window' };
     }
     const finality = finalityStatus(this.ledger, this.observedHead);
-    return buildReport({
+    const report = buildReport({
       ledger: this.ledger,
       finality,
       traceMatrix: [], // The configured public RPC is known trace-unavailable; a future trace source is probed separately.
@@ -110,6 +110,14 @@ export class AttributionShadow {
       liveEmitted: this.ledger.liveEmittedCount(this.lastWindow.from, this.lastWindow.to),
       poolStats: this.verifier.stats(),
     });
+    // The classifier can represent verified V4 evidence, but this first
+    // runtime only obtains V3 pool proofs.  Keep that distinction visible in
+    // every report until PoolManager/Initialize provenance is wired here.
+    report.scope += '; verified-pool confirmation: V3 only in this runtime';
+    report.caveats.push(
+      'V4 PoolManager/Initialize provenance is not wired into this runtime yet. V4 activity may be observed, but cannot become `confirmed_trade` here.',
+    );
+    return report;
   }
 
   private async tick(): Promise<void> {
