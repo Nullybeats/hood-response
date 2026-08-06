@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { PriceOracle } from '../chain/price.js';
+import { PoolPriceReader } from '../chain/poolPrice.js';
 
 const TOKEN = '0xabc0000000000000000000000000000000000a';
 
@@ -56,10 +57,33 @@ describe('PriceOracle ATH tracking', () => {
   it('keeps a throttled visible token pending instead of calling it unpriced', async () => {
     const oracle = new PriceOracle([]);
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 429 }));
+    // A 429 now attempts the canonical-pool fallback immediately. Keep this
+    // unit test about retry state, not a real provider call.
+    vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(2_000);
+    vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue(null);
 
     await oracle.refreshNow(TOKEN);
 
     expect(oracle.quoteState(TOKEN)).toBe('pricing');
+  });
+
+  it('prices a confirmed pool immediately when DexScreener throttles', async () => {
+    const oracle = new PriceOracle([]);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 429 }));
+    vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(2_000);
+    vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue({
+      priceEth: 0.001,
+      venue: 'v3',
+      liquidity: 1n,
+      poolAddress: '0x0000000000000000000000000000000000000001',
+      pairCreatedAt: 1_700_000_000_000,
+    });
+
+    await oracle.refreshNow(TOKEN);
+
+    expect(oracle.priceOf(TOKEN)).toBe(2);
+    expect(oracle.sourceOf(TOKEN)).toBe('pool');
+    expect(oracle.pairCreatedAt(TOKEN)).toBe(1_700_000_000_000);
   });
 
   it('accepts the chain-specific token-pairs response shape', async () => {

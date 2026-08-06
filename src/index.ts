@@ -1,7 +1,12 @@
 import { config } from './config/env.js';
 import { logger } from './logger.js';
 import { MemoryStore } from './store/memory.js';
-import { loadFeedState, saveFeedState, toPersistedToken } from './store/feedState.js';
+import {
+  loadFeedState,
+  saveFeedState,
+  toPersistedToken,
+  type PersistedSignalCandidate,
+} from './store/feedState.js';
 import { PriceOracle } from './chain/price.js';
 import { createListener } from './chain/listener.js';
 import { HyperSyncShadow } from './chain/shadow.js';
@@ -25,6 +30,82 @@ import { tickPaper, paperEnabled } from './pons/paper.js';
 import { TelegramCommands } from './telegram/commands.js';
 import type { Swarm, SwapEvent } from './types.js';
 import { walletIdSaltMissing } from './walletId.js';
+
+type CandidateMode = PersistedSignalCandidate['mode'];
+type CandidateResult = 'resolved' | 'retry' | 'discard';
+
+/**
+ * A bounded, durable retry lane for real chain candidates whose authoritative
+ * pool price, supply, or creation age was temporarily unavailable. It never
+ * replays a recorded alert; it only retains the pre-alert decision.
+ */
+class PendingSignalQueue {
+  private readonly pending = new Map<string, PersistedSignalCandidate>();
+  private readonly timers = new Map<string, NodeJS.Timeout>();
+  private stopped = false;
+
+  constructor(private readonly evaluate: (candidate: PersistedSignalCandidate) => Promise<CandidateResult>) {}
+
+  enqueue(swarm: Swarm, mode: CandidateMode): void {
+    if (this.stopped) return;
+    const key = swarm.id;
+    const existing = this.pending.get(key);
+    if (existing) return;
+    if (this.pending.size >= 256) {
+      logger.warn({ queued: this.pending.size, token: swarm.tokenSymbol }, 'signal retry queue full; candidate retained in chain ledger only');
+      return;
+    }
+    const candidate: PersistedSignalCandidate = { swarm, mode, attempts: 0, nextAt: Date.now() + 1_000 };
+    this.pending.set(key, candidate);
+    this.schedule(key, candidate);
+    logger.info({ token: swarm.tokenSymbol, mode }, 'signal pending: awaiting canonical price/age evidence');
+  }
+
+  restore(candidates: readonly PersistedSignalCandidate[]): void {
+    for (const candidate of candidates.slice(0, 256)) {
+      if (this.pending.has(candidate.swarm.id)) continue;
+      this.pending.set(candidate.swarm.id, candidate);
+      this.schedule(candidate.swarm.id, candidate);
+    }
+  }
+
+  snapshot(): PersistedSignalCandidate[] {
+    return [...this.pending.values()].map((candidate) => ({ ...candidate, swarm: candidate.swarm }));
+  }
+
+  stop(): void {
+    this.stopped = true;
+    for (const timer of this.timers.values()) clearTimeout(timer);
+    this.timers.clear();
+  }
+
+  private schedule(key: string, candidate: PersistedSignalCandidate): void {
+    if (this.stopped || this.pending.get(key) !== candidate) return;
+    const delay = Math.max(250, candidate.nextAt - Date.now());
+    const timer = setTimeout(() => void this.retry(key, candidate), delay);
+    timer.unref();
+    this.timers.set(key, timer);
+  }
+
+  private async retry(key: string, candidate: PersistedSignalCandidate): Promise<void> {
+    this.timers.delete(key);
+    if (this.stopped || this.pending.get(key) !== candidate) return;
+    const result = await this.evaluate(candidate).catch((err) => {
+      logger.warn({ err: String(err), token: candidate.swarm.tokenSymbol }, 'signal retry evaluation failed');
+      return 'retry' as const;
+    });
+    if (result !== 'retry') {
+      this.pending.delete(key);
+      return;
+    }
+    candidate.attempts += 1;
+    // Quick first recovery, then a bounded one-minute cadence. The record is
+    // never discarded merely because an external provider stayed unavailable.
+    const delay = Math.min(60_000, 1_000 * 2 ** Math.min(candidate.attempts, 6));
+    candidate.nextAt = Date.now() + delay;
+    this.schedule(key, candidate);
+  }
+}
 
 async function main(): Promise<void> {
   logger.info(
@@ -168,7 +249,9 @@ async function main(): Promise<void> {
   const safety = new SafetyChecker();
 
   const enrichSwarm = async (swarm: Swarm): Promise<void> => {
-    await price.refreshNow(swarm.token);
+    // Alert-critical pricing is pool-first. DexScreener may fill optional
+    // display data later, but its rate limits cannot postpone this signal.
+    await price.refreshOnChainNow(swarm.token);
     const token = store.tokensByAddress.get(swarm.token);
     if (token) {
       // Re-sync the symbol in case DexScreener enriched a placeholder since detection.
@@ -307,6 +390,34 @@ async function main(): Promise<void> {
     await engine.evaluate(swarm);
   };
 
+  const evaluateCandidate = async (candidate: PersistedSignalCandidate): Promise<CandidateResult> => {
+    const { swarm, mode } = candidate;
+    await enrichSwarm(swarm);
+    // No real quote yet is transient evidence failure, not a reason to lose a
+    // wallet signal. Retry from the durable queue.
+    if (!swarm.priceLive) return 'retry';
+    if (config.ALERT_MIN_MARKETCAP > 0 && swarm.marketCap == null) return 'retry';
+    if (mode === 'entry') {
+      // `false` means conclusively too old; `undefined`/null means the
+      // canonical creation block has not resolved yet and must be retried.
+      if (swarm.pairAgeHours == null) return 'retry';
+      if (!swarm.freshPair) return 'discard';
+    }
+    if (mode === 'solo') {
+      if (swarm.marketCap == null) return 'retry';
+      if (swarm.marketCap < config.SOLO_MIN_MARKETCAP || swarm.marketCap > config.SOLO_MAX_MARKETCAP) {
+        return 'discard';
+      }
+    }
+    await recordAndMaybeAlert(swarm);
+    return 'resolved';
+  };
+  const pendingSignals = new PendingSignalQueue(evaluateCandidate);
+  const submitCandidate = async (swarm: Swarm, mode: CandidateMode): Promise<void> => {
+    const result = await evaluateCandidate({ swarm, mode, attempts: 0, nextAt: Date.now() });
+    if (result === 'retry') pendingSignals.enqueue(swarm, mode);
+  };
+
   // Pipeline: chain → decoder → store → aggregator → alert engine → notify.
   const handleSwap = async (swap: SwapEvent): Promise<void> => {
     // Drop settlement/quote tokens and tokenised equities before anything else —
@@ -330,32 +441,20 @@ async function main(): Promise<void> {
 
     // Multi-wallet swarms (BUY / SELL / ROTATION).
     for (const swarm of aggregator.ingest(swap)) {
-      await enrichSwarm(swarm);
-      await recordAndMaybeAlert(swarm);
+      await submitCandidate(swarm, 'swarm');
     }
 
     // Solo low-cap buy: record + alert only when the real market cap is low.
     const solo = aggregator.soloCandidate(swap);
     if (solo) {
-      await enrichSwarm(solo);
-      // Band membership is unprovable without a cap — an unknown one is out.
-      if (
-        solo.marketCap != null &&
-        solo.marketCap >= config.SOLO_MIN_MARKETCAP &&
-        solo.marketCap <= config.SOLO_MAX_MARKETCAP
-      ) {
-        await recordAndMaybeAlert(solo);
-      }
+      await submitCandidate(solo, 'solo');
     }
 
     // Fresh-pair first entry: a qualifying-tier wallet's first buy of a token
     // whose pair is only hours old — record + alert only when the pair is fresh.
     const entry = aggregator.firstEntryCandidate(swap);
     if (entry) {
-      await enrichSwarm(entry);
-      if (entry.freshPair) {
-        await recordAndMaybeAlert(entry);
-      }
+      await submitCandidate(entry, 'entry');
     }
   };
 
@@ -373,6 +472,10 @@ async function main(): Promise<void> {
   }, (poolId, token) => attribution.v4PoolContainsToken(poolId, token));
   if (resumeCursor != null) listener.resumeAt?.(resumeCursor);
   if (feedState?.pendingMetadata?.length) listener.restorePendingMetadata?.(feedState.pendingMetadata);
+  if (feedState?.pendingSignals?.length) {
+    pendingSignals.restore(feedState.pendingSignals);
+    logger.info({ candidates: feedState.pendingSignals.length }, 'signal retry queue: restored pending candidates');
+  }
   listener.start();
 
   // Shadow measurement. Reads the chain independently and classifies what it
@@ -392,6 +495,7 @@ async function main(): Promise<void> {
       swarms: history.swarms,
       alerts: history.alerts,
       pendingMetadata: listener.pendingMetadata?.() ?? [],
+      pendingSignals: pendingSignals.snapshot(),
     });
   };
   const feedStateTimer = config.FEED_STATE_PATH
@@ -412,6 +516,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info({ signal }, 'shutting down gracefully');
     listener.stop();
+    pendingSignals.stop();
     shadow.stop();
     attribution.stop();
     if (feedStateTimer) clearInterval(feedStateTimer);

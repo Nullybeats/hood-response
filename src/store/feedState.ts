@@ -26,7 +26,7 @@ import { logger } from '../logger.js';
  * snapshot is a cache, so throwing it away costs a rebuild, and mis-reading one
  * costs a wrong cursor — the asymmetry says discard.
  */
-export const FEED_STATE_VERSION = 2;
+export const FEED_STATE_VERSION = 3;
 
 /** Only the fields we can restore meaningfully; everything else re-enriches. */
 export interface PersistedToken {
@@ -51,6 +51,14 @@ export interface PersistedMetadataCandidate {
   logIndex?: string;
 }
 
+/** A real chain candidate held until its proof/price/age evidence resolves. */
+export interface PersistedSignalCandidate {
+  swarm: Swarm;
+  mode: 'swarm' | 'solo' | 'entry';
+  attempts: number;
+  nextAt: number;
+}
+
 export interface FeedStateSnapshot {
   version: number;
   savedAt: number;
@@ -61,6 +69,9 @@ export interface FeedStateSnapshot {
   alerts: Alert[];
   /** Bounded deferred candidates; replayed after a restart before new blocks. */
   pendingMetadata?: PersistedMetadataCandidate[];
+  /** Candidates are data, not alerts: restoring them retries verification but
+   * never re-emits an alert that was already recorded. */
+  pendingSignals?: PersistedSignalCandidate[];
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> =>
@@ -105,6 +116,19 @@ function parseMetadataCandidate(v: unknown): PersistedMetadataCandidate | null {
   };
 }
 
+function parseSignalCandidate(v: unknown): PersistedSignalCandidate | null {
+  if (!isObj(v) || !isObj(v.swarm)) return null;
+  if (v.mode !== 'swarm' && v.mode !== 'solo' && v.mode !== 'entry') return null;
+  const swarm = v.swarm as unknown as Swarm;
+  if (typeof swarm.id !== 'string' || typeof swarm.token !== 'string' || !/^0x[0-9a-f]{40}$/i.test(swarm.token)) return null;
+  return {
+    swarm,
+    mode: v.mode,
+    attempts: finiteNum(v.attempts) && v.attempts >= 0 ? Math.floor(v.attempts) : 0,
+    nextAt: finiteNum(v.nextAt) ? v.nextAt : Date.now(),
+  };
+}
+
 /**
  * Read a snapshot. Returns null for "nothing usable" — missing file, unreadable,
  * malformed JSON, wrong version, or a cursor that is not a real block number.
@@ -138,7 +162,7 @@ export async function loadFeedState(path: string): Promise<FeedStateSnapshot | n
   // v1 had no metadata-retry queue. It remains readable so this safety upgrade
   // never throws away a valid production cursor merely because the snapshot
   // gained an optional field.
-  if (parsed.version !== 1 && parsed.version !== FEED_STATE_VERSION) {
+  if (parsed.version !== 1 && parsed.version !== 2 && parsed.version !== FEED_STATE_VERSION) {
     logger.warn(
       { path, found: parsed.version, expected: FEED_STATE_VERSION },
       'feed state: snapshot version mismatch — cold start',
@@ -158,6 +182,9 @@ export async function loadFeedState(path: string): Promise<FeedStateSnapshot | n
   const pendingMetadata = Array.isArray(parsed.pendingMetadata)
     ? parsed.pendingMetadata.map(parseMetadataCandidate).filter((x): x is PersistedMetadataCandidate => x !== null).slice(0, 512)
     : [];
+  const pendingSignals = Array.isArray(parsed.pendingSignals)
+    ? parsed.pendingSignals.map(parseSignalCandidate).filter((x): x is PersistedSignalCandidate => x !== null).slice(0, 256)
+    : [];
 
   return {
     version: FEED_STATE_VERSION,
@@ -167,6 +194,7 @@ export async function loadFeedState(path: string): Promise<FeedStateSnapshot | n
     swarms,
     alerts,
     pendingMetadata,
+    pendingSignals,
   };
 }
 

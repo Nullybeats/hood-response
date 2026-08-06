@@ -499,6 +499,17 @@ const schema = z.object({
   // off its deepest ETH-paired Uniswap v4/v3 pool (chain/poolPrice.ts). This is
   // the honest answer for a brand-new coin — exactly the window a sniper trades.
   POOL_PRICE_FALLBACK: bool(true),
+  // Canonical Robinhood Chain USDG. Pool pricing uses the WETH/USDG market as
+  // its USD reference so a DexScreener throttle can never block a live signal.
+  // Override only with another independently verified dollar stablecoin.
+  PRICE_USD_QUOTE: z.string().default('0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168'),
+  // Dedicated read endpoint for pool price / pair-age proof. Empty reuses the
+  // attribution endpoint (then the listener HTTP endpoint), keeping the paid
+  // live WebSocket's bandwidth lane separate from these bounded reads.
+  PRICE_RPC_URL: z.string().default(''),
+  // Bounded read budget for alert-time canonical pool checks. This is not a
+  // WebSocket subscription and defaults to a deliberately modest 8 rps.
+  PRICE_RPC_RPS: num(8),
   // DEVELOPMENT ONLY. Fabricates a price by hashing the token address when no
   // real source has one, so a chainless dev run still produces numbers.
   //

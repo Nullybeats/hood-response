@@ -20,6 +20,7 @@ import {
   V3_FACTORY,
   V3_FACTORY_ABI,
   V3_FEE_TIERS,
+  V3_POOL_CREATED_TOPIC,
   V3_POOL_ABI,
 } from './uniswap.js';
 
@@ -66,9 +67,14 @@ class ScheduledJsonRpcProvider extends JsonRpcProvider {
   }
 
   override async _send(payload: JsonRpcPayload | Array<JsonRpcPayload>): Promise<Array<JsonRpcResult>> {
-    const sched = schedulerFor(this.scheduledUrl);
+    const sched = schedulerFor(this.scheduledUrl, {
+      ratePerSec: config.PRICE_RPC_RPS,
+      burst: Math.max(1, Math.ceil(config.PRICE_RPC_RPS)),
+    });
     try {
-      return await sched.run(() => super._send(payload), 'background');
+      // Pool price and creation-time evidence are alert-critical. They outrank
+      // attribution backfills but remain inside this small explicit budget.
+      return await sched.run(() => super._send(payload), 'normal');
     } catch (err) {
       // Ethers wraps HTTP failures. Preserve its error for callers, but make a
       // provider-level 429 cool the same shared bucket as every other caller.
@@ -87,6 +93,12 @@ export interface PoolPrice {
   /** Raw pool depth (uint128 L) — comparable only between pools of the same
    *  token, which is all we use it for (picking the deepest). */
   liquidity: bigint;
+  /** Address for V3; PoolId for V4. */
+  poolAddress: string;
+  /** Unix ms when the canonical pool was initialized/created, when available.
+   * This is chain evidence for fresh-pair gating; it is never inferred from an
+   * indexer timestamp. */
+  pairCreatedAt: number | null;
 }
 
 interface V4Pool {
@@ -96,6 +108,7 @@ interface V4Pool {
   tickSpacing: number;
   hooks: string;
   tokenIs0: boolean;
+  createdBlock: number;
 }
 
 const poolIdOf = (p: V4Pool): string =>
@@ -143,6 +156,8 @@ export class PoolPriceReader {
   private readonly v4Cache = new Map<string, { at: number; pools: V4Pool[] }>();
   private readonly v3Cache = new Map<string, { at: number; pools: string[] }>();
   private readonly decimals = new Map<string, number>();
+  private readonly blockTimes = new Map<number, number | null>();
+  private readonly v3CreatedAt = new Map<string, number | null>();
 
   /** False when the chain RPC / WETH address isn't configured — the reader then
    *  no-ops rather than guessing, and the oracle reports the price as unknown. */
@@ -151,7 +166,7 @@ export class PoolPriceReader {
   }
 
   private rpcUrl(): string {
-    return config.CHAIN_HTTP_URL || '';
+    return config.PRICE_RPC_URL || config.ATTRIB_RPC_URL || config.CHAIN_HTTP_URL || '';
   }
 
   private rpc(): ScheduledJsonRpcProvider {
@@ -221,6 +236,7 @@ export class PoolPriceReader {
             tickSpacing: Number(tickSpacing),
             hooks: getAddress(hooks),
             tokenIs0,
+            createdBlock: Number(log.blockNumber),
           });
         } catch {
           /* skip malformed log */
@@ -232,19 +248,19 @@ export class PoolPriceReader {
     return found;
   }
 
-  /** Every live v3 pool address for the token/WETH pair across the fee tiers. */
-  private async v3Pools(token: string): Promise<string[]> {
-    const key = token.toLowerCase();
+  /** Every live v3 pool address for the token/quote pair across fee tiers. */
+  private async v3Pools(token: string, quote = config.SNIPER_WETH): Promise<string[]> {
+    const key = `${token.toLowerCase()}:${quote.toLowerCase()}`;
     const memo = this.v3Cache.get(key);
     if (memo && Date.now() - memo.at < POOL_CACHE_TTL_MS) return memo.pools;
 
     const factory = new Contract(V3_FACTORY, V3_FACTORY_ABI, this.rpc());
-    const weth = getAddress(config.SNIPER_WETH);
+    const quoteAddress = getAddress(quote);
     const t = getAddress(token);
     const addresses = await Promise.all(
       V3_FEE_TIERS.map(async (fee) => {
         try {
-          const pool = (await factory.getFunction('getPool')(t, weth, fee)) as string;
+          const pool = (await factory.getFunction('getPool')(t, quoteAddress, fee)) as string;
           return pool && pool !== ZeroAddress ? pool : null;
         } catch {
           return null;
@@ -255,6 +271,22 @@ export class PoolPriceReader {
     this.v3Cache.set(key, { at: Date.now(), pools });
     capMap(this.v3Cache);
     return pools;
+  }
+
+  private async blockTime(blockNumber: number): Promise<number | null> {
+    const memo = this.blockTimes.get(blockNumber);
+    if (memo !== undefined) return memo;
+    try {
+      const block = await this.rpc().getBlock(blockNumber);
+      const value = block?.timestamp != null ? Number(block.timestamp) * 1_000 : null;
+      this.blockTimes.set(blockNumber, value);
+      capMap(this.blockTimes);
+      return value;
+    } catch {
+      this.blockTimes.set(blockNumber, null);
+      capMap(this.blockTimes);
+      return null;
+    }
   }
 
   private async readV4(token: string, decimals: number): Promise<PoolPrice[]> {
@@ -270,7 +302,15 @@ export class PoolPriceReader {
             sv.getFunction('getLiquidity')(id).catch(() => 0n) as Promise<bigint>,
           ]);
           const priceEth = priceEthFromSqrtX96(slot0[0], p.tokenIs0, decimals);
-          return priceEth == null ? null : { priceEth, venue: 'v4', liquidity };
+          return priceEth == null
+            ? null
+            : {
+                priceEth,
+                venue: 'v4',
+                liquidity,
+                poolAddress: id,
+                pairCreatedAt: await this.blockTime(p.createdBlock),
+              };
         } catch {
           return null;
         }
@@ -279,13 +319,50 @@ export class PoolPriceReader {
     return reads.filter((r): r is PoolPrice => r != null);
   }
 
-  private async readV3(token: string, decimals: number): Promise<PoolPrice[]> {
-    const pools = await this.v3Pools(token);
+  /** Resolve a V3 pool's factory event into a chain timestamp. The factory
+   * event is canonical creation evidence; no indexer timestamp is involved. */
+  private async v3PairCreatedAt(token: string, quote: string, poolAddress: string): Promise<number | null> {
+    const key = poolAddress.toLowerCase();
+    const cached = this.v3CreatedAt.get(key);
+    if (cached !== undefined) return cached;
+    try {
+      const tokenAddress = getAddress(token);
+      const quoteAddress = getAddress(quote);
+      const [a, b] = tokenAddress.toLowerCase() < quoteAddress.toLowerCase()
+        ? [tokenAddress, quoteAddress]
+        : [quoteAddress, tokenAddress];
+      const logs = await this.rpc().getLogs({
+        address: V3_FACTORY,
+        fromBlock: 0,
+        toBlock: 'latest',
+        topics: [V3_POOL_CREATED_TOPIC, zeroPadValue(a, 32), zeroPadValue(b, 32)],
+      });
+      const target = getAddress(poolAddress).toLowerCase();
+      const match = logs.find((log) => {
+        try {
+          return getAddress(dataSlice(log.data, 44)).toLowerCase() === target;
+        } catch {
+          return false;
+        }
+      });
+      const result = match ? await this.blockTime(Number(match.blockNumber)) : null;
+      this.v3CreatedAt.set(key, result);
+      capMap(this.v3CreatedAt);
+      return result;
+    } catch {
+      this.v3CreatedAt.set(key, null);
+      capMap(this.v3CreatedAt);
+      return null;
+    }
+  }
+
+  private async readV3(token: string, decimals: number, quote = config.SNIPER_WETH, quoteDecimals = 18): Promise<PoolPrice[]> {
+    const pools = await this.v3Pools(token, quote);
     if (pools.length === 0) return [];
     const t = token.toLowerCase();
-    const weth = config.SNIPER_WETH.toLowerCase();
+    const quoteAddress = quote.toLowerCase();
     // v3 orders currencies by address, same as v4 — derive which side we are on.
-    const tokenIs0 = t < weth;
+    const tokenIs0 = t < quoteAddress;
     const reads = await Promise.all(
       pools.map(async (addr): Promise<PoolPrice | null> => {
         try {
@@ -294,8 +371,10 @@ export class PoolPriceReader {
             pool.getFunction('slot0')() as Promise<[bigint, ...unknown[]]>,
             pool.getFunction('liquidity')().catch(() => 0n) as Promise<bigint>,
           ]);
-          const priceEth = priceEthFromSqrtX96(slot0[0], tokenIs0, decimals);
-          return priceEth == null ? null : { priceEth, venue: 'v3', liquidity };
+          const priceEth = priceEthFromSqrtX96(slot0[0], tokenIs0, decimals, quoteDecimals);
+          return priceEth == null
+            ? null
+            : { priceEth, venue: 'v3', liquidity, poolAddress: addr, pairCreatedAt: null };
         } catch {
           return null;
         }
@@ -321,11 +400,36 @@ export class PoolPriceReader {
     ]);
     const all = [...v4, ...v3];
     if (all.length === 0) return null;
-    return all.reduce((best, p) => (p.liquidity > best.liquidity ? p : best), all[0]!);
+    const best = all.reduce((winner, p) => (p.liquidity > winner.liquidity ? p : winner), all[0]!);
+    if (best.venue !== 'v3') return best;
+    return {
+      ...best,
+      pairCreatedAt: await this.v3PairCreatedAt(token, config.SNIPER_WETH, best.poolAddress),
+    };
+  }
+
+  /** Canonical on-chain ETH/USD reference from Robinhood Chain's WETH/USDG market. */
+  async ethUsdFromUsdG(): Promise<number | null> {
+    if (!this.enabled || !config.PRICE_USD_QUOTE) return null;
+    try {
+      const weth = getAddress(config.SNIPER_WETH);
+      const usdg = getAddress(config.PRICE_USD_QUOTE);
+      const [wethDecimals, usdgDecimals] = await Promise.all([
+        this.tokenDecimals(weth),
+        this.tokenDecimals(usdg),
+      ]);
+      if (wethDecimals == null || usdgDecimals == null) return null;
+      const quotes = await this.readV3(weth, wethDecimals, usdg, usdgDecimals);
+      if (!quotes.length) return null;
+      const best = quotes.reduce((winner, q) => (q.liquidity > winner.liquidity ? q : winner), quotes[0]!);
+      return Number.isFinite(best.priceEth) && best.priceEth > 0 ? best.priceEth : null;
+    } catch {
+      return null;
+    }
   }
 }
 
-function capMap(map: Map<string, unknown>, max = MAX_CACHE): void {
+function capMap(map: Map<unknown, unknown>, max = MAX_CACHE): void {
   while (map.size > max) {
     const oldest = map.keys().next().value;
     if (oldest === undefined) break;

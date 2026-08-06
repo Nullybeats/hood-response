@@ -365,6 +365,16 @@ export class PriceOracle {
     const cached = this.ethUsdPrice();
     if (cached != null && cached > 0) return cached;
     if (!config.SNIPER_WETH) return null;
+    // Primary reference is the canonical on-chain WETH/USDG market. That means
+    // a cold process can price a fresh V3/V4 pool without waiting for a public
+    // indexer to recover or index the pair.
+    const onChain = await this.pools.ethUsdFromUsdG();
+    if (onChain != null && onChain >= ETH_USD_MIN && onChain <= ETH_USD_MAX) {
+      this.ethUsdRef = { rate: onChain, at: Date.now() };
+      return onChain;
+    }
+    // Last-resort display fallback. Failure here returns unknown; it never
+    // changes wallet-trade proof or discards a durable candidate.
     try {
       const res = await this.fetchDexScreener(`https://api.dexscreener.com/latest/dex/tokens/${config.SNIPER_WETH}`);
       if (!res.ok) return null;
@@ -408,6 +418,26 @@ export class PriceOracle {
     const existing = this.inflight.get(key);
     if (existing) return existing;
     const work = this.fetchOne(key).finally(() => this.inflight.delete(key));
+    this.inflight.set(key, work);
+    await work;
+  }
+
+  /**
+   * Alert-time quote path. Reads the canonical pool before public market data,
+   * so a DexScreener throttle is never on the path to a confirmed signal.
+   */
+  async refreshOnChainNow(tokenAddress: string): Promise<void> {
+    if (!this.pools.enabled) return this.refreshNow(tokenAddress);
+    const key = tokenAddress.toLowerCase();
+    const existing = this.inflight.get(key);
+    if (existing) return existing;
+    const work = (async () => {
+      await this.fetchFromPool(key);
+      // Preserve legacy/V2 display coverage. This only runs when canonical
+      // V3/V4 pool discovery genuinely has no answer; it is never ahead of the
+      // critical on-chain path.
+      if (!this.fresh(key)) await this.fetchOne(key);
+    })().finally(() => this.inflight.delete(key));
     this.inflight.set(key, work);
     await work;
   }
@@ -539,9 +569,10 @@ export class PriceOracle {
       );
       if (!res.ok) {
         logger.warn({ token: address, status: res.status }, 'price: DexScreener request failed');
-        // A throttle is not evidence the token lacks a price. Keep this visible
-        // token at the head of the bounded retry lane after the global cooldown.
-        if (res.status === 429) this.requestRefresh(address);
+        // A public-indexer throttle is not evidence the pool lacks a price.
+        // Establish it on chain immediately; Dex is optional enrichment.
+        await this.fetchFromPool(address).catch(() => undefined);
+        if (res.status === 429 && !this.fresh(address)) this.requestRefresh(address);
         return;
       }
       const json = (await res.json()) as DexTokenResponse;
@@ -661,7 +692,7 @@ export class PriceOracle {
       // Depth here is raw uint128 L, which is not a USD figure and must not be
       // presented as one. Unknown until DexScreener indexes the pair.
       liquidityUsd: null,
-      pairCreatedAt: null,
+      pairCreatedAt: pool.pairCreatedAt,
       volume24: null,
       priceChangeH1: null,
       priceChangeH24: null,

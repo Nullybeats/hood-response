@@ -31,6 +31,8 @@ export const STATE_VIEW_ABI = [
 
 // ── Uniswap v3 (genuine, unmodified deployment) ──────────────────────────────
 export const V3_FACTORY = '0x1f7d7550B1b028f7571E69A784071F0205FD2EfA';
+/** keccak256(PoolCreated(address,address,uint24,int24,address)). */
+export const V3_POOL_CREATED_TOPIC = '0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118';
 export const V3_ROUTER = '0xCaf681a66D020601342297493863E78C959E5cb2'; // SwapRouter02
 export const V3_QUOTER = '0x33e885eD0Ec9bF04EcfB19341582aADCb4c8A9E7'; // QuoterV2
 export const V3_FEE_TIERS = [500, 3000, 10000, 100]; // 0.05% / 0.3% / 1% / 0.01%
