@@ -75,6 +75,7 @@ export class AttributionShadow {
 
   status(): Record<string, unknown> {
     const safe = this.ledger.safeCursor();
+    const accounting = this.ledger.accountedFor(CLASSIFIER_VERSION);
     return {
       enabled: this.enabled,
       degraded: this.ledger.degraded,
@@ -84,7 +85,14 @@ export class AttributionShadow {
       cursorLag: this.observedHead != null && safe != null ? Math.max(0, this.observedHead - safe) : null,
       lastTickAt: this.lastTickAt,
       lastError: this.lastError,
-      accounting: this.ledger.accountedFor(CLASSIFIER_VERSION),
+      // `unprocessed` is a normal bounded-batch queue during a backfill.  It
+      // must not be exposed as "drift" (which implies an invariant breach).
+      accounting: {
+        observed: accounting.pairs,
+        attributed: accounting.attributed,
+        pending: accounting.pending,
+        unprocessed: accounting.drift,
+      },
       pools: this.ledger.poolVerificationStats(),
     };
   }
@@ -148,7 +156,14 @@ export class AttributionShadow {
         .unsettledObservations(CLASSIFIER_VERSION, config.ATTRIB_BATCH_SIZE, universe.safeCovered)
         .map((o) => o as PairObservation);
       const settled = await this.ingester.ingestBatch(work, universe.safeCovered);
-      this.lastWindow = { from, to: universe.safeCovered };
+      // `covered` only proves that the observation streams reached this
+      // point.  The report may cover only the contiguous prefix the ingester
+      // has actually settled; the rest is queued work under the batch limit.
+      const accountedThrough = this.ledger.safeCursor();
+      this.lastWindow =
+        accountedThrough != null && accountedThrough >= from
+          ? { from, to: Math.min(universe.safeCovered, accountedThrough) }
+          : null;
       this.lastTickAt = Date.now();
       logger.info(
         {

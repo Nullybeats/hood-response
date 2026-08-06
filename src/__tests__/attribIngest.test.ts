@@ -250,6 +250,17 @@ describe('ingester — atomic per pair, idempotent on restart', () => {
       expect(s.safeThroughBlock).toBe(300);
     });
 
+    it('holds the cursor before observations omitted by the bounded batch', async () => {
+      // Runtime observation happens before enrichment.  A batch limit is
+      // ordinary queueing, not drift and not permission to claim its tail as
+      // an accounted window.
+      led.recordObservation('0xlater', -1, WALLET, 200, 'tx_sender', null);
+      const s = await make(swapEnricher()).ingestBatch([obs('0xfirst', 100)], 300);
+      expect(s.attributed).toBe(1);
+      expect(s.heldAtBlock).toBe(200);
+      expect(s.safeThroughBlock).toBe(199);
+    });
+
     it('work parked by an EARLIER run still holds the cursor', async () => {
       // A restart that only looked at its own batch would advance past a pair
       // it never retried.

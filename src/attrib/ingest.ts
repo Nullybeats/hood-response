@@ -365,6 +365,16 @@ export class Ingester {
       if (b != null && (heldAt == null || b < heldAt)) heldAt = b;
     }
 
+    // Observation is deliberately decoupled from enrichment.  A bounded
+    // batch can therefore leave freshly observed pairs untouched behind its
+    // limit; those are queued work, not evidence that the blocks were fully
+    // accounted for.  Treat the oldest one exactly like a retriable pending
+    // pair when calculating the safe prefix.
+    const unprocessed = this.o.ledger.unsettledObservations(this.cv, 1, coveredThrough)[0];
+    if (unprocessed && (heldAt == null || unprocessed.blockNumber < heldAt)) {
+      heldAt = unprocessed.blockNumber;
+    }
+
     const safeThroughBlock = heldAt == null ? coveredThrough : Math.min(coveredThrough, heldAt - 1);
 
     return {
