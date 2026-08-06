@@ -15,6 +15,7 @@ import {
 import { fetchTokenMetadata } from './metadata.js';
 import { receiptConfirmsSwap, receiptDiagnostic } from './receipt.js';
 import { logHttpFailure, logRpcError, logRpcThrow, rpcHost } from './rpcLog.js';
+import { schedulerFor } from '../attrib/scheduler.js';
 
 export type SwapHandler = (e: SwapEvent) => void;
 
@@ -81,7 +82,7 @@ async function buildSwapFromLog(
 function enrichToken(store: MemoryStore, tokenAddr: string, inflight: Set<string>): void {
   if (!config.CHAIN_HTTP_URL || inflight.has(tokenAddr)) return;
   inflight.add(tokenAddr);
-  void fetchTokenMetadata(config.CHAIN_HTTP_URL, tokenAddr)
+  void fetchTokenMetadata(config.CHAIN_HTTP_URL, tokenAddr, 'background')
     .then((meta) => {
       if (meta) store.updateTokenMeta(tokenAddr, meta);
     })
@@ -529,32 +530,41 @@ export class HttpPollingChainListener implements ChainListener {
       method,
       ...(range ? { range } : {}),
     };
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 8000);
+    const sched = schedulerFor(config.CHAIN_HTTP_URL);
     try {
-      const res = await fetch(config.CHAIN_HTTP_URL, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-        signal: ctrl.signal,
-      });
-      // A 429 here is the single most consequential failure this service has,
-      // and it used to return null with no trace at all.
-      if (!res.ok) {
-        logHttpFailure(ctx, res.status, res.statusText);
-        return null;
-      }
-      const json = (await res.json()) as { result?: unknown; error?: unknown };
-      if (json.error) {
-        logRpcError(ctx, json.error);
-        return null;
-      }
-      return json.result ?? null;
+      return await sched.run(async () => {
+        // Start the request timeout only after admission. Starting it while
+        // waiting in the shared queue turns polite back-pressure into a fake
+        // transport failure before the request has even reached the node.
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 8000);
+        try {
+          const res = await fetch(config.CHAIN_HTTP_URL, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+            signal: ctrl.signal,
+          });
+          // A 429 here is the single most consequential failure this service has,
+          // and it used to return null with no trace at all.
+          if (!res.ok) {
+            logHttpFailure(ctx, res.status, res.statusText);
+            if (res.status === 429 || res.status === 503) sched.penalise(1_000);
+            return null;
+          }
+          const json = (await res.json()) as { result?: unknown; error?: unknown };
+          if (json.error) {
+            logRpcError(ctx, json.error);
+            return null;
+          }
+          return json.result ?? null;
+        } finally {
+          clearTimeout(t);
+        }
+      }, 'live');
     } catch (err) {
       logRpcThrow(ctx, err);
       return null;
-    } finally {
-      clearTimeout(t);
     }
   }
 

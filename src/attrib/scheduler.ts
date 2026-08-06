@@ -51,6 +51,20 @@ export interface SchedulerOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
+/**
+ * The public RPC is shared by the real-time listener and shadow accounting.
+ * The listener protects the live feed; attribution can wait. `normal` is for
+ * enrichment that is needed to finish a detected transaction but is not the
+ * block scanner itself.
+ */
+export type SchedulerPriority = 'live' | 'normal' | 'background';
+
+interface QueuedCall {
+  fn: () => Promise<unknown>;
+  resolve: (value: unknown) => void;
+  reject: (reason: unknown) => void;
+}
+
 const realSleep = (ms: number): Promise<void> =>
   new Promise((r) => {
     setTimeout(r, ms);
@@ -63,8 +77,15 @@ export class RpcScheduler {
   private readonly rate: number;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
-  /** Serialises token acquisition so two callers cannot take the same token. */
-  private gate: Promise<void> = Promise.resolve();
+  /**
+   * One queue, three lanes. A token is always charged against this one bucket;
+   * priority only selects the NEXT request. This is deliberately not separate
+   * "live" and "shadow" buckets — the node sees their aggregate rate.
+   */
+  private readonly queues: Record<SchedulerPriority, QueuedCall[]> = {
+    live: [], normal: [], background: [],
+  };
+  private draining = false;
   private cooldownUntil = 0;
 
   private dispatched = 0;
@@ -94,27 +115,51 @@ export class RpcScheduler {
    * occupying the host. Counting only the waiting ones would report a depth of
    * zero at exactly the moment the host is most loaded.
    */
-  async run<T>(fn: () => Promise<T>): Promise<T> {
+  async run<T>(fn: () => Promise<T>, priority: SchedulerPriority = 'normal'): Promise<T> {
     this.queueDepth += 1;
     if (this.queueDepth > this.peakQueueDepth) this.peakQueueDepth = this.queueDepth;
-    try {
-      await this.acquire();
-      this.dispatched += 1;
-      return await fn();
-    } finally {
-      this.queueDepth -= 1;
-    }
+    return new Promise<T>((resolve, reject) => {
+      this.queues[priority].push({
+        fn: fn as () => Promise<unknown>,
+        resolve: resolve as (value: unknown) => void,
+        reject,
+      });
+      void this.drain();
+    });
   }
 
-  /** Chain onto the gate so refills and takes never interleave. */
-  private acquire(): Promise<void> {
-    const next = this.gate.then(() => this.take());
-    // Swallow here only; the caller still sees the rejection through `next`.
-    this.gate = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    return next;
+  private next(): QueuedCall | undefined {
+    return this.queues.live.shift() ?? this.queues.normal.shift() ?? this.queues.background.shift();
+  }
+
+  /**
+   * Admit requests at the global host rate while selecting live work first.
+   * We intentionally do not await a network call before admitting the next
+   * token: rate, not response time, is the host's contract. Queue depth stays
+   * occupied until the request settles, so the report still shows in-flight
+   * work.
+   */
+  private async drain(): Promise<void> {
+    if (this.draining) return;
+    this.draining = true;
+    try {
+      for (;;) {
+        const job = this.next();
+        if (!job) return;
+        await this.take();
+        this.dispatched += 1;
+        void job.fn().then(job.resolve, job.reject).finally(() => {
+          this.queueDepth -= 1;
+        });
+      }
+    } finally {
+      this.draining = false;
+      // A request may have queued while the drain was completing its last
+      // iteration. Start a new drain rather than leaving that request parked.
+      if (this.queues.live.length || this.queues.normal.length || this.queues.background.length) {
+        void this.drain();
+      }
+    }
   }
 
   private async take(): Promise<void> {
@@ -185,7 +230,12 @@ export function schedulerFor(url: string, opts?: Partial<SchedulerOptions>): Rpc
   const host = rpcHost(url);
   let s = registry.get(host);
   if (!s) {
-    s = new RpcScheduler(host, { ratePerSec: opts?.ratePerSec ?? 8, ...opts });
+    // The free Robinhood RPC has repeatedly 429ed above this rate. Two requests
+    // per second sustains the 4-second live poll (head + two Transfer queries)
+    // while leaving sparse capacity for shadow enrichment. A source that proves
+    // it can do more may opt in at construction; the safe default must work on
+    // the deployed public node.
+    s = new RpcScheduler(host, { ratePerSec: opts?.ratePerSec ?? 2, burst: opts?.burst ?? 1, ...opts });
     registry.set(host, s);
   }
   return s;

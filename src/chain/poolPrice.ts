@@ -8,8 +8,10 @@ import {
   zeroPadValue,
   ZeroAddress,
 } from 'ethers';
+import type { JsonRpcPayload, JsonRpcResult } from 'ethers';
 import { config } from '../config/env.js';
 import { logger } from '../logger.js';
+import { schedulerFor } from '../attrib/scheduler.js';
 import {
   INIT_TOPIC,
   POOL_MANAGER,
@@ -50,6 +52,32 @@ const Q96 = 2n ** 96n;
  *  migration, a second fee tier opening) must not stay invisible forever. */
 const POOL_CACHE_TTL_MS = 5 * 60_000;
 const MAX_CACHE = 5_000;
+
+/**
+ * Pool-price fallback is display/gating enrichment, never more important than
+ * the live wallet scanner. Ethers normally sends directly through its provider,
+ * which previously bypassed the shared RPC limiter and could flood the public
+ * node with factory, state-view and historic Initialize queries. Disable ethers
+ * batching so every HTTP request is charged to the same host bucket.
+ */
+class ScheduledJsonRpcProvider extends JsonRpcProvider {
+  constructor(private readonly scheduledUrl: string) {
+    super(scheduledUrl, undefined, { staticNetwork: true, batchMaxCount: 1 });
+  }
+
+  override async _send(payload: JsonRpcPayload | Array<JsonRpcPayload>): Promise<Array<JsonRpcResult>> {
+    const sched = schedulerFor(this.scheduledUrl);
+    try {
+      return await sched.run(() => super._send(payload), 'background');
+    } catch (err) {
+      // Ethers wraps HTTP failures. Preserve its error for callers, but make a
+      // provider-level 429 cool the same shared bucket as every other caller.
+      const status = (err as { info?: { response?: { statusCode?: number } } })?.info?.response?.statusCode;
+      if (status === 429 || status === 503) sched.penalise(1_000);
+      throw err;
+    }
+  }
+}
 
 export interface PoolPrice {
   /** Token price denominated in ETH (the pool's marginal price). */
@@ -111,7 +139,7 @@ export function priceEthFromSqrtX96(
 }
 
 export class PoolPriceReader {
-  private provider: JsonRpcProvider | null = null;
+  private provider: ScheduledJsonRpcProvider | null = null;
   private readonly v4Cache = new Map<string, { at: number; pools: V4Pool[] }>();
   private readonly v3Cache = new Map<string, { at: number; pools: string[] }>();
   private readonly decimals = new Map<string, number>();
@@ -126,8 +154,8 @@ export class PoolPriceReader {
     return config.CHAIN_HTTP_URL || '';
   }
 
-  private rpc(): JsonRpcProvider {
-    if (!this.provider) this.provider = new JsonRpcProvider(this.rpcUrl());
+  private rpc(): ScheduledJsonRpcProvider {
+    if (!this.provider) this.provider = new ScheduledJsonRpcProvider(this.rpcUrl());
     return this.provider;
   }
 

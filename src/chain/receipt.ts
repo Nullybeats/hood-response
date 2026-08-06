@@ -3,6 +3,7 @@ import { config } from '../config/env.js';
 import { logger } from '../logger.js';
 import type { DecodedTransfer, EthLog } from './decoder.js';
 import { logHttpFailure, logRpcError, logRpcThrow } from './rpcLog.js';
+import { schedulerFor } from '../attrib/scheduler.js';
 
 // Both official Uniswap swap event signatures. Receipt evidence is required in
 // addition to a tracked-wallet transfer so airdrops/direct payments never turn
@@ -16,25 +17,29 @@ interface Transaction { to?: string | null; }
 
 async function rpc<T>(method: string, params: unknown[]): Promise<T | null> {
   if (!config.CHAIN_HTTP_URL) return null;
+  const sched = schedulerFor(config.CHAIN_HTTP_URL);
   try {
-    const response = await fetch(config.CHAIN_HTTP_URL, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal: AbortSignal.timeout(6_000),
-    });
-    const ctx = { op: 'receipt', url: config.CHAIN_HTTP_URL, method };
+    return await sched.run(async () => {
+      const response = await fetch(config.CHAIN_HTTP_URL, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal: AbortSignal.timeout(6_000),
+      });
+      const ctx = { op: 'receipt', url: config.CHAIN_HTTP_URL, method };
     // The receipt pair is 2 RPC calls per candidate transfer, so it is the first
     // thing to be rate-limited under load — and a null here silently downgrades
     // a real swap to "no swap". It must never fail quietly again.
-    if (!response.ok) {
-      logHttpFailure(ctx, response.status, response.statusText);
-      return null;
-    }
-    const body = await response.json() as { result?: T; error?: unknown };
-    if (body.error) {
-      logRpcError(ctx, body.error);
-      return null;
-    }
-    return body.result ?? null;
+      if (!response.ok) {
+        logHttpFailure(ctx, response.status, response.statusText);
+        if (response.status === 429 || response.status === 503) sched.penalise(1_000);
+        return null;
+      }
+      const body = await response.json() as { result?: T; error?: unknown };
+      if (body.error) {
+        logRpcError(ctx, body.error);
+        return null;
+      }
+      return body.result ?? null;
+    }, 'live');
   } catch (err) {
     logRpcThrow({ op: 'receipt', url: config.CHAIN_HTTP_URL, method }, err);
     return null;

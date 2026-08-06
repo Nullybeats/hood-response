@@ -1,5 +1,6 @@
 import type { TrackedToken } from '../types.js';
 import { logHttpFailure, logRpcError, logRpcThrow } from './rpcLog.js';
+import { schedulerFor, type SchedulerPriority } from '../attrib/scheduler.js';
 
 /**
  * Best-effort ERC-20 metadata reader over HTTP JSON-RPC (`eth_call`).
@@ -15,37 +16,49 @@ const SEL_SYMBOL = '0x95d89b41'; // symbol()
 const SEL_DECIMALS = '0x313ce567'; // decimals()
 const SEL_TOTAL_SUPPLY = '0x18160ddd'; // totalSupply()
 
-async function ethCall(rpcUrl: string, to: string, data: string): Promise<string | null> {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 4000);
+async function ethCall(
+  rpcUrl: string,
+  to: string,
+  data: string,
+  priority: SchedulerPriority,
+): Promise<string | null> {
+  const sched = schedulerFor(rpcUrl);
   try {
-    const res = await fetch(rpcUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'eth_call',
-        params: [{ to, data }, 'latest'],
-      }),
-      signal: ctrl.signal,
-    });
-    const ctx = { op: 'metadata', url: rpcUrl, method: 'eth_call' };
-    if (!res.ok) {
-      logHttpFailure(ctx, res.status, res.statusText);
-      return null;
-    }
-    const json = (await res.json()) as { result?: string; error?: unknown };
-    if (json.error) {
-      logRpcError(ctx, json.error);
-      return null;
-    }
-    return json.result ?? null;
+    return await sched.run(async () => {
+      // Queue time is deliberate back-pressure, not a network timeout.
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 4000);
+      try {
+        const res = await fetch(rpcUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'eth_call',
+            params: [{ to, data }, 'latest'],
+          }),
+          signal: ctrl.signal,
+        });
+        const ctx = { op: 'metadata', url: rpcUrl, method: 'eth_call' };
+        if (!res.ok) {
+          logHttpFailure(ctx, res.status, res.statusText);
+          if (res.status === 429 || res.status === 503) sched.penalise(1_000);
+          return null;
+        }
+        const json = (await res.json()) as { result?: string; error?: unknown };
+        if (json.error) {
+          logRpcError(ctx, json.error);
+          return null;
+        }
+        return json.result ?? null;
+      } finally {
+        clearTimeout(t);
+      }
+    }, priority);
   } catch (err) {
     logRpcThrow({ op: 'metadata', url: rpcUrl, method: 'eth_call' }, err);
     return null;
-  } finally {
-    clearTimeout(t);
   }
 }
 
@@ -83,11 +96,12 @@ function decodeUint(hex: string | null): number | null {
 export async function fetchTokenMetadata(
   rpcUrl: string,
   tokenAddr: string,
+  priority: SchedulerPriority = 'normal',
 ): Promise<Partial<TrackedToken> | null> {
   const [symbolHex, decimalsHex, supplyHex] = await Promise.all([
-    ethCall(rpcUrl, tokenAddr, SEL_SYMBOL),
-    ethCall(rpcUrl, tokenAddr, SEL_DECIMALS),
-    ethCall(rpcUrl, tokenAddr, SEL_TOTAL_SUPPLY),
+    ethCall(rpcUrl, tokenAddr, SEL_SYMBOL, priority),
+    ethCall(rpcUrl, tokenAddr, SEL_DECIMALS, priority),
+    ethCall(rpcUrl, tokenAddr, SEL_TOTAL_SUPPLY, priority),
   ]);
 
   const symbol = decodeString(symbolHex);

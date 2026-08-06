@@ -52,6 +52,21 @@ describe('shared RPC scheduler', () => {
     expect(st.throttleWaitMs).toBeGreaterThan(0);
   });
 
+  it('admits live polling before queued background attribution', async () => {
+    // Priority is sequencing only: both calls still consume the same host
+    // bucket. This makes a slow shadow backfill yield to the live feed rather
+    // than creating a second, competing rate limit.
+    const s = new RpcScheduler('h', { ratePerSec: 1_000, burst: 1_000 });
+    const order: string[] = [];
+    const bgA = s.run(async () => { order.push('background-a'); }, 'background');
+    const bgB = s.run(async () => { order.push('background-b'); }, 'background');
+    const live = s.run(async () => { order.push('live'); }, 'live');
+    await Promise.all([bgA, bgB, live]);
+    // A request already admitted cannot be cancelled, but the queued live poll
+    // jumps ahead of the next queued attribution call.
+    expect(order).toEqual(['background-a', 'live', 'background-b']);
+  });
+
   it('a 429 slows EVERY caller on the host, not just the rejected one', async () => {
     const c = fakeClock();
     const s = new RpcScheduler('h', { ratePerSec: 1000, burst: 1000, now: c.now, sleep: c.sleep });
