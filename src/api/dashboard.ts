@@ -188,6 +188,11 @@ export const DASHBOARD_HTML = /* html */ `<!doctype html>
 
 <script>
 const $ = (id) => document.getElementById(id);
+// Header totals are refreshed with the feed snapshot as well as SSE. A swap
+// can occur in the narrow gap between the initial /api/stats request and the
+// EventSource subscription; without this, the row appears while the header
+// misleadingly stays at zero until the *next* swap.
+let swaps=0, sw=0, al=0;
 const short = (a) => a ? a.slice(0,6)+'…'+a.slice(-4) : '';
 // null/undefined = unknown, and must not render as "$0.00" — an unmeasured
 // figure that looks measured is the whole bug class this guards against.
@@ -718,14 +723,21 @@ async function loadFeeds(){
   const ae=$('alerts'); ae.innerHTML='';
   if(alerts.length) alerts.slice().reverse().forEach(a=>ae.prepend(alertRow(a)));
   else ae.innerHTML='<div class="empty">no alerts fired yet</div>';
+
+  // A restored feed can have rows before this process's totals start counting,
+  // and an event can arrive during boot before SSE is attached. Show at least
+  // what is visibly present; later SSE events continue from this high-water mark.
+  swaps=Math.max(swaps, swaps.length); sw=Math.max(sw, swarms.length); al=Math.max(al, alerts.length);
+  $('m-swaps').textContent=swaps; $('m-swarms').textContent=sw; $('m-alerts').textContent=al;
 }
 
 async function boot(){
   try{ const cfg=await fetch('/api/config').then(r=>r.json()); DEX_CHAIN=cfg.dexscreenerChain||null; EXPLORER_BASE=cfg.explorerBase||null; SIGMA_REF=cfg.sigmaRef||null; BASED_REF=cfg.basedRef||null; }catch(e){}
   const stats=await fetch('/api/stats').then(r=>r.json());
-  $('m-swaps').textContent=stats.totals.swaps;
-  $('m-swarms').textContent=stats.totals.swarms;
-  $('m-alerts').textContent=stats.totals.alerts;
+  swaps=stats.totals.swaps; sw=stats.totals.swarms; al=stats.totals.alerts;
+  $('m-swaps').textContent=swaps;
+  $('m-swarms').textContent=sw;
+  $('m-alerts').textContent=al;
   applyStats(stats.metrics);
 
   await loadFeeds();
@@ -744,7 +756,6 @@ async function boot(){
   setInterval(loadPerformance, 30000);
 
   const es=new EventSource('/events');
-  let swaps=stats.totals.swaps, sw=stats.totals.swarms, al=stats.totals.alerts;
   es.addEventListener('swap', e=>{ const s=JSON.parse(e.data); const f=$('feed'); clearEmpty(f);
     f.prepend(feedRow(s)); cap(f,60); $('m-swaps').textContent=++swaps; });
   es.addEventListener('swarm', e=>{ const s=JSON.parse(e.data); const se=$('swarms'); clearEmpty(se);
