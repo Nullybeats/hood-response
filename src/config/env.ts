@@ -162,6 +162,23 @@ const schema = z.object({
   // stays on HyperSync/public RPC, while this lower-volume evidence path may
   // use a keyed provider without changing live detection behaviour.
   ATTRIB_TRACE_RPC_URL: z.string().default(''),
+  // ── Live verified-trade gate (chain/liveTradeVerifier.ts) ────────────────
+  // The receipt listener historically treated “a tracked-wallet Transfer in a
+  // transaction that happened to contain Swap” as a trade.  Keep the stronger
+  // decision in shadow first, then explicitly promote it once mismatches have
+  // been reviewed.  When the gate is on, anything short of confirmed_trade is
+  // suppressed before it can reach alerts or the sniper.
+  LIVE_VERIFIED_TRADE_SHADOW: bool(false),
+  LIVE_VERIFIED_TRADE_GATE: bool(false),
+  // Optional trace-capable provider for the live verifier. It is separate so a
+  // low-volume proof source never changes the feed's primary RPC. Empty falls
+  // back to ATTRIB_TRACE_RPC_URL below, which permits one audited trace source
+  // to serve both shadow accounting and the eventual execution gate.
+  LIVE_TRADE_TRACE_RPC_URL: z.string().default(''),
+  // Comma-separated, independently audited router/settlement contracts. These
+  // are NOT a shortcut around pool verification: they only prove a top-level
+  // native payment after a canonical V3/V4 swap and wallet net flow exist.
+  LIVE_VERIFIED_ENTRY_CONTRACTS: z.string().default(''),
   // Blocks below the observed head treated as settled. Above this the
   // accounting window is PROVISIONAL and reported as such — a scanned block is
   // not a final block, and a reorg must not silently invalidate published
@@ -579,6 +596,18 @@ export const config = {
       .map((s) => s.trim().toUpperCase())
       .filter(Boolean),
   ),
+  // Only a configured, syntactically valid address can be trusted as a native
+  // settlement entry point. Keep these lower-cased because receipt addresses
+  // and classifier contract sets are normalized that way.
+  liveVerifiedEntryContracts: new Set(
+    env.LIVE_VERIFIED_ENTRY_CONTRACTS.split(',')
+      .map((s) => normAddr(s).toLowerCase())
+      .filter((s) => /^0x[0-9a-f]{40}$/.test(s)),
+  ),
+  // Reuse the attribution trace provider by default, but allow the live gate
+  // to be moved to a separately metered/audited endpoint without changing the
+  // accounting job.
+  liveTradeTraceRpcUrl: env.LIVE_TRADE_TRACE_RPC_URL || env.ATTRIB_TRACE_RPC_URL,
   // An unset admin password becomes a random per-boot secret rather than a known literal or an
   // open gate, so a deployment that forgot to set one is locked out of admin, not exposed by it.
   ADMIN_PASSWORD: adminPassword(env.ADMIN_PASSWORD),

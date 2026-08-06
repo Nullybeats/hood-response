@@ -372,6 +372,7 @@ async function main(): Promise<void> {
     void handleSwap(swap);
   });
   if (resumeCursor != null) listener.resumeAt?.(resumeCursor);
+  if (feedState?.pendingMetadata?.length) listener.restorePendingMetadata?.(feedState.pendingMetadata);
   listener.start();
 
   // Shadow measurement. Reads the chain independently and classifies what it
@@ -390,6 +391,7 @@ async function main(): Promise<void> {
       tokens: store.exportDiscoveredTokens().map(toPersistedToken),
       swarms: history.swarms,
       alerts: history.alerts,
+      pendingMetadata: listener.pendingMetadata?.() ?? [],
     });
   };
   const feedStateTimer = config.FEED_STATE_PATH

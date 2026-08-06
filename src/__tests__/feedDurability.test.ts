@@ -6,7 +6,8 @@ import { join } from 'node:path';
 // buildSwapFromLog reaches the network twice (receipt confirmation + token
 // metadata). Stub both so a synthetic Transfer log decodes into a real swap —
 // these tests are about the SCAN LOOP, not about decoding.
-vi.mock('../chain/receipt.js', () => ({
+vi.mock('../chain/receipt.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../chain/receipt.js')>()),
   receiptConfirmsSwap: async () => true,
   receiptDiagnostic: () => undefined,
 }));
@@ -288,6 +289,16 @@ describe('feed durability — snapshot persistence', () => {
     expect(back!.cursor).toBe(28_700_000);
     expect(back!.tokens).toHaveLength(1);
     expect(back!.tokens[0]!.symbol).toBe('NEW');
+  });
+
+  it('persists only well-formed metadata retry candidates', async () => {
+    const path = join(dir, 'metadata-retry.json');
+    const candidate = transferLog('0x3333333333333333333333333333333333333333', 10, '0xabc');
+    await saveFeedState(path, {
+      cursor: 10, tokens: [], swarms: [], alerts: [], pendingMetadata: [candidate],
+    });
+    const back = await loadFeedState(path);
+    expect(back!.pendingMetadata).toEqual([candidate]);
   });
 
   it('writes atomically — no .tmp file survives a completed save', async () => {

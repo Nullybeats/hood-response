@@ -14,10 +14,90 @@ import {
 } from './decoder.js';
 import { fetchTokenMetadata } from './metadata.js';
 import { receiptConfirmsSwap, receiptDiagnostic } from './receipt.js';
+import { LiveTradeVerifier, logLiveTradeShadow } from './liveTradeVerifier.js';
 import { logHttpFailure, logRpcError, logRpcThrow, rpcHost } from './rpcLog.js';
 import { schedulerFor } from '../attrib/scheduler.js';
 
 export type SwapHandler = (e: SwapEvent) => void;
+
+// Shared by both WS and polling listeners. The verifier memoizes immutable
+// receipt/transaction context by hash, so one multi-log transaction never pays
+// for the same proof repeatedly.
+const liveTradeVerifier = new LiveTradeVerifier();
+
+/**
+ * Bounded retry queue for a discovery race: a token Transfer can land before a
+ * flaky RPC answers decimals().  The old path returned null and the polling
+ * cursor advanced, making that fresh token permanently invisible until it
+ * traded again.  Retain the immutable log and retry metadata with backoff.
+ *
+ * This is intentionally bounded. A hostile stream of malformed contracts must
+ * not turn a best-effort enrichment feature into unbounded process memory.
+ */
+class MetadataRetryQueue {
+  private readonly pending = new Map<string, { token: string; log: EthLog; attempts: number; timer: NodeJS.Timeout | null }>();
+  private stopped = false;
+
+  constructor(
+    private readonly store: MemoryStore,
+    private readonly onReady: (log: EthLog) => Promise<void>,
+  ) {}
+
+  enqueue(token: string, log: EthLog): void {
+    if (this.stopped) return;
+    const key = `${log.transactionHash ?? ''}:${log.logIndex ?? ''}:${token}`;
+    if (this.pending.has(key)) return;
+    if (this.pending.size >= 512) {
+      logger.warn({ queued: this.pending.size, token }, 'metadata retry queue full; candidate remains suppressed');
+      return;
+    }
+    const item = { token, log, attempts: 0, timer: null as NodeJS.Timeout | null };
+    this.pending.set(key, item);
+    this.schedule(key, item, 1_000);
+  }
+
+  restore(logs: EthLog[]): void {
+    for (const log of logs.slice(0, 512)) {
+      const transfer = decodeTransfer(log);
+      if (transfer) this.enqueue(transfer.token, log);
+    }
+  }
+
+  snapshot(): EthLog[] {
+    return [...this.pending.values()].map((item) => item.log);
+  }
+
+  start(): void {
+    this.stopped = false;
+  }
+
+  stop(): void {
+    this.stopped = true;
+    for (const item of this.pending.values()) if (item.timer) clearTimeout(item.timer);
+    this.pending.clear();
+  }
+
+  private schedule(key: string, item: { token: string; log: EthLog; attempts: number; timer: NodeJS.Timeout | null }, delay: number): void {
+    item.timer = setTimeout(() => void this.retry(key, item), delay);
+    item.timer.unref();
+  }
+
+  private async retry(key: string, item: { token: string; log: EthLog; attempts: number; timer: NodeJS.Timeout | null }): Promise<void> {
+    if (this.stopped || this.pending.get(key) !== item) return;
+    const meta = await fetchTokenMetadata(config.CHAIN_HTTP_URL, item.token, 'normal').catch(() => null);
+    if (meta?.decimals != null) {
+      this.pending.delete(key);
+      this.store.updateTokenMeta(item.token, meta);
+      await this.onReady(item.log).catch((err) =>
+        logger.warn({ err: String(err), tx: item.log.transactionHash }, 'metadata retry: candidate reprocess failed'),
+      );
+      return;
+    }
+    item.attempts += 1;
+    const delay = Math.min(60_000, 1_000 * 2 ** Math.min(item.attempts, 6));
+    this.schedule(key, item, delay);
+  }
+}
 
 export interface ChainListener {
   start(): void;
@@ -27,6 +107,9 @@ export interface ChainListener {
   resumeAt?(cursor: number): void;
   /** Last block fully scanned, for the durable snapshot. */
   readonly cursor?: number;
+  /** Bounded metadata candidates that must survive cursor advancement. */
+  pendingMetadata?(): EthLog[];
+  restorePendingMetadata?(logs: EthLog[]): void;
 }
 
 /**
@@ -39,6 +122,7 @@ async function buildSwapFromLog(
   price: PriceOracle,
   log: EthLog,
   onNewToken?: (addr: string) => void,
+  onMetadataPending?: (token: string, log: EthLog) => void,
 ): Promise<SwapEvent | null> {
   const transfer = decodeTransfer(log);
   if (!transfer) return null;
@@ -52,13 +136,26 @@ async function buildSwapFromLog(
     onNewToken?.(transfer.token);
   }
 
-  if (!(await receiptConfirmsSwap(log, transfer))) {
+  const strictMode = config.LIVE_VERIFIED_TRADE_SHADOW || config.LIVE_VERIFIED_TRADE_GATE;
+  if (strictMode) {
+    const verdict = await liveTradeVerifier.verify(log, transfer, match.wallet, match.direction);
+    if (config.LIVE_VERIFIED_TRADE_SHADOW) logLiveTradeShadow(transfer.txHash, verdict);
+    // Shadow preserves today's live calls exactly; the gate is a separate,
+    // explicit promotion after a reviewed measurement window.
+    if (!verdict.legacyCandidate || (config.LIVE_VERIFIED_TRADE_GATE && !verdict.confirmed)) {
+      receiptDiagnostic(log);
+      return null;
+    }
+  } else if (!(await receiptConfirmsSwap(log, transfer))) {
     receiptDiagnostic(log);
     return null;
   }
   if (token.decimals == null) {
     const meta = await fetchTokenMetadata(config.CHAIN_HTTP_URL, transfer.token).catch(() => null);
-    if (!meta || meta.decimals == null) return null;
+    if (!meta || meta.decimals == null) {
+      onMetadataPending?.(transfer.token, log);
+      return null;
+    }
     store.updateTokenMeta(transfer.token, meta);
     token = store.tokensByAddress.get(transfer.token) ?? token;
   }
@@ -86,7 +183,8 @@ function enrichToken(store: MemoryStore, tokenAddr: string, inflight: Set<string
     .then((meta) => {
       if (meta) store.updateTokenMeta(tokenAddr, meta);
     })
-    .catch(() => undefined);
+    .catch(() => undefined)
+    .finally(() => inflight.delete(tokenAddr));
 }
 
 /**
@@ -104,15 +202,19 @@ export class LiveChainListener implements ChainListener {
   private nextId = 1;
   private readonly pendingLatency = new Map<number, number>();
   private readonly enriching = new Set<string>();
+  private readonly metadataRetries: MetadataRetryQueue;
 
   constructor(
     private readonly store: MemoryStore,
     private readonly price: PriceOracle,
     private readonly onSwap: SwapHandler,
-  ) {}
+  ) {
+    this.metadataRetries = new MetadataRetryQueue(store, (log) => this.handleLog(log).then(() => undefined));
+  }
 
   start(): void {
     this.stopped = false;
+    this.metadataRetries.start();
     this.connect();
   }
 
@@ -122,6 +224,7 @@ export class LiveChainListener implements ChainListener {
     if (this.latencyTimer) clearInterval(this.latencyTimer);
     this.ws?.close();
     this.ws = null;
+    this.metadataRetries.stop();
   }
 
   private connect(): void {
@@ -227,9 +330,13 @@ export class LiveChainListener implements ChainListener {
   private async handleLog(log: EthLog): Promise<void> {
     const swap = await buildSwapFromLog(this.store, this.price, log, (a) =>
       enrichToken(this.store, a, this.enriching),
+      (token, retryLog) => this.metadataRetries.enqueue(token, retryLog),
     );
     if (swap) this.onSwap(swap);
   }
+
+  pendingMetadata(): EthLog[] { return this.metadataRetries.snapshot(); }
+  restorePendingMetadata(logs: EthLog[]): void { this.metadataRetries.restore(logs); }
 }
 
 /**
@@ -365,6 +472,7 @@ export class HttpPollingChainListener implements ChainListener {
   private walletTopics: string[] = [];
   private pollCount = 0;
   private readonly enriching = new Set<string>();
+  private readonly metadataRetries: MetadataRetryQueue;
   private static readonly MAX_RANGE = 5000;
   /** Floor for the adaptive range; below this a shrink cannot help. */
   private static readonly MIN_RANGE = 32;
@@ -393,7 +501,9 @@ export class HttpPollingChainListener implements ChainListener {
     private readonly onSwap: SwapHandler,
     /** Injectable transport, for tests. Defaults to the real JSON-RPC call. */
     private readonly rpcFn?: RpcFn,
-  ) {}
+  ) {
+    this.metadataRetries = new MetadataRetryQueue(store, (log) => this.handleLog(log).then(() => undefined));
+  }
 
   /** Resume the cursor from a persisted snapshot. Must be called before start(). */
   resumeAt(cursor: number): void {
@@ -407,6 +517,7 @@ export class HttpPollingChainListener implements ChainListener {
 
   start(): void {
     this.stopped = false;
+    this.metadataRetries.start();
     this.walletTopics = [...this.store.wallets.keys()].map(addressToTopic);
     this.store.updateMetrics({ mode: 'live' });
     logger.info({ host: rpcHost(config.CHAIN_HTTP_URL) }, 'HTTP polling listener started');
@@ -417,8 +528,22 @@ export class HttpPollingChainListener implements ChainListener {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    this.metadataRetries.stop();
     this.store.updateMetrics({ wsConnected: false });
   }
+
+  private async handleLog(log: EthLog): Promise<boolean> {
+    const swap = await buildSwapFromLog(this.store, this.price, log, (a) =>
+      enrichToken(this.store, a, this.enriching),
+      (token, retryLog) => this.metadataRetries.enqueue(token, retryLog),
+    );
+    if (!swap) return false;
+    this.onSwap(swap);
+    return true;
+  }
+
+  pendingMetadata(): EthLog[] { return this.metadataRetries.snapshot(); }
+  restorePendingMetadata(logs: EthLog[]): void { this.metadataRetries.restore(logs); }
 
   private async init(): Promise<void> {
     const head = await this.blockNumber();
@@ -645,13 +770,7 @@ export class HttpPollingChainListener implements ChainListener {
         // leave the cursor un-advanced with swaps already emitted, so the retry
         // would re-emit them. Skip the bad log, keep the range atomic.
         try {
-          const swap = await buildSwapFromLog(this.store, this.price, log, (a) =>
-            enrichToken(this.store, a, this.enriching),
-          );
-          if (swap) {
-            hits += 1;
-            this.onSwap(swap);
-          }
+          if (await this.handleLog(log)) hits += 1;
         } catch (err) {
           logger.warn(
             { err: String(err), tx: log.transactionHash },

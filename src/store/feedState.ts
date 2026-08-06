@@ -26,7 +26,7 @@ import { logger } from '../logger.js';
  * snapshot is a cache, so throwing it away costs a rebuild, and mis-reading one
  * costs a wrong cursor — the asymmetry says discard.
  */
-export const FEED_STATE_VERSION = 1;
+export const FEED_STATE_VERSION = 2;
 
 /** Only the fields we can restore meaningfully; everything else re-enriches. */
 export interface PersistedToken {
@@ -41,6 +41,16 @@ export interface PersistedToken {
   decimals?: number;
 }
 
+/** A receipt log held only because token decimals were temporarily unreadable. */
+export interface PersistedMetadataCandidate {
+  address: string;
+  topics: string[];
+  data: string;
+  blockNumber?: string;
+  transactionHash?: string;
+  logIndex?: string;
+}
+
 export interface FeedStateSnapshot {
   version: number;
   savedAt: number;
@@ -49,6 +59,8 @@ export interface FeedStateSnapshot {
   tokens: PersistedToken[];
   swarms: Swarm[];
   alerts: Alert[];
+  /** Bounded deferred candidates; replayed after a restart before new blocks. */
+  pendingMetadata?: PersistedMetadataCandidate[];
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> =>
@@ -74,6 +86,22 @@ function parseToken(v: unknown): PersistedToken | null {
     discovered: v.discovered !== false,
     firstSeen: finiteNum(firstSeen) ? firstSeen : Date.now(),
     ...(finiteNum(v.decimals) ? { decimals: v.decimals } : {}),
+  };
+}
+
+function parseMetadataCandidate(v: unknown): PersistedMetadataCandidate | null {
+  if (!isObj(v)) return null;
+  if (typeof v.address !== 'string' || !/^0x[0-9a-f]{40}$/i.test(v.address)) return null;
+  if (!Array.isArray(v.topics) || v.topics.length < 3 || !v.topics.every((t) => typeof t === 'string' && /^0x[0-9a-f]*$/i.test(t))) return null;
+  if (typeof v.data !== 'string' || !/^0x[0-9a-f]*$/i.test(v.data)) return null;
+  if (v.transactionHash !== undefined && typeof v.transactionHash !== 'string') return null;
+  if (v.logIndex !== undefined && typeof v.logIndex !== 'string') return null;
+  if (v.blockNumber !== undefined && typeof v.blockNumber !== 'string') return null;
+  return {
+    address: v.address.toLowerCase(), topics: [...v.topics], data: v.data,
+    ...(typeof v.blockNumber === 'string' ? { blockNumber: v.blockNumber } : {}),
+    ...(typeof v.transactionHash === 'string' ? { transactionHash: v.transactionHash } : {}),
+    ...(typeof v.logIndex === 'string' ? { logIndex: v.logIndex } : {}),
   };
 }
 
@@ -107,7 +135,10 @@ export async function loadFeedState(path: string): Promise<FeedStateSnapshot | n
     logger.warn({ path }, 'feed state: snapshot is not an object — cold start');
     return null;
   }
-  if (parsed.version !== FEED_STATE_VERSION) {
+  // v1 had no metadata-retry queue. It remains readable so this safety upgrade
+  // never throws away a valid production cursor merely because the snapshot
+  // gained an optional field.
+  if (parsed.version !== 1 && parsed.version !== FEED_STATE_VERSION) {
     logger.warn(
       { path, found: parsed.version, expected: FEED_STATE_VERSION },
       'feed state: snapshot version mismatch — cold start',
@@ -124,6 +155,9 @@ export async function loadFeedState(path: string): Promise<FeedStateSnapshot | n
     : [];
   const swarms = Array.isArray(parsed.swarms) ? (parsed.swarms as Swarm[]) : [];
   const alerts = Array.isArray(parsed.alerts) ? (parsed.alerts as Alert[]) : [];
+  const pendingMetadata = Array.isArray(parsed.pendingMetadata)
+    ? parsed.pendingMetadata.map(parseMetadataCandidate).filter((x): x is PersistedMetadataCandidate => x !== null).slice(0, 512)
+    : [];
 
   return {
     version: FEED_STATE_VERSION,
@@ -132,6 +166,7 @@ export async function loadFeedState(path: string): Promise<FeedStateSnapshot | n
     tokens,
     swarms,
     alerts,
+    pendingMetadata,
   };
 }
 

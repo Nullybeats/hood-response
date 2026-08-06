@@ -104,13 +104,20 @@ case and no other.
 
 ### Uniswap attribution status
 
-The legacy live listener currently uses receipt-level V3/V4 swap co-occurrence
-as a **candidate** gate. It is not yet the final proof that a watched wallet
-economically bought or sold a token. The production promotion contract, real
-fixture matrix, and reconciliation gate are documented in
-[Uniswap V3/V4 attribution](docs/uniswap-v3-v4-attribution.md). Until that
-contract is promoted, the conservative attribution ledger remains a shadow
-measurement path and alerts/sniper behaviour are unchanged.
+The live listener has an opt-in strict V3/V4 gate: exact receipt transfer,
+successful transaction, verified V3 pool or canonical V4 PoolManager event,
+and a demonstrated watched-wallet net exchange. LP/fee/zap, Permit2/WETH-only,
+airdrop, and unresolved activity are suppressed. It defaults to off: run
+`LIVE_VERIFIED_TRADE_SHADOW=true` for 24–48 hours, investigate every `live
+trade shadow mismatch` log, then set `LIVE_VERIFIED_TRADE_GATE=true`.
+
+Native-payment routes require either a trace-capable RPC
+(`LIVE_TRADE_TRACE_RPC_URL`, `debug_traceTransaction` + `callTracer`) or an
+independently audited entry address in `LIVE_VERIFIED_ENTRY_CONTRACTS`; an
+entry address never replaces V3/V4 provenance or wallet-delta proof. The
+FORK 0.5 ETH → FORK V4 transaction is covered by a fixture. The fuller
+contract and reconciliation matrix remain in
+[Uniswap V3/V4 attribution](docs/uniswap-v3-v4-attribution.md).
 
 ## Quick start
 
