@@ -8,7 +8,12 @@ describe('dashboard quote fallback', () => {
     expect(DASHBOARD_HTML).toContain('const quoteFor=(s)=>');
     expect(DASHBOARD_HTML).toContain('const currentPriceLabel=');
     expect(DASHBOARD_HTML).toContain('const swarmFacts=');
-    expect(DASHBOARD_HTML).toContain('swaps=Math.max(swaps, swaps.length)');
+    // The refresh snapshot must not shadow the mutable header `swaps` counter:
+    // assigning to that local const crashed the whole dashboard with
+    // "Assignment to constant variable".
+    expect(DASHBOARD_HTML).toContain('const [feedSwaps,feedSwarms,feedAlerts]=await Promise.all([');
+    expect(DASHBOARD_HTML).toContain('swaps=Math.max(swaps, feedSwaps.length)');
+    expect(DASHBOARD_HTML).not.toContain('const [swaps,swarms,alerts]=await Promise.all([');
     expect(DASHBOARD_HTML).toContain('MC (after signal)');
   });
 });

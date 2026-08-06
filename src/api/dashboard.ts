@@ -704,30 +704,33 @@ function applyStats(m){
 // bounded lists so a row that first said “pricing…” updates without needing a
 // new transfer or a full page reload.
 async function loadFeeds(){
-  const [swaps,swarms,alerts]=await Promise.all([
+  // Keep the fetched snapshots distinct from the mutable header counters above.
+  // Reusing the swaps name here shadowed the mutable header counter, then attempted to
+  // assign to the local const below — crashing the dashboard refresh loop.
+  const [feedSwaps,feedSwarms,feedAlerts]=await Promise.all([
     fetch('/api/swaps?limit=60').then(r=>r.json()),
     fetch('/api/swarms?limit=50').then(r=>r.json()),
     fetch('/api/alerts?limit=30').then(r=>r.json()),
   ]);
   const feed=$('feed'); feed.innerHTML='';
-  if(swaps.length) swaps.slice().reverse().forEach(s=>feed.prepend(feedRow(s)));
+  if(feedSwaps.length) feedSwaps.slice().reverse().forEach(s=>feed.prepend(feedRow(s)));
   else feed.innerHTML='<div class="empty">waiting for swaps…</div>';
 
   const se=$('swarms'); se.innerHTML='';
   const nc=$('newcoins'); nc.innerHTML='';
-  if(swarms.length){
-    swarms.slice().reverse().forEach(s=>{ se.prepend(swarmRow(s)); if(s.newToken) nc.prepend(newCoinRow(s)); });
+  if(feedSwarms.length){
+    feedSwarms.slice().reverse().forEach(s=>{ se.prepend(swarmRow(s)); if(s.newToken) nc.prepend(newCoinRow(s)); });
   } else se.innerHTML='<div class="empty">no swarms yet</div>';
   if(!nc.children.length) nc.innerHTML='<div class="empty">no new-coin swarms yet</div>';
 
   const ae=$('alerts'); ae.innerHTML='';
-  if(alerts.length) alerts.slice().reverse().forEach(a=>ae.prepend(alertRow(a)));
+  if(feedAlerts.length) feedAlerts.slice().reverse().forEach(a=>ae.prepend(alertRow(a)));
   else ae.innerHTML='<div class="empty">no alerts fired yet</div>';
 
   // A restored feed can have rows before this process's totals start counting,
   // and an event can arrive during boot before SSE is attached. Show at least
   // what is visibly present; later SSE events continue from this high-water mark.
-  swaps=Math.max(swaps, swaps.length); sw=Math.max(sw, swarms.length); al=Math.max(al, alerts.length);
+  swaps=Math.max(swaps, feedSwaps.length); sw=Math.max(sw, feedSwarms.length); al=Math.max(al, feedAlerts.length);
   $('m-swaps').textContent=swaps; $('m-swarms').textContent=sw; $('m-alerts').textContent=al;
 }
 
