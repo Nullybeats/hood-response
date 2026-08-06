@@ -24,8 +24,12 @@ import type { SwapEvent } from '../types.js';
  */
 export class AttributionShadow {
   readonly ledger = new AttributionLedger();
-  private readonly verifier = new PoolVerifier(makeEthCall(config.CHAIN_HTTP_URL));
-  private readonly v4Pools = new V4PoolRegistry(this.ledger, config.CHAIN_HTTP_URL);
+  // Attribution is deliberately off the listener's public node whenever a
+  // dedicated endpoint exists. Falling back keeps local/dev installations
+  // zero-config, but production can now move receipt/pool work independently.
+  private readonly rpcUrl = config.ATTRIB_RPC_URL || config.ATTRIB_TRACE_RPC_URL || config.CHAIN_HTTP_URL;
+  private readonly verifier = new PoolVerifier(makeEthCall(this.rpcUrl));
+  private readonly v4Pools = new V4PoolRegistry(this.ledger, this.rpcUrl);
   private readonly hs = new HyperSyncClient({
     url: config.FEED_HYPERSYNC_URL,
     token: config.FEED_HYPERSYNC_TOKEN,
@@ -36,7 +40,7 @@ export class AttributionShadow {
     ledger: this.ledger,
     verifier: this.verifier,
     enrich: (txHash, wallet) => this.enrich(txHash, wallet),
-    sourceHost: config.CHAIN_HTTP_URL,
+    sourceHost: this.rpcUrl,
   });
   private readonly traceMatrix = new TraceCapabilityMatrix();
   private timer: NodeJS.Timeout | null = null;
@@ -101,6 +105,8 @@ export class AttributionShadow {
       },
       pools: this.ledger.poolVerificationStats(),
       v4InitializedPools: this.ledger.v4InitializationCount(),
+      enrichmentRpcHost: rpcHost(this.rpcUrl),
+      enrichmentSharesListenerRpc: this.rpcUrl === config.CHAIN_HTTP_URL,
       traceCapability: this.traceMatrix.entries(),
     };
   }
@@ -233,7 +239,7 @@ export class AttributionShadow {
   }
 
   private async rpc<T>(method: string, params: unknown[]): Promise<{ ok: true; value: T } | { ok: false; kind: FailureCategory; detail: string }> {
-    const url = config.CHAIN_HTTP_URL;
+    const url = this.rpcUrl;
     const sched = schedulerFor(url);
     try {
       return await sched.run(async () => {
@@ -424,7 +430,7 @@ export class AttributionShadow {
         nativeValueWei: tx.value.value ?? null,
         receiptStatus: receipt.value.status ?? null,
         receiptJson: JSON.stringify(receipt.value),
-        sourceHost: rpcHost(config.CHAIN_HTTP_URL),
+        sourceHost: rpcHost(this.rpcUrl),
       },
       ctx: {
         txHash,
