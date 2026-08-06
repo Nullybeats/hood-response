@@ -109,7 +109,10 @@ function capMap<T>(map: Map<string, T>, max: number): void {
 export class PriceOracle {
   private readonly synthetic = new Map<string, number>();
   private readonly live = new Map<string, LivePrice>();
+  /** Ordinary refresh work. It is deliberately bounded each tick. */
   private readonly queue = new Set<string>();
+  /** Recently displayed tokens jump ahead of the long restored-token backlog. */
+  private readonly priorityQueue = new Set<string>();
   /** Tokens awaiting an on-chain supply read (see drainSupplyQueue). */
   private readonly supplyQueue = new Set<string>();
   /** Failed supply-read counts, so a hopeless contract is not retried forever. */
@@ -400,6 +403,27 @@ export class PriceOracle {
     await this.fetchOne(key);
   }
 
+  /**
+   * Put a displayed token at the front of the next bounded refresh.  This is
+   * intentionally asynchronous: chain detection never waits on DexScreener,
+   * but a new visible row must not sit behind hundreds of restored tokens.
+   */
+  requestRefresh(tokenAddress: string): void {
+    if (!this.liveEnabled) return;
+    const key = tokenAddress.toLowerCase();
+    if (this.fresh(key)) return;
+    this.queue.delete(key);
+    this.priorityQueue.add(key);
+  }
+
+  /** The display may say either how the price was established or why it is absent. */
+  quoteState(tokenAddress: string): 'live' | 'pricing' | 'unavailable' {
+    const key = tokenAddress.toLowerCase();
+    if (this.fresh(key)) return 'live';
+    if (this.priorityQueue.has(key) || this.queue.has(key)) return 'pricing';
+    return 'unavailable';
+  }
+
   /** Best DexScreener link: the precise pair page when known, else token search. */
   dexUrl(tokenAddress: string): string {
     const live = this.fresh(tokenAddress);
@@ -425,6 +449,8 @@ export class PriceOracle {
     if (config.PRICE_SYNTHETIC_FALLBACK) {
       logger.warn('PRICE_SYNTHETIC_FALLBACK is ON — unpriced tokens get a FABRICATED price. Dev only.');
     }
+    // Do not leave a recovered dashboard blank until the first interval.
+    void this.refresh();
     this.timer = setInterval(() => void this.refresh(), config.PRICE_REFRESH_MS);
   }
 
@@ -445,9 +471,12 @@ export class PriceOracle {
 
     await this.drainSupplyQueue();
 
-    if (this.queue.size === 0) return;
-    const batch = [...this.queue].slice(0, MAX_PER_TICK);
-    for (const a of batch) this.queue.delete(a);
+    if (this.priorityQueue.size === 0 && this.queue.size === 0) return;
+    const batch = [...this.priorityQueue, ...this.queue].slice(0, MAX_PER_TICK);
+    for (const a of batch) {
+      this.priorityQueue.delete(a);
+      this.queue.delete(a);
+    }
     await Promise.all(batch.map((a) => this.fetchOne(a)));
   }
 

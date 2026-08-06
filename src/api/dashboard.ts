@@ -191,7 +191,8 @@ const $ = (id) => document.getElementById(id);
 const short = (a) => a ? a.slice(0,6)+'…'+a.slice(-4) : '';
 // null/undefined = unknown, and must not render as "$0.00" — an unmeasured
 // figure that looks measured is the whole bug class this guards against.
-const usd = (n) => n==null ? '?' : n>=1e6 ? '$'+(n/1e6).toFixed(2)+'M' : n>=1e3 ? '$'+(n/1e3).toFixed(1)+'k' : '$'+n.toFixed(2);
+const usd = (n) => n==null ? 'unpriced' : n>=1e6 ? '$'+(n/1e6).toFixed(2)+'M' : n>=1e3 ? '$'+(n/1e3).toFixed(1)+'k' : '$'+n.toFixed(2);
+const quoteLabel = (q) => q&&q.state==='pricing' ? 'pricing…' : 'price unavailable';
 const convClass = (c) => c>=70?'hi':c>=40?'mid':'lo';
 const time = (t) => new Date(t).toLocaleTimeString();
 let DEX_CHAIN=null;
@@ -215,7 +216,13 @@ const buyLinks = (addr) => {
 function cap(el, max){ while(el.children.length>max) el.removeChild(el.lastChild); }
 function clearEmpty(el){ const e=el.querySelector('.empty'); if(e) e.remove(); }
 
-const mcLabel = (s) => (s.kind==='SELL' ? 'sold @ ' : 'bought @ ') + usd(s.marketCap) + ' MC' + srcLabel(s) + athLabel(s);
+const mcLabel = (s) => {
+  if(s.marketCap!=null) return (s.kind==='SELL' ? 'sold @ ' : 'bought @ ') + usd(s.marketCap) + ' MC' + srcLabel(s) + athLabel(s);
+  // A later quote is useful, but never rewrite history and call it the entry
+  // cap. The qualifier is what prevents that new kind of false precision.
+  if(s.quote&&s.quote.marketCap!=null) return 'now '+usd(s.quote.marketCap)+' MC (after signal)';
+  return quoteLabel(s.quote);
+};
 const srcLabel = (s) => !s.priceLive ? ' (no price)' : s.priceSource==='pool' ? ' (on-chain px)' : '';
 const athLabel = (s) => {
   if(s.athMarketCap==null) return '';
@@ -225,10 +232,12 @@ const athLabel = (s) => {
 
 function feedRow(s){
   const d=document.createElement('div'); d.className='row flash';
+  const value=s.usdValue!=null ? usd(s.usdValue) : s.quote&&s.quote.priceUsd!=null
+    ? '~'+usd(s.quote.priceUsd*s.amount) : quoteLabel(s.quote);
   d.innerHTML='<span class="tag '+s.direction+'">'+s.direction+'</span>'+
     '<span class="sym">'+s.tokenSymbol+'</span>'+
     '<span class="grow mono">tracked wallet</span>'+
-    '<span class="usd">'+usd(s.usdValue)+'</span>'+
+    '<span class="usd">'+value+'</span>'+
     '<span class="mono">'+time(s.timestamp)+'</span>';
   return d;
 }
@@ -251,7 +260,7 @@ function swarmRow(s){
     '<span class="sym">'+dexA(s.dexUrl,s.tokenSymbol)+into+'</span>'+
     '<span class="grow mono">'+(s.walletSummary||s.walletCount+' wallets')+' · '+mcLabel(s)+'</span>'+
     buyLinks(s.token)+
-    '<span class="usd">'+usd(s.totalUsd)+'</span>'+
+    '<span class="usd">'+(s.totalUsd>0?usd(s.totalUsd):quoteLabel(s.quote))+'</span>'+
     '<span class="conv '+convClass(s.conviction)+'">'+s.conviction+'</span>';
   return d;
 }
@@ -273,7 +282,7 @@ function newCoinRow(s){
     '<span class="grow addr" title="'+s.token+'">'+dexA(s.dexUrl,s.token)+'</span>'+
     '<span class="mono">'+s.walletCount+'w · '+mcLabel(s)+'</span>'+
     buyLinks(s.token)+
-    '<span class="usd">'+usd(s.totalUsd)+'</span>'+
+    '<span class="usd">'+(s.totalUsd>0?usd(s.totalUsd):quoteLabel(s.quote))+'</span>'+
     '<span class="conv '+convClass(s.conviction)+'">'+s.conviction+'</span>';
   return d;
 }
@@ -637,6 +646,31 @@ function applyStats(m){
   mode.className='pill '+(m.mode==='live'?'live':'sim');
 }
 
+// Quotes arrive asynchronously after chain detection. Rebuild these small,
+// bounded lists so a row that first said “pricing…” updates without needing a
+// new transfer or a full page reload.
+async function loadFeeds(){
+  const [swaps,swarms,alerts]=await Promise.all([
+    fetch('/api/swaps?limit=60').then(r=>r.json()),
+    fetch('/api/swarms?limit=50').then(r=>r.json()),
+    fetch('/api/alerts?limit=30').then(r=>r.json()),
+  ]);
+  const feed=$('feed'); feed.innerHTML='';
+  if(swaps.length) swaps.slice().reverse().forEach(s=>feed.prepend(feedRow(s)));
+  else feed.innerHTML='<div class="empty">waiting for swaps…</div>';
+
+  const se=$('swarms'); se.innerHTML='';
+  const nc=$('newcoins'); nc.innerHTML='';
+  if(swarms.length){
+    swarms.slice().reverse().forEach(s=>{ se.prepend(swarmRow(s)); if(s.newToken) nc.prepend(newCoinRow(s)); });
+  } else se.innerHTML='<div class="empty">no swarms yet</div>';
+  if(!nc.children.length) nc.innerHTML='<div class="empty">no new-coin swarms yet</div>';
+
+  const ae=$('alerts'); ae.innerHTML='';
+  if(alerts.length) alerts.slice().reverse().forEach(a=>ae.prepend(alertRow(a)));
+  else ae.innerHTML='<div class="empty">no alerts fired yet</div>';
+}
+
 async function boot(){
   try{ const cfg=await fetch('/api/config').then(r=>r.json()); DEX_CHAIN=cfg.dexscreenerChain||null; EXPLORER_BASE=cfg.explorerBase||null; SIGMA_REF=cfg.sigmaRef||null; BASED_REF=cfg.basedRef||null; }catch(e){}
   const stats=await fetch('/api/stats').then(r=>r.json());
@@ -645,15 +679,7 @@ async function boot(){
   $('m-alerts').textContent=stats.totals.alerts;
   applyStats(stats.metrics);
 
-  const swarms=await fetch('/api/swarms?limit=50').then(r=>r.json());
-  const se=$('swarms'); const nc=$('newcoins');
-  if(swarms.length){ clearEmpty(se);
-    swarms.slice().reverse().forEach(s=>{ se.prepend(swarmRow(s)); if(s.newToken){ clearEmpty(nc); nc.prepend(newCoinRow(s)); } });
-    cap(se,40); cap(nc,40);
-  }
-  const alerts=await fetch('/api/alerts?limit=30').then(r=>r.json());
-  const ae=$('alerts'); if(alerts.length){ clearEmpty(ae); alerts.reverse().forEach(a=>ae.prepend(alertRow(a))); }
-
+  await loadFeeds();
   await loadTables();
   await loadPerformance();
   $('admin-btn').onclick=unlockAdmin;
@@ -665,16 +691,17 @@ async function boot(){
   };
   document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>showTab(t.dataset.tab));
   setInterval(loadTables, 8000);
+  setInterval(loadFeeds, 8000);
   setInterval(loadPerformance, 30000);
 
   const es=new EventSource('/events');
   let swaps=stats.totals.swaps, sw=stats.totals.swarms, al=stats.totals.alerts;
   es.addEventListener('swap', e=>{ const s=JSON.parse(e.data); const f=$('feed'); clearEmpty(f);
     f.prepend(feedRow(s)); cap(f,60); $('m-swaps').textContent=++swaps; });
-  es.addEventListener('swarm', e=>{ const s=JSON.parse(e.data); clearEmpty(se);
+  es.addEventListener('swarm', e=>{ const s=JSON.parse(e.data); const se=$('swarms'); clearEmpty(se);
     $('swarms').prepend(swarmRow(s)); cap($('swarms'),40); $('m-swarms').textContent=++sw;
     if(s.newToken){ const nc=$('newcoins'); clearEmpty(nc); nc.prepend(newCoinRow(s)); cap(nc,40); } });
-  es.addEventListener('alert', e=>{ const a=JSON.parse(e.data); clearEmpty(ae);
+  es.addEventListener('alert', e=>{ const a=JSON.parse(e.data); const ae=$('alerts'); clearEmpty(ae);
     $('alerts').prepend(alertRow(a)); cap($('alerts'),40); $('m-alerts').textContent=++al; });
   es.addEventListener('metrics', e=>applyStats(JSON.parse(e.data)));
 }

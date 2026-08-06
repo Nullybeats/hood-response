@@ -29,6 +29,18 @@ afterEach(() => {
 });
 
 describe('PriceOracle ATH tracking', () => {
+  it('prioritises a displayed token and exposes its honest interim state', async () => {
+    const oracle = new PriceOracle([]);
+    expect(oracle.quoteState(TOKEN)).toBe('unavailable');
+
+    oracle.requestRefresh(TOKEN);
+    expect(oracle.quoteState(TOKEN)).toBe('pricing');
+
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(dexResponse(100_000)));
+    await oracle.refreshNow(TOKEN);
+    expect(oracle.quoteState(TOKEN)).toBe('live');
+  });
+
   it('tracks the highest market cap seen and never lowers it on a dip', async () => {
     const oracle = new PriceOracle([]);
     const fetchMock = vi

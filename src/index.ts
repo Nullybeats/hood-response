@@ -72,6 +72,11 @@ async function main(): Promise<void> {
   }
 
   const price = new PriceOracle([...store.tokensByAddress.values()], store);
+  // The durable UI may contain a handful of signals created while a new pair
+  // was still unindexed. Give those visible tokens priority over the broad
+  // restored-token sweep; this is display enrichment only, never alert input.
+  for (const swarm of store.recentSwarms(50)) price.requestRefresh(swarm.token);
+  for (const alert of store.recentAlerts(30)) price.requestRefresh(alert.swarm.token);
   price.start();
   const aggregator = new Aggregator(store, price);
   const engine = new AlertEngine(store, aggregator);
@@ -312,6 +317,10 @@ async function main(): Promise<void> {
       );
     }
     store.recordSwap(swap);
+    // The listener intentionally emits before price discovery finishes. Put
+    // this visible row at the front of the bounded background price queue so
+    // the UI can fill it on its next poll without slowing detection.
+    price.requestRefresh(swap.token);
 
     // Multi-wallet swarms (BUY / SELL / ROTATION).
     for (const swarm of aggregator.ingest(swap)) {
@@ -382,7 +391,7 @@ async function main(): Promise<void> {
     : null;
   feedStateTimer?.unref();
 
-  const app = await buildServer(store, engine, aggregator, performance, sniper, shadow, attribution);
+  const app = await buildServer(store, engine, aggregator, performance, sniper, shadow, attribution, price);
   await app.listen({ port: config.PORT, host: config.HOST });
   logger.info(
     { url: `http://${config.HOST}:${config.PORT}`, wallets: store.wallets.size },

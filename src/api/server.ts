@@ -14,6 +14,7 @@ import type { SniperRegistry } from '../sniper/registry.js';
 import type { HyperSyncShadow } from '../chain/shadow.js';
 import type { AttributionShadow } from '../attrib/runtime.js';
 import { addressOfPrivateKey } from '../sniper/executor.js';
+import type { PriceOracle } from '../chain/price.js';
 import { configuredChannels, dispatch } from '../notify/index.js';
 import { walletId } from '../walletId.js';
 import type { Alert, AlertRule, Swarm, SwapEvent, WalletCategory } from '../types.js';
@@ -108,9 +109,28 @@ export async function buildServer(
   sniper?: SniperRegistry,
   shadow?: HyperSyncShadow,
   attribution?: AttributionShadow,
+  price?: PriceOracle,
 ): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
   await app.register(cors, { origin: true });
+
+  // Historical signals retain the price facts known at the time they fired.
+  // A current quote is deliberately a separate overlay: overwriting an old
+  // unknown with today's price would falsely claim it was the entry price.
+  const quoteFor = (token: string) => {
+    if (!price) return { state: 'unavailable' as const, priceUsd: null, marketCap: null };
+    const tracked = store.tokensByAddress.get(token.toLowerCase());
+    const priceUsd = price.priceOf(token);
+    const marketCap = tracked ? price.marketCap(tracked) : null;
+    return {
+      state: price.quoteState(token),
+      priceUsd,
+      marketCap,
+    };
+  };
+  const displaySwap = (s: SwapEvent) => ({ ...redactSwap(s), quote: quoteFor(s.token) });
+  const displaySwarm = (s: Swarm) => ({ ...redactSwarm(s), quote: quoteFor(s.token) });
+  const displayAlert = (a: Alert) => ({ ...a, swarm: displaySwarm(a.swarm) });
 
   // ── Health ────────────────────────────────────────────────────────────────
   app.get('/health', async () => ({
@@ -609,15 +629,15 @@ export async function buildServer(
   // ── Feeds ────────────────────────────────────────────────────────────────────
   app.get('/api/swaps', async (req) => {
     const limit = clampLimit((req.query as { limit?: string }).limit);
-    return store.recentSwaps(limit).map(redactSwap);
+    return store.recentSwaps(limit).map(displaySwap);
   });
   app.get('/api/swarms', async (req) => {
     const limit = clampLimit((req.query as { limit?: string }).limit);
-    return store.recentSwarms(limit).map(redactSwarm);
+    return store.recentSwarms(limit).map(displaySwarm);
   });
   app.get('/api/alerts', async (req) => {
     const limit = clampLimit((req.query as { limit?: string }).limit);
-    return store.recentAlerts(limit).map(redactAlert);
+    return store.recentAlerts(limit).map(displayAlert);
   });
 
   // Send a sample alert to every configured channel so a new Telegram channel /
@@ -735,9 +755,9 @@ export async function buildServer(
       reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
     };
     // Redact wallet addresses before they leave the server over SSE.
-    const onSwap = (e: SwapEvent) => send('swap')(redactSwap(e));
-    const onSwarm = (s: Swarm) => send('swarm')(redactSwarm(s));
-    const onAlert = (a: Alert) => send('alert')(redactAlert(a));
+    const onSwap = (e: SwapEvent) => send('swap')(displaySwap(e));
+    const onSwarm = (s: Swarm) => send('swarm')(displaySwarm(s));
+    const onAlert = (a: Alert) => send('alert')(displayAlert(a));
     const onMetrics = send('metrics');
     store.on('swap', onSwap);
     store.on('swarm', onSwarm);
