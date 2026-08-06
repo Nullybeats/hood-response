@@ -240,6 +240,10 @@ const quoteFor=(s)=>{
 // later quote. When it is absent, show the current unit price instead of
 // incorrectly calling a valid quote unavailable.
 const currentPriceLabel=(q)=>q&&q.priceUsd!=null?'px '+usd(q.priceUsd):quoteLabel(q);
+// Keep the row's fact order stable: wallet count, price facts, historical
+// notional, then conviction. The tier makeup is retained as supporting detail
+// rather than replacing the count shown in alert copy.
+const swarmFacts=(s)=>s.walletCount+'w'+(s.walletSummary?' · '+s.walletSummary:'')+' · '+mcLabel(s);
 const txLink=(h)=>h&&EXPLORER_BASE?'<a href="'+EXPLORER_BASE+'/tx/'+h+'" target="_blank" rel="noopener" class="dex">'+h.slice(0,8)+'…</a>':(h?h.slice(0,8)+'…':'');
 const dexUrl = (addr) => DEX_CHAIN ? 'https://dexscreener.com/'+DEX_CHAIN+'/'+addr : 'https://dexscreener.com/search?q='+addr;
 const dexLink = (addr,label) => '<a href="'+dexUrl(addr)+'" target="_blank" rel="noopener" class="dex">'+label+'</a>';
@@ -302,7 +306,7 @@ function swarmRow(s){
   const into = s.kind==='ROTATION' ? ' → '+(s.rotatedIntoSymbol||'?') : '';
   d.innerHTML='<span class="tag '+s.kind+'">'+s.kind+'</span>'+primeBadge(s)+newBadge(s)+repeatBadge(s)+freshBadge(s)+safeBadge(s)+momBadge(s)+
     '<span class="sym">'+dexA(s.dexUrl,s.tokenSymbol)+into+'</span>'+
-    '<span class="grow mono">'+(s.walletSummary||s.walletCount+' wallets')+' · '+mcLabel(s)+'</span>'+
+    '<span class="grow mono">'+swarmFacts(s)+'</span>'+
     buyLinks(s.token)+
     '<span class="usd">'+(s.totalUsd>0?usd(s.totalUsd):currentPriceLabel(q))+'</span>'+
     '<span class="conv '+convClass(s.conviction)+'">'+s.conviction+'</span>';
