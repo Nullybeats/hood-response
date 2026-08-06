@@ -4,6 +4,7 @@ import { classifyTransaction, walletDeltas } from '../attrib/classifier.js';
 import { OUTCOME_OF, type Category } from '../attrib/taxonomy.js';
 import { TRANSFER_TOPIC, addressToTopic } from '../chain/decoder.js';
 import { V3_SWAP_TOPIC, V4_SWAP_TOPIC } from '../chain/receipt.js';
+import { POOL_MANAGER } from '../chain/uniswap.js';
 import { TRANSFER_WITH_SCALED_UI } from '../attrib/protocols/index.js';
 import type { TxContext, TxLogView } from '../attrib/protocols/types.js';
 
@@ -12,6 +13,7 @@ const OTHER = '0x2222222222222222222222222222222222222222';
 const POOL = '0x3333333333333333333333333333333333333333';
 const TOKEN = '0x4444444444444444444444444444444444444444';
 const WETH = '0x0bd7d308f8e1639fab988df18a8011f41eacad73';
+const V4_POOL_ID = '0x' + 'ab'.repeat(32);
 
 const NPM = '0x58daec3116aae6d93017baaea7749052e8a04fa7'; // POSITION_MANAGER
 const NATIVE = '0x0000000000000000000000000000000000000000';
@@ -74,13 +76,14 @@ describe('attribution classifier — a trade requires a demonstrated exchange', 
   });
 
   it('confirms a V4 swap on wallet deltas, NOT on the router being the sender', () => {
-    // V4's Swap sender is the router. If we trusted that as beneficiary we would
-    // credit the router, not the user — the deltas are the only honest source.
+    // V4 topic1 is the PoolId; topic2 is the router/sender.  If we trusted that
+    // sender as beneficiary we would credit the router, not the user — the
+    // demonstrated wallet deltas are the only honest source.
     const r = classifyTransaction({
       ctx: ctx([
         xfer(WETH, WALLET, POOL, 10n ** 18n),
         xfer(TOKEN, POOL, WALLET, 42n * 10n ** 18n),
-        log(POOL, V4_SWAP_TOPIC, addressToTopic(OTHER)),
+        log(POOL_MANAGER, V4_SWAP_TOPIC, V4_POOL_ID, addressToTopic(OTHER)),
       ]),
     });
     expect(r.category).toBe('swap_v4_poolmanager');

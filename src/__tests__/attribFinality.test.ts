@@ -132,6 +132,26 @@ describe('finality, continuity and reorg rollback', () => {
       expect(led.checkpointAt(STREAM, 1000)).toBeNull();
       expect(led.checkpointAt(STREAM, 999)).toBe('0xok');
     });
+
+    it('removes V4 Initialize provenance from reorged blocks', () => {
+      led.recordV4Initialization({
+        poolId: '0x' + 'aa'.repeat(32),
+        blockNumber: 999,
+        logIndex: 1,
+        txHash: '0xkeep',
+        evidence: { trustedAnchor: '0xmanager' },
+      });
+      led.recordV4Initialization({
+        poolId: '0x' + 'bb'.repeat(32),
+        blockNumber: 1000,
+        logIndex: 2,
+        txHash: '0xdrop',
+        evidence: { trustedAnchor: '0xmanager' },
+      });
+      expect(led.v4InitializationCount()).toBe(2);
+      led.rollbackTo(STREAM, 1000, null, null);
+      expect(led.v4InitializationCount()).toBe(1);
+    });
   });
 
   describe('finality reporting', () => {

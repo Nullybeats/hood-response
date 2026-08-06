@@ -120,7 +120,10 @@ export function classifyTransaction(input: ClassifyInput): AttributionResult {
   // finding may influence a verdict.
   const ours = (f: ProtocolFinding): boolean =>
     f.verified && (f.beneficiary == null || isWallet(f.beneficiary, ctx.wallet));
-  const oursLiq = liq.filter(ours);
+  // V4 ModifyLiquidity's indexed sender is typically a router.  With no
+  // explicit beneficiary, it cannot be charged to this wallet; otherwise a
+  // third party adding liquidity in the same batch would suppress a real swap.
+  const oursLiq = liq.filter((f) => ours(f) && !(f.protocolId === 'uniswap-v4' && f.beneficiary == null));
   const oursFees = fees.filter(ours);
   const oursSwaps = swaps.filter((f) => f.verified);
 

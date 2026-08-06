@@ -1,7 +1,7 @@
 import { logger } from '../logger.js';
 import { classifyTransaction } from './classifier.js';
 import type { AttributionLedger, ObservationKey, TxRecord } from './ledger.js';
-import type { PoolVerifier } from './poolVerify.js';
+import type { PoolVerification, PoolVerifier } from './poolVerify.js';
 import type { TxContext } from './protocols/types.js';
 import {
   CLASSIFIER_VERSION,
@@ -42,6 +42,8 @@ export interface EnrichedTx {
   ctx: Omit<TxContext, 'verifiedContracts' | 'pendingContracts'>;
   /** Pools whose identity this transaction's verdict depends on. */
   candidatePools: string[];
+  /** Trusted-PoolManager Initialize proofs found in this receipt. */
+  v4Initializations?: PoolVerification[];
   extraDeltas?: WalletDelta[];
   decimals?: Record<string, number>;
 }
@@ -107,6 +109,23 @@ export class Ingester {
 
   constructor(private readonly o: IngestOptions) {
     this.cv = o.classifierVersion ?? CLASSIFIER_VERSION;
+  }
+
+  /** Store V4 pool provenance in the same transaction as this receipt. */
+  private persistV4Initializations(val: EnrichedTx): void {
+    for (const v of val.v4Initializations ?? []) {
+      if (v.protocol !== 'uniswap-v4' || v.status !== 'verified' || !v.evidence.poolId) continue;
+      const blockNumber = v.evidence.blockNumber;
+      const logIndex = v.evidence.logIndex;
+      if (blockNumber == null || logIndex == null) continue;
+      this.o.ledger.recordV4Initialization({
+        poolId: v.evidence.poolId,
+        blockNumber,
+        logIndex,
+        txHash: v.evidence.txHash ?? val.tx.txHash,
+        evidence: v.evidence,
+      });
+    }
   }
 
   /**
@@ -222,6 +241,7 @@ export class Ingester {
     try {
       ledger.transaction(() => {
         ledger.recordTx(val.tx);
+        this.persistV4Initializations(val);
         ledger.recordObservation(
           key.txHash,
           obs.logIndex,
@@ -306,6 +326,7 @@ export class Ingester {
     try {
       ledger.transaction(() => {
         ledger.recordTx(val.tx);
+        this.persistV4Initializations(val);
         ledger.recordObservation(
           base.key.txHash,
           obs.logIndex,

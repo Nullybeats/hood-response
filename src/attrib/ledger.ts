@@ -46,7 +46,7 @@ type DatabaseSync = InstanceType<typeof DatabaseSync>;
  */
 
 /** Bumped when the schema changes; recorded via `PRAGMA user_version`. */
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 const sqlList = (vals: string[]): string => vals.map((v) => `'${v}'`).join(',');
 const OUTCOMES = sqlList([...new Set(Object.values(OUTCOME_OF))]);
@@ -306,6 +306,19 @@ export class AttributionLedger {
         updated_at INTEGER NOT NULL
       );
 
+      -- V4 has no per-pool contract.  Its durable provenance is the Initialize
+      -- log emitted by the trusted singleton PoolManager, keyed by PoolId.
+      -- Keep the block coordinate separate so a reorg removes a proof that
+      -- belonged only to the discarded chain.
+      CREATE TABLE IF NOT EXISTS attrib_v4_pool_initialization (
+        pool_id TEXT PRIMARY KEY,
+        block_number INTEGER NOT NULL,
+        log_index INTEGER NOT NULL,
+        tx_hash TEXT,
+        evidence_json TEXT NOT NULL,
+        recorded_at INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS attrib_cursor (
         stream_id TEXT PRIMARY KEY,
         covered_through_block INTEGER NOT NULL,
@@ -318,6 +331,7 @@ export class AttributionLedger {
       CREATE INDEX IF NOT EXISTS idx_hit_sig ON attrib_protocol_hit (event_sig, verified);
       CREATE INDEX IF NOT EXISTS idx_failure_kind ON attrib_failure (failure_kind, at);
       CREATE INDEX IF NOT EXISTS idx_pool_state ON attrib_pool_verification (state);
+      CREATE INDEX IF NOT EXISTS idx_v4_init_block ON attrib_v4_pool_initialization (block_number);
     `);
     this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     logger.info({ schemaVersion: SCHEMA_VERSION }, 'attrib: ledger open');
@@ -644,6 +658,36 @@ export class AttributionLedger {
       else out.pending = r.n;
     }
     return out;
+  }
+
+  /** Persist a verified V4 Initialize proof.  PoolIds are not addresses. */
+  recordV4Initialization(init: {
+    poolId: string;
+    blockNumber: number;
+    logIndex: number;
+    txHash: string | null;
+    evidence: unknown;
+  }): void {
+    if (!this.db) return;
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO attrib_v4_pool_initialization
+         (pool_id, block_number, log_index, tx_hash, evidence_json, recorded_at)
+         VALUES (?,?,?,?,?,?)`,
+      )
+      .run(
+        init.poolId.toLowerCase(),
+        init.blockNumber,
+        init.logIndex,
+        init.txHash?.toLowerCase() ?? null,
+        JSON.stringify(init.evidence),
+        Date.now(),
+      );
+  }
+
+  v4InitializationCount(): number {
+    if (!this.db) return 0;
+    return (this.db.prepare('SELECT COUNT(*) AS n FROM attrib_v4_pool_initialization').get() as unknown as { n: number }).n;
   }
 
   /**
@@ -1041,6 +1085,7 @@ export class AttributionLedger {
       const observationsRemoved = Number(
         this.db!.prepare('DELETE FROM attrib_observation WHERE block_number >= ?').run(block).changes,
       );
+      this.db!.prepare('DELETE FROM attrib_v4_pool_initialization WHERE block_number >= ?').run(block);
       this.db!.prepare('DELETE FROM attrib_checkpoint WHERE block_number >= ?').run(block);
       // Rewind every stream: a reorg invalidates the range for all of them.
       this.db!

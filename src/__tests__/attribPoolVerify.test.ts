@@ -9,7 +9,7 @@ import {
 import { INIT_TOPIC, POOL_MANAGER, V3_FACTORY } from '../chain/uniswap.js';
 import { classifyTransaction } from '../attrib/classifier.js';
 import { TRANSFER_TOPIC, addressToTopic } from '../chain/decoder.js';
-import { V3_SWAP_TOPIC } from '../chain/receipt.js';
+import { V3_SWAP_TOPIC, V4_SWAP_TOPIC } from '../chain/receipt.js';
 import type { TxLogView } from '../attrib/protocols/types.js';
 
 // Real values captured from chain 4663 on 2026-08-05.
@@ -234,6 +234,55 @@ describe('pool verification — identity, not a non-zero response', () => {
       await verifier.verifyV3(POOL);
       const r = classifyTransaction({ ctx: ctx(verifier.verifiedSet()) });
       expect(r.outcome).toBe('unknown_unsupported');
+    });
+
+    it('confirms a well-formed V4 PoolManager Swap only with a demonstrated exchange', () => {
+      i = 0;
+      const amt = '0x' + (10n ** 18n).toString(16).padStart(64, '0');
+      const poolId = '0x' + 'cd'.repeat(32);
+      const v4ctx = {
+        txHash: '0xv4',
+        logs: [
+          log(WETH, TRANSFER_TOPIC, addressToTopic(WALLET), addressToTopic(POOL_MANAGER), amt),
+          log(PORT, TRANSFER_TOPIC, addressToTopic(POOL_MANAGER), addressToTopic(WALLET), amt),
+          // V4 indexes PoolId in topic1 and sender in topic2. Neither is the
+          // recipient; wallet attribution comes from the net transfers above.
+          log(POOL_MANAGER, V4_SWAP_TOPIC, poolId, addressToTopic(OTHER)),
+        ],
+        wallet: WALLET,
+        walletTopic: addressToTopic(WALLET).toLowerCase(),
+        txTo: null,
+        selector: null,
+        nativeValueWei: null,
+        receiptStatus: '0x1',
+        verifiedContracts: new Set<string>(),
+      };
+      const r = classifyTransaction({ ctx: v4ctx });
+      expect(r.outcome).toBe('confirmed_trade');
+      expect(r.category).toBe('swap_v4_poolmanager');
+    });
+
+    it('does not certify a V4-shaped event from another contract or without a PoolId', () => {
+      i = 0;
+      const amt = '0x' + (10n ** 18n).toString(16).padStart(64, '0');
+      const malformed = {
+        txHash: '0xbadv4',
+        logs: [
+          log(WETH, TRANSFER_TOPIC, addressToTopic(WALLET), addressToTopic(OTHER), amt),
+          log(PORT, TRANSFER_TOPIC, addressToTopic(OTHER), addressToTopic(WALLET), amt),
+          log(OTHER, V4_SWAP_TOPIC, '0x' + 'cd'.repeat(32), addressToTopic(OTHER)),
+        ],
+        wallet: WALLET,
+        walletTopic: addressToTopic(WALLET).toLowerCase(),
+        txTo: null,
+        selector: null,
+        nativeValueWei: null,
+        receiptStatus: '0x1',
+        verifiedContracts: new Set<string>(),
+      };
+      const r = classifyTransaction({ ctx: malformed });
+      expect(r.outcome).toBe('unknown_unsupported');
+      expect(r.category).toBe('unsupported_protocol');
     });
   });
 });

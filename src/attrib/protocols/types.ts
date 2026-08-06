@@ -94,6 +94,8 @@ export interface ProtocolFinding {
   verified: boolean;
   tokenIn?: string | null;
   tokenOut?: string | null;
+  /** Uniswap v4 PoolId, when the event carries one.  It is not an address. */
+  poolId?: string | null;
   note?: string;
 }
 

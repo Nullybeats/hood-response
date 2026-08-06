@@ -51,6 +51,7 @@ export const TRANSFER_WITH_SCALED_UI = id(
 
 const find = (ctx: TxContext, sigs: string[]): TxLogView[] =>
   ctx.logs.filter((l) => sigs.includes(lc(l.topic0)));
+const isBytes32 = (v: string | null | undefined): v is string => !!v && /^0x[0-9a-f]{64}$/i.test(v);
 
 /** Was this emitter's protocol identity actually established for this tx? */
 function isVerified(ctx: TxContext, address: string, canonical: string[] = []): boolean {
@@ -173,22 +174,38 @@ const uniswapV4: ProtocolAdapter = {
   events: { Swap: V4_SWAP_TOPIC, ModifyLiquidity: V4_MODIFY_LIQUIDITY },
   interpret(ctx) {
     const out: ProtocolFinding[] = [];
-    // V4 is a singleton: topic1 is the sender, which for a routed swap is the
-    // ROUTER, not the user. So beneficiary is intentionally left null — the
-    // classifier must fall back to the wallet's own asset deltas. Claiming the
-    // router as beneficiary here is exactly the mislabel this design forbids.
+    // V4 is a singleton.  topic1 is the PoolId and topic2 is the sender (often
+    // a router, not the user).  The PoolManager's identity, plus this complete
+    // event shape, proves the protocol action; the wallet's net flow proves
+    // who traded.  Never call topic2 the beneficiary.
     for (const l of find(ctx, [V4_SWAP_TOPIC])) {
+      const poolId = isBytes32(l.topic1) ? lc(l.topic1) : null;
+      const manager = lc(l.address) === lc(POOL_MANAGER);
       out.push(
-        mk(this, ctx, l, 'swap', { beneficiary: null, note: 'v4 sender is the router, not the user' }, [
-          lc(POOL_MANAGER),
-        ]),
+        mk(this, ctx, l, 'swap', {
+          beneficiary: null,
+          poolId,
+          // A topic match from another contract, or a malformed manager log,
+          // is not V4 proof.  This overrides the generic canonical shortcut.
+          verified: manager && poolId != null,
+          note: manager
+            ? poolId
+              ? 'v4 PoolManager Swap; sender is not assumed to be the user'
+              : 'malformed PoolManager Swap: missing PoolId'
+            : 'Swap-shaped event from a non-PoolManager emitter',
+        }),
       );
     }
     for (const l of find(ctx, [V4_MODIFY_LIQUIDITY])) {
+      const poolId = isBytes32(l.topic1) ? lc(l.topic1) : null;
+      const manager = lc(l.address) === lc(POOL_MANAGER);
       out.push(
-        mk(this, ctx, l, 'liquidity_add', { beneficiary: null, note: 'liquidityDelta sign not decoded' }, [
-          lc(POOL_MANAGER),
-        ]),
+        mk(this, ctx, l, 'liquidity_add', {
+          beneficiary: null,
+          poolId,
+          verified: manager && poolId != null,
+          note: 'v4 ModifyLiquidity sender is not assumed to be the user',
+        }),
       );
     }
     return out;

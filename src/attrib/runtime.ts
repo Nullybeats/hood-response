@@ -1,6 +1,7 @@
 import { config } from '../config/env.js';
 import { addressToTopic } from '../chain/decoder.js';
 import { V3_SWAP_TOPIC } from '../chain/receipt.js';
+import { INIT_TOPIC } from '../chain/uniswap.js';
 import { logHttpFailure, logRpcError, logRpcThrow, rpcHost } from '../chain/rpcLog.js';
 import { HyperSyncClient, type HyperSyncFailure } from '../chain/hypersync.js';
 import { logger } from '../logger.js';
@@ -8,7 +9,7 @@ import { finalityStatus } from './finality.js';
 import { Ingester, type Enricher, type EnrichedTx, type PairObservation } from './ingest.js';
 import { AttributionLedger } from './ledger.js';
 import { observeUniverse } from './observe.js';
-import { PoolVerifier, makeEthCall } from './poolVerify.js';
+import { PoolVerifier, makeEthCall, verifyV4Pool } from './poolVerify.js';
 import { buildReport, type AccountingReport } from './report.js';
 import { schedulerFor } from './scheduler.js';
 import { CLASSIFIER_VERSION, type Evidence, type FailureCategory } from './taxonomy.js';
@@ -95,6 +96,7 @@ export class AttributionShadow {
         unprocessed: accounting.drift,
       },
       pools: this.ledger.poolVerificationStats(),
+      v4InitializedPools: this.ledger.v4InitializationCount(),
     };
   }
 
@@ -119,12 +121,9 @@ export class AttributionShadow {
       liveEmitted: this.ledger.liveEmittedCount(this.lastWindow.from, this.lastWindow.to),
       poolStats: this.verifier.stats(),
     });
-    // The classifier can represent verified V4 evidence, but this first
-    // runtime only obtains V3 pool proofs.  Keep that distinction visible in
-    // every report until PoolManager/Initialize provenance is wired here.
-    report.scope += '; verified-pool confirmation: V3 only in this runtime';
+    report.scope += '; V4 swaps require the official PoolManager event shape + wallet net flow';
     report.caveats.push(
-      'V4 PoolManager/Initialize provenance is not wired into this runtime yet. V4 activity may be observed, but cannot become `confirmed_trade` here.',
+      'V4 Initialize provenance is persisted whenever it appears in an ingested receipt. Historic registry backfill is still an audit enhancement; trade confirmation rests on the trusted singleton PoolManager event plus the wallet’s demonstrated net exchange.',
     );
     return report;
   }
@@ -262,6 +261,9 @@ export class AttributionShadow {
     if (!receipt.value || !tx.value || !Array.isArray(receipt.value.logs)) {
       return { ok: false, kind: 'receipt_missing', detail: 'transaction or receipt unavailable' };
     }
+    const blockNumber = Number.parseInt(receipt.value.blockNumber ?? tx.value.blockNumber ?? '0x0', 16);
+    const logIndexOf = (l: RawLog, index: number): number =>
+      typeof l.logIndex === 'string' ? Number.parseInt(l.logIndex, 16) : l.logIndex ?? index;
     const logs = receipt.value.logs.map((l, index) => ({
       address: (l.address ?? '').toLowerCase(),
       topic0: l.topics?.[0]?.toLowerCase() ?? null,
@@ -269,12 +271,24 @@ export class AttributionShadow {
       topic2: l.topics?.[2]?.toLowerCase() ?? null,
       topic3: l.topics?.[3]?.toLowerCase() ?? null,
       data: l.data ?? null,
-      logIndex: typeof l.logIndex === 'string' ? Number.parseInt(l.logIndex, 16) : l.logIndex ?? index,
+      logIndex: logIndexOf(l, index),
     }));
     const candidatePools = logs
       .filter((l) => l.topic0 === V3_SWAP_TOPIC && l.address)
       .map((l) => l.address);
-    const blockNumber = Number.parseInt(receipt.value.blockNumber ?? tx.value.blockNumber ?? '0x0', 16);
+    const v4Initializations = receipt.value.logs
+      .map((l, index) => ({ l, index }))
+      .filter(({ l }) => l.topics?.[0]?.toLowerCase() === INIT_TOPIC)
+      .map(({ l, index }) =>
+        verifyV4Pool({
+          address: (l.address ?? '').toLowerCase(),
+          topics: (l.topics ?? []).map((t) => t.toLowerCase()),
+          data: l.data ?? '0x',
+          blockNumber,
+          logIndex: logIndexOf(l, index),
+          transactionHash: txHash,
+        }),
+      );
     const value: EnrichedTx = {
       tx: {
         txHash,
@@ -299,6 +313,7 @@ export class AttributionShadow {
         receiptStatus: receipt.value.status ?? null,
       },
       candidatePools,
+      v4Initializations,
     };
     return { ok: true, value };
   }
