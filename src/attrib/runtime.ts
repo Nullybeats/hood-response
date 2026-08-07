@@ -17,6 +17,31 @@ import { V4PoolRegistry, type V4PoolMembership } from './v4Registry.js';
 import { CLASSIFIER_VERSION, type Evidence, type FailureCategory } from './taxonomy.js';
 import type { SwapEvent } from '../types.js';
 
+/** How often retention is applied. The sweep runs every 10s; a range delete need not. */
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+
+/**
+ * The block below which rows may be deleted, or null when nothing may be.
+ *
+ * Pure and exported because this is the whole safety argument for pruning: get
+ * it wrong in the permissive direction and the ledger deletes observations the
+ * ingester never classified, while the accounting still claims full coverage of
+ * those blocks — evidence destroyed and the loss invisible. The clamp to the
+ * safe cursor is what prevents that, so it is tested directly rather than
+ * inferred from the behaviour of a runtime that needs a live ledger to exist.
+ */
+export function pruneFloor(
+  head: number,
+  retentionBlocks: number,
+  cursor: number | null,
+): number | null {
+  if (retentionBlocks <= 0) return null;
+  const retentionFloor = head - retentionBlocks;
+  if (retentionFloor <= 0) return null;
+  const floor = cursor == null ? retentionFloor : Math.min(retentionFloor, cursor);
+  return floor > 0 ? floor : null;
+}
+
 /**
  * The attribution runtime is deliberately a SHADOW service.  It has a durable
  * ledger and its own cursors, but it does not receive or emit SwapEvents and is
@@ -49,6 +74,9 @@ export class AttributionShadow {
   private lastWindow: { from: number; to: number } | null = null;
   private lastError: string | null = null;
   private lastTickAt: number | null = null;
+  private lastPruneAt: number | null = null;
+  private lastPruneFloor: number | null = null;
+  private prunedRows = 0;
 
   constructor(private readonly watchedWallets: string[]) {}
 
@@ -95,6 +123,15 @@ export class AttributionShadow {
       cursorLag: this.observedHead != null && safe != null ? Math.max(0, this.observedHead - safe) : null,
       lastTickAt: this.lastTickAt,
       lastError: this.lastError,
+      // Retention is reported, not assumed: an unbounded ledger on a shared
+      // volume is exactly the kind of slow failure that stays invisible until
+      // the disk is full and every store on it starts failing at once.
+      retention: {
+        blocks: config.ATTRIB_RETENTION_BLOCKS,
+        lastPruneAt: this.lastPruneAt,
+        lastPruneFloor: this.lastPruneFloor,
+        prunedRows: this.prunedRows,
+      },
       // `unprocessed` is a normal bounded-batch queue during a backfill.  It
       // must not be exposed as "drift" (which implies an invariant breach).
       accounting: {
@@ -216,11 +253,61 @@ export class AttributionShadow {
         },
         'attrib: shadow sweep complete',
       );
+      this.maybePrune(head);
     } catch (err) {
       this.lastError = String(err).slice(0, 200);
       logger.error({ err: this.lastError }, 'attrib: shadow tick failed');
     } finally {
       this.running = false;
+    }
+  }
+
+  /**
+   * Apply the retention policy that `ATTRIB_RETENTION_BLOCKS` has always
+   * described but nothing enforced.
+   *
+   * The knob, the prune and the "failures are never auto-pruned" contract were
+   * all written; `pruneBefore` was simply never called outside a test, so the
+   * ledger grew without bound on a 500MB volume it shares with the sniper state,
+   * the performance store and the feed state. A full volume does not degrade
+   * gracefully — it fails all of them at once, with the SQLite write errors that
+   * produced the orphan-WAL corruption scare.
+   *
+   * Two safety properties:
+   *
+   *  - The floor is clamped to the safe cursor, so a large retention setting can
+   *    never delete observations the ingester has not yet classified. Pruning
+   *    ahead of the cursor would silently destroy queued work and leave the
+   *    accounting claiming full coverage of blocks it never explained.
+   *  - Throttled by wall clock, not by tick: the delete is a range scan, and the
+   *    sweep runs every 10s.
+   *
+   * Deliberately no VACUUM. SQLite does not shrink the file on delete, but it
+   * reuses the freed pages, so growth is bounded — which is the actual goal. A
+   * VACUUM rewrites the whole database and needs roughly double its size in free
+   * space, which is precisely what a nearly-full volume does not have.
+   */
+  private maybePrune(head: number): void {
+    const now = Date.now();
+    if (this.lastPruneAt != null && now - this.lastPruneAt < PRUNE_INTERVAL_MS) return;
+
+    const floor = pruneFloor(head, config.ATTRIB_RETENTION_BLOCKS, this.ledger.safeCursor());
+    if (floor == null) return;
+    this.lastPruneAt = now;
+
+    try {
+      const removed = this.ledger.pruneBefore(floor);
+      this.lastPruneFloor = floor;
+      this.prunedRows += removed;
+      if (removed > 0) {
+        logger.info(
+          { floor, removed, retentionBlocks: config.ATTRIB_RETENTION_BLOCKS },
+          'attrib: pruned observations older than the retention window',
+        );
+      }
+    } catch (err) {
+      // Retention is housekeeping. It must never take down the sweep it serves.
+      logger.warn({ err: String(err).slice(0, 160) }, 'attrib: prune failed');
     }
   }
 
