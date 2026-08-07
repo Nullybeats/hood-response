@@ -48,6 +48,12 @@ export interface V2Providers {
   claimFirstBuy(wallet: string, token: string, at: number, block: number): boolean;
   /** How much of the outcome record is usable, for the status endpoint. Optional. */
   outcomeStats?(): { wallets: number; calls: number };
+  /**
+   * Value a token amount at the CURRENT price, for trades whose usdValue was
+   * null at detection time. Recovers the `howMuch` dial on new pairs; the fact
+   * records that it came from a later price.
+   */
+  usdValueNow?(token: string, amount: number): number | null;
 }
 
 export interface V2RuntimeOptions {
@@ -217,6 +223,8 @@ export class V2Shadow {
       // the second time, which would erase the very fact it is waiting on.
       firstBuy: this.firstBuyMemo(trade),
       rotatedFrom: null,
+      usdValueLate:
+        trade.usdValue == null ? (this.providers.usdValueNow?.(trade.token, trade.amount) ?? null) : null,
     };
     return buildFactSheet(
       {

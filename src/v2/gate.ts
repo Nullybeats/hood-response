@@ -45,11 +45,24 @@ export interface GateOptions {
 }
 
 export const DEFAULT_GATE_OPTIONS: GateOptions = {
-  // [config] Enrichment either lands in the first few seconds or usually not at
-  // all. Beyond this the alert is stale anyway: on real trades every >50%-peak
-  // winner filled in under two seconds.
-  maxAttempts: 8,
-  maxPendingMs: 45_000,
+  /**
+   * [config] Sized against how long enrichment ACTUALLY takes, measured.
+   *
+   * The first values (8 attempts / 45s) were guessed from how quickly a live
+   * alert must fire, and they were wrong for this job: brand-new pairs need a
+   * canonical pool read plus a supply backfill plus an external safety screen,
+   * and trades were being dropped as "unresolved" while that work was still in
+   * flight. The legacy signal queue already backs off to a full minute per
+   * attempt and persists across restarts, so 45s was well short of what the
+   * rest of the system considers normal.
+   *
+   * A shadow that emits nothing loses nothing by waiting: a fact that resolves
+   * at 90s still tells us it was obtainable, which is the measurement. When v2
+   * eventually drives live alerts it will need a much tighter budget — but that
+   * is a decision to make against this data, not ahead of it.
+   */
+  maxAttempts: 30,
+  maxPendingMs: 180_000,
 };
 
 /**

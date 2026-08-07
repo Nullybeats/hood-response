@@ -80,6 +80,16 @@ export interface SheetInputs {
   firstBuy: boolean;
   /** Token this wallet sold to fund the buy, when the rotation was established. */
   rotatedFrom: string | null;
+  /**
+   * USD value of the buy when the trade itself carried none.
+   *
+   * A SwapEvent's usdValue is computed at detection time, before the pair has a
+   * price — so on exactly the brand-new coins this system hunts, it is null and
+   * stays null forever. Recomputing later recovers the dial, but the number is
+   * then a price from AFTER the trade, so it is sourced distinctly rather than
+   * passed off as the executed value.
+   */
+  usdValueLate?: number | null;
 }
 
 export interface FactSheet {
@@ -164,9 +174,11 @@ export function buildFactSheet(trade: VerifiedTrade, inputs: SheetInputs, now: n
     // An unpriced buy is unknown, never $0. Scoring it as zero is what made a real
     // five-figure buy on a brand-new pair contribute nothing to the legacy score.
     buyUsd:
-      trade.usdValue == null
-        ? unknown<number>('no price for this pair at trade time')
-        : measured(trade.usdValue, 'price'),
+      trade.usdValue != null
+        ? measured(trade.usdValue, 'price-at-trade')
+        : inputs.usdValueLate != null
+          ? measured(inputs.usdValueLate, 'price-after-trade')
+          : unknown<number>('no price for this pair, at trade time or since'),
 
     crowdSize: measured(inputs.crowdWallets.length, 'crowd-window'),
     crowdGpa:

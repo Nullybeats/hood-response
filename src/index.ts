@@ -278,14 +278,35 @@ async function main(): Promise<void> {
       .catch(() => null)
       .finally(() => safetyInFlight.delete(key));
   };
+  /**
+   * Pull a token's quote on the SAME path the alert engine uses.
+   *
+   * `requestRefresh` only nudges a bounded background queue, and the shadow was
+   * relying on it alone: market cap resolved on none of the trades it saw, and
+   * they were dropped with "marketCap still unresolved after 8 attempts" while
+   * the queue was still working through hundreds of restored tokens.
+   * `refreshOnChainNow` reads the canonical V3/V4 pool directly — it is what
+   * enrichSwarm calls, and it already de-duplicates in flight, so calling it per
+   * retry costs one read per token rather than one per attempt.
+   */
+  const warmQuote = (token: string): void => {
+    void price.refreshOnChainNow(token.toLowerCase()).catch(() => null);
+  };
   const v2Shadow = new V2Shadow({
     marketCap: (token) => {
       const t = store.tokensByAddress.get(token.toLowerCase());
-      return t ? price.marketCap(t) : null;
+      const cap = t ? price.marketCap(t) : null;
+      if (cap == null) warmQuote(token);
+      return cap;
     },
     pairAge: (token) => {
       const created = price.pairCreatedAt(token);
-      if (created == null) return null;
+      if (created == null) {
+        // pairCreatedAt comes with the DexScreener record, which the same quote
+        // path fetches when the pool read cannot answer on its own.
+        warmQuote(token);
+        return null;
+      }
       // Sourced from the indexer, and labelled as such: an on-chain Initialize
       // block is strictly better evidence and will supersede this.
       return { hours: (Date.now() - created) / 3_600_000, source: 'dexscreener-paircreated' };
@@ -318,6 +339,10 @@ async function main(): Promise<void> {
     // which is unknown rather than bad.
     outcomes: (wallet) => walletOutcomes.for(wallet),
     claimFirstBuy: (wallet, token, at, block) => firstBuyRegistry.claim(wallet, token, at, block),
+    // Recovers the buy-size dial on brand-new pairs, whose usdValue is null at
+    // detection because the pair had no price yet. Sourced as a later price, not
+    // as the executed value.
+    usdValueNow: (token, amount) => price.usdValue(token, amount),
     outcomeStats: () => {
       const s = walletOutcomes.stats();
       return { wallets: s.wallets, calls: s.calls };
