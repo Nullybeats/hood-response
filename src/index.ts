@@ -258,6 +258,26 @@ async function main(): Promise<void> {
   // would let a measurement-only path slow the thing it is measuring.
   const firstBuyRegistry = new FirstBuyRegistry();
   const walletOutcomes = new WalletOutcomes(performance);
+
+  /**
+   * Screen a token for the shadow, at most once at a time.
+   *
+   * The in-flight set matters: a token being retried every few seconds would
+   * otherwise queue a fresh GoPlus/Blockscout call on every pass, turning a
+   * measurement-only path into a burst of duplicated external requests against
+   * providers that rate-limit. Failures are swallowed — an unscreened token
+   * stays unknown, which is exactly what the gate expects.
+   */
+  const safetyInFlight = new Set<string>();
+  const warmSafety = (token: string): void => {
+    const key = token.toLowerCase();
+    if (safetyInFlight.has(key)) return;
+    safetyInFlight.add(key);
+    void safety
+      .check(key, price.liquidityOf(key))
+      .catch(() => null)
+      .finally(() => safetyInFlight.delete(key));
+  };
   const v2Shadow = new V2Shadow({
     marketCap: (token) => {
       const t = store.tokensByAddress.get(token.toLowerCase());
@@ -272,7 +292,19 @@ async function main(): Promise<void> {
     },
     canSell: (token) => {
       const report = safety.cached(token);
-      if (!report) return null;
+      if (!report) {
+        // Nothing has screened this token, and nothing would have: the legacy
+        // path only screens tokens that become swarms, while v2 evaluates every
+        // verified trade. Without this the retry lane could never succeed —
+        // measured live as canSell resolving on 1% of trades, with the rest
+        // waiting out the budget and being dropped. The gate was right to refuse
+        // to assume; the pipeline was wrong to never go and look.
+        //
+        // Kicked off without awaiting: the listener must not block on a shadow,
+        // and the retry a few seconds later is what reads the result.
+        warmSafety(token);
+        return null;
+      }
       // `source: 'none'` means nothing was actually checked. Reporting that as
       // sellable is the exact bug that printed "🛡️ Safe" over unchecked tokens.
       if (report.source === 'none') return null;

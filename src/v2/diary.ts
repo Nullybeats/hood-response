@@ -139,7 +139,18 @@ export class Diary {
 
   constructor(private readonly opts: DiaryOptions = DEFAULT_DIARY_OPTIONS) {}
 
+  /**
+   * Record a verdict, superseding any earlier one for the same transaction.
+   *
+   * A trade waiting on evidence is re-evaluated every few seconds, and appending
+   * each attempt made the diary mostly duplicates — measured live at 80 entries
+   * for 10 trades, with the outcome counts inflated to match. One entry per
+   * trade, showing its CURRENT verdict, is both what the summary counts should
+   * mean and what a reader wants to see.
+   */
   record(entry: DiaryEntry): void {
+    const prior = this.entries.findIndex((e) => e.txHash === entry.txHash);
+    if (prior !== -1) this.entries.splice(prior, 1);
     this.entries.unshift(entry);
     if (this.entries.length > this.opts.maxEntries) this.entries.length = this.opts.maxEntries;
   }

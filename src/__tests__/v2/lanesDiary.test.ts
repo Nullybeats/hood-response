@@ -146,7 +146,8 @@ describe('diary', () => {
     ];
 
     const diary = new Diary();
-    for (const c of cases) diary.record(evaluate(c).entry);
+    // Distinct tx hashes: these are six different trades, not six looks at one.
+    cases.forEach((c, i) => diary.record(evaluate(c, { ...trade, txHash: '0xtx' + i }).entry));
 
     expect(diary.size).toBe(cases.length);
     const counts = diary.summary().counts;
@@ -173,7 +174,9 @@ describe('diary', () => {
   it('builds a near-miss leaderboard — which rule turns away the most trades', () => {
     const diary = new Diary();
     for (let i = 0; i < 5; i++) {
-      diary.record(evaluate({ outcomesByWallet: new Map([[WALLET, outcomesFor(1.05)]]) }).entry);
+      diary.record(
+        evaluate({ outcomesByWallet: new Map([[WALLET, outcomesFor(1.05)]]) }, { ...trade, txHash: '0xn' + i }).entry,
+      );
     }
     const board = diary.summary().nearMissesByLane;
     expect(board.length).toBeGreaterThan(0);
@@ -184,7 +187,7 @@ describe('diary', () => {
   it('keeps entries newest-first and bounded', () => {
     const diary = new Diary({ maxEntries: 3 });
     for (let i = 0; i < 10; i++) {
-      diary.record({ ...evaluate().entry, tokenSymbol: `T${i}` });
+      diary.record({ ...evaluate().entry, txHash: `0x${i}`, tokenSymbol: `T${i}` });
     }
     expect(diary.size).toBe(3);
     expect(diary.recent()[0]!.tokenSymbol).toBe('T9');
@@ -192,8 +195,8 @@ describe('diary', () => {
 
   it('filters by outcome for the dashboard tabs', () => {
     const diary = new Diary();
-    diary.record(evaluate().entry);
-    diary.record(evaluate({ canSell: false }).entry);
+    diary.record(evaluate({}, { ...trade, txHash: '0xa' }).entry);
+    diary.record(evaluate({ canSell: false }, { ...trade, txHash: '0xb' }).entry);
     expect(diary.recent(10, 'blocked')).toHaveLength(1);
     expect(diary.recent(10, 'matched')).toHaveLength(1);
   });
@@ -202,5 +205,28 @@ describe('diary', () => {
     const { sheet, gate: g, score, lanes } = evaluate();
     const entry = buildEntry(sheet, g, score, lanes, { minScore: 80 });
     expect(entry.configSnapshot).toEqual({ minScore: 80 });
+  });
+});
+
+describe('diary supersede', () => {
+  /**
+   * A trade waiting on evidence is re-evaluated every few seconds. Appending each
+   * attempt produced 80 entries for 10 trades in production, and inflated every
+   * outcome count with it.
+   */
+  it('replaces an earlier verdict for the same transaction instead of appending', () => {
+    const diary = new Diary();
+    const waiting = evaluate({ canSell: null }, { ...trade, txHash: '0xsame' }).entry;
+    diary.record(waiting);
+    diary.record(waiting);
+    diary.record(waiting);
+    expect(diary.size).toBe(1);
+    expect(diary.summary().counts.waiting).toBe(1);
+
+    // …and the resolved verdict replaces the waiting one, not stacks on it.
+    diary.record(evaluate({}, { ...trade, txHash: '0xsame' }).entry);
+    expect(diary.size).toBe(1);
+    expect(diary.summary().counts.waiting).toBe(0);
+    expect(diary.recent(1)[0]!.outcome).not.toBe('waiting');
   });
 });
