@@ -136,9 +136,16 @@ async function buildSwapFromLog(
   }
 
   const strictMode = config.LIVE_VERIFIED_TRADE_SHADOW || config.LIVE_VERIFIED_TRADE_GATE;
+  // Carried onto the SwapEvent rather than discarded: the strict verdict is the
+  // only sound input for the v2 pipeline, and recomputing it downstream would
+  // mean a second RPC round-trip for an answer already established here.
+  let verifiedTrade: boolean | undefined;
+  let verifiedCategory: string | undefined;
   if (strictMode) {
     const verdict = await liveTradeVerifier.verify(log, transfer, match.wallet, match.direction);
     if (config.LIVE_VERIFIED_TRADE_SHADOW) logLiveTradeShadow(transfer.txHash, verdict);
+    verifiedTrade = verdict.confirmed;
+    verifiedCategory = verdict.category;
     // Shadow preserves today's live calls exactly; the gate is a separate,
     // explicit promotion after a reviewed measurement window.
     if (!verdict.legacyCandidate || (config.LIVE_VERIFIED_TRADE_GATE && !verdict.confirmed)) {
@@ -171,6 +178,8 @@ async function buildSwapFromLog(
     blockNumber: transfer.blockNumber || store.metrics.lastBlock,
     logIndex: transfer.logIndex,
     timestamp: Date.now(),
+    verifiedTrade,
+    verifiedCategory,
   };
 }
 

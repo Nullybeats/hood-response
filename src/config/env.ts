@@ -564,6 +564,11 @@ const schema = z.object({
   // "first-ever buy" is exactly the failure the legacy in-memory Set produced
   // after every redeploy.
   V2_FIRST_BUY_PATH: z.string().default('/data/v2-first-buy.sqlite'),
+  // The shadow pipeline: observes strictly-verified trades, records decisions,
+  // emits NOTHING. The legacy engine stays the only thing on the wire until v2
+  // has a measured record worth trusting — same discipline the attribution
+  // shadow follows, and for the same reason.
+  V2_SHADOW_ENABLED: bool(false),
 
   // Secret salt for the opaque wallet ids exposed on alerts and /api/wallets (see walletId.ts).
   // Addresses are public and enumerable, so an unsalted hash is reversible by brute force.

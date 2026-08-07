@@ -13,12 +13,15 @@ import type { PerformanceTracker } from '../engine/performance.js';
 import type { SniperRegistry } from '../sniper/registry.js';
 import type { HyperSyncShadow } from '../chain/shadow.js';
 import type { AttributionShadow } from '../attrib/runtime.js';
+import type { V2Shadow } from '../v2/runtime.js';
+import { DEFAULT_LANES, describeCondition } from '../v2/lanes.js';
 import { addressOfPrivateKey } from '../sniper/executor.js';
 import type { PriceOracle } from '../chain/price.js';
 import { configuredChannels, dispatch } from '../notify/index.js';
 import { walletId } from '../walletId.js';
 import type { Alert, AlertRule, Swarm, SwapEvent, WalletCategory } from '../types.js';
 import { DASHBOARD_HTML } from './dashboard.js';
+import { DASHBOARD_V2_HTML } from './dashboardV2.js';
 
 const ADDR = /^0x[0-9a-fA-F]{40}$/;
 
@@ -110,6 +113,7 @@ export async function buildServer(
   shadow?: HyperSyncShadow,
   attribution?: AttributionShadow,
   price?: PriceOracle,
+  v2?: V2Shadow,
 ): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
   await app.register(cors, { origin: true });
@@ -182,6 +186,51 @@ export async function buildServer(
     if (!attribution) return { enabled: false, reason: 'attribution shadow not constructed' };
     return { status: attribution.status(), report: attribution.report() };
   });
+
+  // ── v2 shadow: decisions, lanes, coverage ───────────────────────────────────
+  // The diary is the whole point of the rebuild being observable: every leak the
+  // audit found was invisible because decisions were silent, so a suppressed
+  // signal looked exactly like a quiet market. These endpoints are aggregate and
+  // carry no wallet addresses, matching the attribution endpoint's rule.
+  app.get('/api/v2/status', async () => {
+    if (!v2) return { enabled: false, reason: 'v2 shadow not constructed' };
+    return v2.status();
+  });
+
+  app.get('/api/v2/decisions', async (req) => {
+    if (!v2) return { enabled: false, decisions: [] };
+    const q = req.query as { limit?: string; outcome?: string };
+    const limit = Math.min(Number(q.limit) || 100, 500);
+    const outcome = q.outcome as 'matched' | 'skipped' | 'waiting' | 'blocked' | undefined;
+    const entries = v2.diary.recent(limit, outcome).map((e) => ({
+      at: e.at,
+      token: e.token,
+      tokenSymbol: e.tokenSymbol,
+      outcome: e.outcome,
+      reason: e.reason,
+      score: e.score,
+      matchedLanes: e.matchedLanes,
+      nearMiss: e.nearMiss,
+      // Per-condition detail, minus anything identifying the wallet.
+      lanes: e.lanes.map((l) => ({
+        laneId: l.laneId,
+        matched: l.matched,
+        blockedByUnknown: l.blockedByUnknown,
+        reason: l.reason,
+      })),
+    }));
+    return { enabled: true, decisions: entries };
+  });
+
+  app.get('/api/v2/lanes', async () => ({
+    lanes: DEFAULT_LANES.map((l) => ({
+      id: l.id,
+      emoji: l.emoji,
+      name: l.name,
+      sentence: l.sentence,
+      conditions: l.conditions.map(describeCondition),
+    })),
+  }));
 
   // ── Stats / config ──────────────────────────────────────────────────────────
   app.get('/api/stats', async () => ({
@@ -779,6 +828,13 @@ export async function buildServer(
   app.get('/', async (_req, reply) => {
     // Never let a browser/proxy cache a stale dashboard build.
     reply.header('cache-control', 'no-store').type('text/html').send(DASHBOARD_HTML);
+  });
+
+  // The v2 brain's view, served ALONGSIDE the legacy dashboard rather than
+  // replacing it: the old engine is still the one on the wire, so the old view
+  // stays authoritative until it isn't.
+  app.get('/v2', async (_req, reply) => {
+    reply.header('cache-control', 'no-store').type('text/html').send(DASHBOARD_V2_HTML);
   });
 
   app.setErrorHandler((err: unknown, _req, reply) => {

@@ -184,6 +184,21 @@ export class SafetyChecker {
     }
   }
 
+  /**
+   * The cached verdict, or null when none has been established yet.
+   *
+   * Synchronous and non-fetching on purpose. The v2 pipeline must be able to ask
+   * "do we KNOW whether this can be sold?" without blocking, and get an honest
+   * null when the answer has not landed — which its gate turns into a retry
+   * rather than an assumption. A fetching variant here would reintroduce exactly
+   * the pressure that made the legacy screen report `ok` on no data at all.
+   */
+  cached(tokenAddress: string): SafetyReport | null {
+    const hit = this.cache.get(tokenAddress.toLowerCase());
+    if (!hit) return null;
+    return Date.now() - hit.checkedAt < SafetyChecker.TTL_MS ? hit : null;
+  }
+
   /** Screen a token, using a cached verdict when fresh. */
   async check(tokenAddress: string, liquidityUsd: number | null): Promise<SafetyReport> {
     const key = tokenAddress.toLowerCase();

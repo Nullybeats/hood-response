@@ -22,6 +22,8 @@ import {
   onAlertCardSent,
 } from './notify/index.js';
 import { SafetyChecker } from './chain/safety.js';
+import { FirstBuyRegistry } from './v2/facts/firstBuy.js';
+import { V2Shadow } from './v2/runtime.js';
 import { PerformanceTracker, type TrackedCall } from './engine/performance.js';
 import { SniperRegistry } from './sniper/registry.js';
 import { FeedSubscriber, SNIPER_FEED_URL } from './sniper/feed.js';
@@ -248,6 +250,44 @@ async function main(): Promise<void> {
   // placeholder) even for tokens the background refresher hasn't reached yet.
   const safety = new SafetyChecker();
 
+  // ── v2 shadow ──────────────────────────────────────────────────────────────
+  // Providers answer only from what is ALREADY established, synchronously. A
+  // null here is honest ("not known yet"), and the v2 gate turns it into a retry
+  // — which is why none of them fetch. Blocking the listener to enrich a shadow
+  // would let a measurement-only path slow the thing it is measuring.
+  const firstBuyRegistry = new FirstBuyRegistry();
+  const v2Shadow = new V2Shadow({
+    marketCap: (token) => {
+      const t = store.tokensByAddress.get(token.toLowerCase());
+      return t ? price.marketCap(t) : null;
+    },
+    pairAge: (token) => {
+      const created = price.pairCreatedAt(token);
+      if (created == null) return null;
+      // Sourced from the indexer, and labelled as such: an on-chain Initialize
+      // block is strictly better evidence and will supersede this.
+      return { hours: (Date.now() - created) / 3_600_000, source: 'dexscreener-paircreated' };
+    },
+    canSell: (token) => {
+      const report = safety.cached(token);
+      if (!report) return null;
+      // `source: 'none'` means nothing was actually checked. Reporting that as
+      // sellable is the exact bug that printed "🛡️ Safe" over unchecked tokens.
+      if (report.source === 'none') return null;
+      if (report.honeypot === true) return false;
+      if (report.honeypot === false) return true;
+      return null;
+    },
+    // Wallet outcomes are not yet wired: the performance record identifies calls
+    // by mutable wallet LABELS, not addresses, so attributing an outcome to an
+    // address is not currently sound. Until that is fixed every wallet grades
+    // `U`, which is the honest answer — and `U` is treated as unknown, never as
+    // average, so it cannot inflate a score in the meantime.
+    outcomes: () => [],
+    claimFirstBuy: (wallet, token, at, block) => firstBuyRegistry.claim(wallet, token, at, block),
+  });
+  v2Shadow.start();
+
   const enrichSwarm = async (swarm: Swarm): Promise<void> => {
     // Alert-critical pricing is pool-first. DexScreener may fill optional
     // display data later, but its rate limits cannot postpone this signal.
@@ -434,6 +474,14 @@ async function main(): Promise<void> {
       );
     }
     store.recordSwap(swap);
+    // v2 shadow: observes strictly-verified trades only, records what it would
+    // have done, emits nothing. Deliberately before the legacy pipeline and
+    // fully isolated from it — a fault here must never affect what ships today.
+    try {
+      v2Shadow.onSwap(swap);
+    } catch (err) {
+      logger.warn({ err: String(err).slice(0, 200) }, 'v2 shadow: evaluation failed (legacy path unaffected)');
+    }
     // The listener intentionally emits before price discovery finishes. Put
     // this visible row at the front of the bounded background price queue so
     // the UI can fill it on its next poll without slowing detection.
@@ -503,7 +551,7 @@ async function main(): Promise<void> {
     : null;
   feedStateTimer?.unref();
 
-  const app = await buildServer(store, engine, aggregator, performance, sniper, shadow, attribution, price);
+  const app = await buildServer(store, engine, aggregator, performance, sniper, shadow, attribution, price, v2Shadow);
   await app.listen({ port: config.PORT, host: config.HOST });
   logger.info(
     { url: `http://${config.HOST}:${config.PORT}`, wallets: store.wallets.size },

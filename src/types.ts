@@ -75,6 +75,19 @@ export interface SwapEvent {
   logIndex?: number;
   /** Unix ms. */
   timestamp: number;
+  /**
+   * True only when the strict verifier PROVED this was a swap: a successful
+   * receipt, a canonical V3/V4 pool, and a wallet net exchange.
+   *
+   * Undefined when strict mode was off and nothing was checked — which is not
+   * the same as false, and must not be read as "unverified". The v2 pipeline
+   * consumes only `true`, because the attribution shadow measured that ~90% of
+   * watched-wallet activity is `airdrop_receive` and barely 1.5% is a real
+   * trade. Feeding it anything looser would make the whole brain mostly noise.
+   */
+  verifiedTrade?: boolean;
+  /** The strict classifier's category, e.g. 'swap_v4_poolmanager'. For the fact sheet's venue. */
+  verifiedCategory?: string;
 }
 
 /** Breakdown of the 0..100 conviction score for a detected swarm. */
