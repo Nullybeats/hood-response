@@ -1,18 +1,16 @@
 # 🪰 Swarm the Fly
 
-**Ultra-low-latency wallet-swarm alert bot for Robinhood Chain.**
+**Wallet-activity alert feed for Robinhood Chain.**
 
 Swarm the Fly monitors a curated set of wallets and fires an alert the moment
 *multiple* tracked wallets buy or sell the **same token** inside a short time
-window — coordinated accumulation, coordinated dumps, and capital rotation —
-before the broader market reacts. Detection runs entirely in memory for
-sub-second latency; Postgres and Redis are optional archival layers.
+window. Detection is in memory; Postgres and Redis are optional archival
+layers. This is a signal system, not proof that an observed transfer was a
+purchase or that a token is safe.
 
-Built from the *Robinhood Chain Alpha Intelligence* spec and seeded with the
-**Robinhood Smart-Money Conviction List** — 15 tokens (8 curated + 7 auto-fetched
-top coins) and 131 real tracked wallets, tiered by holder rank, with 10
-cross-coin conviction wallets. Refresh/expand the list any time with
-`node scripts/fetch-holders.mjs SYMBOL …`.
+The tracked-wallet set is configured from seed data and can be refreshed with
+`node scripts/fetch-holders.mjs SYMBOL …`. Do not treat a static wallet count,
+holder rank, or past alert outcome as a performance claim.
 
 ---
 
@@ -24,21 +22,21 @@ cross-coin conviction wallets. Refresh/expand the list any time with
 | **Swarm detection** | ≥ N unique tracked wallets BUY the same token within a window → alert |
 | **Safety filter** | before any alert fires, the token is screened via GoPlus token-security (honeypot, buy/sell tax, mintable, ownership, LP lock — supported on Robinhood Chain) + a minimum DEX liquidity check; rugs/honeypots are suppressed (still shown on the dashboard, tagged). Tunable via `SAFETY_*`, degrades to a liquidity-only check if GoPlus is unreachable |
 | **Solo low-cap alerts** | a *single* tracked wallet buying a coin fires an alert too — but only when the token's market cap is inside the band `SOLO_MIN_MARKETCAP`–`SOLO_MAX_MARKETCAP` (default $25k–$120k), to catch early low-cap entries without dust or large caps |
-| **Fresh-pair first entry** | fires when a qualifying-tier wallet (`FRESH_ENTRY_TIERS`, default alpha+beta) makes its *first-ever* buy of a token whose DEX pair is younger than `FRESH_PAIR_MAX_AGE_HOURS` (default 48h) — the purest "ground floor" signal |
-| **PRIME tier** | the loudest alert — flagged when the swarm's kind + conviction hit the combo that actually backtested well (`PRIME_KINDS` default `ENTRY` @ `PRIME_MIN_CONVICTION` default 80, derived from real tracked-call outcomes). PRIME alerts get a 👑 crown headline, a multiplied 🪰 fly banner, and the kind icon itself repeats 3x — same treatment on Telegram, webhooks, Discord (gold embed), and the dashboard (👑 PRIME badge). Toggle with `PRIME_ALERTS` |
+| **Fresh-pair first entry** | flags a qualifying-tier wallet's first observed buy of a token whose DEX pair is younger than `FRESH_PAIR_MAX_AGE_HOURS` (default 48h). This is an early-entry heuristic, not a quality or return guarantee. |
+| **PRIME tier** | presentation tier for a configured kind + conviction threshold (`PRIME_KINDS`, default `ENTRY`; `PRIME_MIN_CONVICTION`, default 80). It changes alert treatment only; it is not a recommendation. Toggle with `PRIME_ALERTS`. |
 | **Global alert floors** | *every* alert type is gated by `ALERT_MIN_MARKETCAP` (default $25k) and `PAIR_MIN_AGE_MINUTES` (default 30 min) — nothing below the cap floor or on a pair younger than the age floor ever fires. Both **fail closed on an unknown value**: a token whose market cap cannot be established is suppressed, not waved through |
-| **Real market cap** | market cap is fetched live at alert time, so every alert reports the true cap it was bought/sold into — or reports it as **unknown**. It is never estimated: a cap requires a real price AND a total supply read from the contract |
+| **Market-cap estimate** | when a real price source and contract supply are available, the alert shows their derived market cap; otherwise it reports **unknown**. It does not fabricate a fallback value. |
 | **ATH market cap** | every card also shows the highest market cap seen for that token since the bot started tracking it, and how far the current cap is off that peak (e.g. "🏔️ ATH 2.1M (-64%)") — DexScreener doesn't expose a true lifetime ATH, so this is a running high-water mark, not the coin's all-time record |
 | **One-tap buy links** | alert cards, Discord embeds, and the dashboard include clickable buy buttons for Sigma bot (🎯 SGM) and Based bot (🎲 BSD), pre-filled with the token contract via your own referral id. Configure with `SIGMA_REF` / `BASED_REF`; blank hides that bot's button |
 | **Volume + momentum** | alerts show 24h volume, recent price change, and buy pressure; when volume + direction confirm momentum the alert is flagged 🔥 and conviction is boosted (up to +15). Optional `MOMENTUM_MIN_VOLUME_USD` gate suppresses dead tokens |
 | **Repeat / escalation counter** | every alert reports how many times the *same token* has alerted inside a rolling window (`REPEAT_WINDOW_MINUTES`, default 35) — "🔁 REPEAT x3 · 3rd alert in 35m" — plus the **% price move since the previous alert** and how many **distinct** tracked wallets have driven it. It's **wallet-aware**: a brand-new top holder joining always breaks through the cooldown and is highlighted harder ("🚨 NEW HOLDER IN"), while the *same* busy wallet re-buying the same coin is suppressed so it can't hog the feed or masquerade as a swarm. Escalation conviction is keyed on distinct wallets (+4 each, capped +12) with an extra +4 when a new holder joins. Dashboard rows show a `🔁x{n}` / `🚨 NEW HOLDER` badge with the % move |
-| **Sniper (auto-buy)** | optional **Sniper** dashboard tab that auto-buys qualifying alerts with a server **hot wallet** (ethers). Settings: buy-conviction band (default 60–100), buy amount (0.0005 ETH minimum), and a **take-profit %** that auto-sells a position when it hits target. Shows live **positions**, current value, and **PnL** (open + realized). Trades **both Uniswap v4 (Robinhood's modified router) and plain Uniswap v3** — some tokens' real liquidity lives on v3, not v4. Before every buy or sell, the quoted price is sanity-checked against the token's own known market price — a token can have several v4 pools (fee-tier variants, or a near-empty pool created moments before a snipe specifically to trap bots) and its *real* liquidity can be on v3 entirely; a pool that resolves to a wildly different price is refused rather than traded, even though nothing "reverts", and the other venue (v3 ⇄ v4) is tried automatically instead. Among multiple v4 pool candidates, the one with the most on-chain liquidity is picked, not just the most recently created; v3 candidates are picked the same way across the standard fee tiers. A sell that reverts on normal slippage (`SNIPER_SLIPPAGE_PCT`, default 15%) — e.g. a fast-crashing token moving past tolerance while the tx is in flight — retries once at a much wider tolerance (`SNIPER_MAX_SELL_SLIPPAGE_PCT`, default 50%) so you don't get stuck holding a position that won't sell; buys never do this. **OFF by default**; real swaps only run once a dedicated burner wallet + verified DEX router are configured. Rails: per-trade cap, daily spend cap, and an on/off kill switch. Admin-gated. See `SNIPER_*` |
-| **Outcome tracking** | after every alert fires, the token's price is followed and the peak + 1h/6h/24h returns are recorded, so signal quality is measured from **real results** rather than guessed. The `/api/performance` view (and dashboard **Best Calls** card) ranks calls by peak gain and breaks win-rate down by the dimensions that catch runners — **multi-wallet vs solo**, **repeat vs single**, **kind**, **conviction band**, **entry market cap band**, **token age at entry**, and **individual tracked wallet** (by label, e.g. "which wallet's calls actually run"). The full breakdown — each stat stacked in its own scrollable block, not a jumbled row — plus every tracked call (now tagged with the wallet labels and pair age behind it) lives on the dashboard's **📈 Plays & Stats** tab. The Best Calls list clears itself once a day (`PERF_AUTO_RESET`, default 8am `PERF_RESET_TZ`) and can also be reset on demand via the admin 🔄 Reset button. Tunable via `PERFORMANCE_TRACKING`, `PERF_SAMPLE_MINUTES`, `PERF_TRACK_HOURS`, `PERF_WIN_THRESHOLD_PCT`, `PERF_AUTO_RESET`, `PERF_RESET_HOUR`, `PERF_RESET_TZ`. Set `PERF_STORE_PATH` to a mounted Railway Volume (e.g. `/data/performance.json`) to persist outcomes across redeploys — otherwise the data is in-memory and resets on restart |
+| **Sniper (auto-buy)** | optional, admin-gated executor using a server hot wallet. It can route V3/V4, applies configured size/spend/slippage limits, and is off until a dedicated wallet and router configuration are present. These are safeguards, not execution or loss guarantees. See `SNIPER_*`. |
+| **Outcome tracking** | records observed price snapshots after an alert (peak plus configured intervals) and exposes them in `/api/performance`. Treat results as descriptive samples: incomplete price coverage, survivorship, and transfer-attribution quality affect them. Persist with `PERF_STORE_PATH`; otherwise they reset on restart. |
 | **PnL milestone cards** | every time a tracked call's peak return crosses a new 50% interval (+50%, +100%, +150%, …) a celebratory card fires to every configured channel — 🚀 rockets scaling with the milestone size, entry MC → now MC, current vs peak return, conviction, and which tracked wallet(s) called it. A jump that skips several intervals between samples (a fast pump) announces each one it passed through, not just the top. Toggle with `PERF_MILESTONES_ENABLED`, change the interval with `PERF_MILESTONE_STEP_PCT` (default 50) |
 | **Telegram slash commands** | send `/t5` or `/t10` in the alert chat for the best-performing calls in the last 24h (ranked by peak gain), or `/l5` for the 5 most recent calls regardless of performance — each replies with one compact line per ticker: `#1 $GME 200k - 1.1 mill 5x -10mins ago 7/10` (rank, entry MC → peak/current MC, gain multiplier, age, conviction as X/10). Long-polls Telegram (no public webhook URL needed) and only answers in the configured `TELEGRAM_CHAT_ID`, so it never leaks wallet-labeled data to a stranger DMing the bot. Requires `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` to be set |
 | **Sell detection** | ≥ N wallets SELL the same token → bearish alert |
 | **Rotation detection** | wallets SELL token A then BUY token B → rotation alert |
-| **Noise filter** | settlement/quote tokens (WETH, USDC, USDG…) and tokenised equities (AAPL, TSLA, NVDA…) are dropped before detection via `IGNORE_SYMBOLS`, so the feed and alerts stay focused on real gems (no spurious "sold WETH" leg on every buy) |
+| **Noise filter** | settlement/quote tokens (WETH, USDC, USDG…) and tokenised equities (AAPL, TSLA, NVDA…) can be dropped via `IGNORE_SYMBOLS`, reducing routine counter-leg activity in the feed. |
 | **Conviction refinement** | after detection, conviction is re-scored with the *real* market cap, liquidity and momentum — low caps and healthy liquidity get a boost, dangerously thin liquidity a penalty — so the best low-cap gems rank highest |
 | **Blue-chip buy/sell filter** | toggle whether tracked-wallet **buys** and **sells** of the coins we already track (the seed set — CASHCAT, PONS, YOLO, HMM…) can alert. Turn a side off to weed out whales just rotating money between known coins, so alerts focus on new low-caps. Two independent switches on the dashboard **Alert Filters** card or `POST /api/bluechip/{buys,sells}`; seed defaults with `BLUE_CHIP_BUYS` / `BLUE_CHIP_SELLS` |
 | **Mutable wallet groups** | turn a whole coin's tracked wallets off/on at runtime — click the coin in the dashboard's **Wallet Groups** card, or `POST`/`DELETE /api/muted/:symbol` (seed defaults with `MUTE_WALLET_TOKENS`). A wallet is only silenced when *every* coin it's a top-holder of is muted, so cross-conviction wallets that also hold other gems keep firing. Muted wallets drop out before detection — they never form or grow a swarm, solo, or entry |
@@ -82,10 +80,10 @@ Robinhood RPC (WebSocket)
    SSE / REST ──► Dashboard
 ```
 
-**The bot ships live by default.** It polls Robinhood Chain's public HTTP RPC
+**The default configuration runs live.** It polls Robinhood Chain's public HTTP RPC
 (`https://rpc.mainnet.chain.robinhood.com`, chain id 4663) every few seconds
 via `eth_getLogs`, pulling Transfer logs for the tracked wallets and decoding
-them into swaps — no paid provider or WebSocket required. Point `CHAIN_WS_URL`
+them into candidate wallet activity — no paid provider or WebSocket required. Point `CHAIN_WS_URL`
 at a streaming provider (Alchemy/QuickNode) to use lower-latency websocket
 subscriptions instead.
 
@@ -104,12 +102,18 @@ case and no other.
 
 ### Uniswap attribution status
 
-The live listener has an opt-in strict V3/V4 gate: exact receipt transfer,
-successful transaction, verified V3 pool or canonical V4 PoolManager event,
-and a demonstrated watched-wallet net exchange. LP/fee/zap, Permit2/WETH-only,
-airdrop, and unresolved activity are suppressed. It defaults to off: run
-`LIVE_VERIFIED_TRADE_SHADOW=true` for 24–48 hours, investigate every `live
-trade shadow mismatch` log, then set `LIVE_VERIFIED_TRADE_GATE=true`.
+The strict V3/V4 verifier is deployed to the Railway feed in **shadow mode**.
+It requires a successful transaction, exact receipt evidence, a verified V3
+pool or canonical V4 PoolManager plus registered PoolId, and a watched-wallet
+net exchange. It rejects or defers LP/fee/zap, Permit2/WETH-only, airdrop, and
+unresolved activity. The current gate remains **off**, so legacy feed calls
+continue while the 24–48 hour comparison window is reviewed; it does **not**
+yet guarantee that every displayed live signal is a proven buy or sell.
+
+After every shadow mismatch is explained, set `LIVE_VERIFIED_TRADE_GATE=true`
+to suppress anything except a confirmed wallet exchange. The first investigated
+V4 mismatch was correctly suppressed: the watched wallet received output but
+did not fund the swaps.
 
 Native-payment routes require either a trace-capable RPC
 (`LIVE_TRADE_TRACE_RPC_URL`, `debug_traceTransaction` + `callTracer`) or an
@@ -137,10 +141,11 @@ Open **http://localhost:8080** for the dashboard.
 CHAIN_WS_URL=wss://<robinhood-chain-rpc> CHAIN_MODE=live npm start
 ```
 
-The listener subscribes to ERC-20 `Transfer` logs for the tracked tokens,
-classifies each as a BUY (tracked wallet receiving) or SELL (tracked wallet
-sending), auto-reconnects with exponential backoff, and reports block height +
-RPC latency to the dashboard.
+The listener subscribes to ERC-20 `Transfer` logs for the tracked wallets,
+uses transfer direction as a candidate, auto-reconnects with exponential
+backoff, and reports block height + RPC latency to the dashboard. Transfer
+direction alone is not trade proof; the strict verifier above is the promotion
+path for V3/V4.
 
 > **Prices:** `DEXSCREENER_CHAIN` (default `robinhood`) pulls real USD price,
 > market cap, and pair links from DexScreener. The slug selects the pair on the
@@ -163,13 +168,13 @@ alert rules are additionally editable at runtime through the API. Key vars:
 | Var | Default | Meaning |
 |---|---|---|
 | `PORT` / `HOST` | `8080` / `0.0.0.0` | HTTP bind |
-| `CHAIN_WS_URL` | — | Robinhood Chain WS RPC; empty ⇒ simulator |
+| `CHAIN_WS_URL` | — | Robinhood Chain WS RPC; empty uses HTTP polling when `CHAIN_HTTP_URL` is set |
 | `CHAIN_MODE` | `auto` | `live`, `simulator`, or `auto` |
 | `ALERT_MIN_WALLETS` | `2` | default swarm threshold |
 | `ALERT_WINDOW_SECONDS` | `300` | default detection window (5 min) |
 | `ALERT_MIN_USD` / `ALERT_MIN_CONVICTION` | `0` / `0` | default gates |
 | `ALERT_COOLDOWN_SECONDS` | `120` | per rule/token/kind cooldown |
-| `PRIME_ALERTS` | `true` | loudest alert tier for the kind+conviction combo backed by real outcome data |
+| `PRIME_ALERTS` | `true` | loudest alert tier for the configured kind + conviction combination |
 | `PRIME_KINDS` | `ENTRY` | comma-separated swarm kinds eligible for PRIME |
 | `PRIME_MIN_CONVICTION` | `80` | minimum conviction (of an eligible kind) to hit PRIME |
 | `REPEAT_WINDOW_MINUTES` | `35` | rolling window for the repeat/escalation counter |
@@ -206,12 +211,6 @@ Invalid configuration fails fast at startup with a readable message.
 | POST | `/api/admin/verify` | validate the admin password (`x-admin-password` header) |
 | GET | `/api/sniper` | sniper status, wallet, positions + PnL (admin) |
 | POST | `/api/sniper/settings` `/api/sniper/toggle` | update sniper settings / flip on-off (admin) |
-
-> **Admin controls** — the Alert Filters and Wallet Groups sections and their
-> toggle endpoints are gated by `ADMIN_PASSWORD` (checked server-side; the
-> password is never in the page source). Unlock via the dashboard **🔒 Admin**
-> button, or send an `x-admin-password` header. Set `ADMIN_PASSWORD=''` to
-> disable the gate.
 | GET | `/api/swaps` `/api/swarms` `/api/alerts` | recent activity (`?limit=`) |
 | POST | `/api/test-alert` | send a sample alert to every configured channel (verify a new channel instantly) |
 | GET | `/api/performance` | tracked alert outcomes (peak/current return) + win-rate by signal type |
@@ -219,6 +218,12 @@ Invalid configuration fails fast at startup with a readable message.
 | GET | `/api/leaderboard/wallets` `/api/leaderboard/tokens` | rankings |
 | GET/POST/PUT/DELETE | `/api/rules[/:id]` | manage alert rules |
 | GET | `/events` | SSE stream: `swap`, `swarm`, `alert`, `metrics` |
+
+> **Admin controls** — the Alert Filters, Wallet Groups, and sniper endpoints
+> are gated by `ADMIN_PASSWORD` (checked server-side; the password is never in
+> the page source). Unlock via the dashboard **🔒 Admin** button or send an
+> `x-admin-password` header. A blank or unset password fails closed: those
+> routes are locked with a random per-boot secret.
 
 Example — add a rule that only fires on high-conviction, high-value buys:
 
@@ -256,8 +261,9 @@ npm test            # vitest (detection, conviction, seed)
 npm run build       # compile to dist/
 ```
 
-Tests cover the swarm/rotation detection state machine, the 0–100 conviction
-scoring, and the seed-data derivation (72 unique wallets, 5 cross-coin).
+Tests cover signal detection, receipt and V3/V4 attribution, safety, sniper
+controls, and seed-data derivation. The test count and wallet count are not
+stable documentation claims; run `npm test` for the current suite.
 
 ## Project layout
 
