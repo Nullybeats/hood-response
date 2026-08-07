@@ -27,6 +27,15 @@ export default defineConfig({
       // Same rule for the attribution ledger: a test must never write into a
       // real ledger. Tests that need one pass an explicit tmp path.
       ATTRIB_LEDGER_PATH: '',
+      // And for the v2 journal, which defaults to the durable volume shared with
+      // the sniper state. A test that appended there would both corrupt the
+      // measurement record and spend the volume budget the journal exists to respect.
+      V2_JOURNAL_PATH: '',
+      V2_JOURNAL_ENABLED: '',
+      // The first-buy registry decides whether the premium signal fires at all.
+      // A test writing into the live one would permanently mark real pairs as
+      // already-seen, silently suppressing future ENTRY-class alerts.
+      V2_FIRST_BUY_PATH: '',
     },
     server: {
       deps: {

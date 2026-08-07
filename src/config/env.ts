@@ -534,6 +534,37 @@ const schema = z.object({
   SIGMA_REF: z.string().default('450463357'),
   BASED_REF: z.string().default('Rick'),
 
+  // Telegram permits ONE getUpdates consumer per bot token; every other caller
+  // gets 409. Both production deployments run this image, so set this false on
+  // whichever should not serve /t5 /t10 /l5 to designate the owner explicitly.
+  // Left true, an instance that loses the race yields on its own after a few
+  // conflicts rather than retrying forever (see telegram/commands.ts).
+  TELEGRAM_COMMANDS_ENABLED: bool(true),
+
+  // ── v2 brain (src/v2/) ─────────────────────────────────────────────────────
+  // Detection/scoring rebuild. Every flag defaults OFF: this repo auto-deploys
+  // to Railway from pushed main, so a half-finished phase must never activate
+  // by being merged. Enabling is an explicit operator act, per phase.
+  //
+  // The journal is the foundation — no rule, score or lane is trusted before it
+  // can be replayed against recorded traffic. Written to the durable volume
+  // (RAILWAY_VOLUME_MOUNT_PATH), which is shared with the sniper state and the
+  // performance store, hence the hard budget below rather than a soft warning.
+  V2_JOURNAL_ENABLED: bool(false),
+  V2_JOURNAL_PATH: z.string().default('/data/journal-v2.ndjson'),
+  // One segment before rotation. Small enough that dropping the oldest frees a
+  // useful amount without discarding a whole day of evidence at once.
+  V2_JOURNAL_MAX_SEGMENT_BYTES: num(16 * 1024 * 1024),
+  // Hard ceiling across ALL segments. Sized against the volume's free space
+  // (~76MB of 500MB at the time of writing), not against what the journal would
+  // like: the journal is observational, the trade record sharing this disk is not.
+  V2_JOURNAL_MAX_TOTAL_BYTES: num(48 * 1024 * 1024),
+  // Durable (wallet, token) first-buy registry. Blank disables it — and a
+  // disabled registry reports every pair as NOT first, because a fabricated
+  // "first-ever buy" is exactly the failure the legacy in-memory Set produced
+  // after every redeploy.
+  V2_FIRST_BUY_PATH: z.string().default('/data/v2-first-buy.sqlite'),
+
   // Secret salt for the opaque wallet ids exposed on alerts and /api/wallets (see walletId.ts).
   // Addresses are public and enumerable, so an unsalted hash is reversible by brute force.
   // Set this once to a long random string and NEVER rotate it — rotating renames every wallet
