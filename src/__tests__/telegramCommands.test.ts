@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   shortMC,
   multiplierStr,
@@ -8,9 +8,12 @@ import {
   topPlaysText,
   lastAlertsText,
   parseCommand,
+  TelegramCommands,
+  TelegramHttpError,
 } from '../telegram/commands.js';
 import type { TrackedCall } from '../engine/performance.js';
 import type { PerformanceTracker } from '../engine/performance.js';
+import { config } from '../config/env.js';
 
 function trackedCall(over: Partial<TrackedCall> = {}): TrackedCall {
   const now = Date.now();
@@ -131,5 +134,51 @@ describe('telegram command formatting', () => {
 
   it('/l5 reports when nothing has been tracked yet', () => {
     expect(lastAlertsText(fakeTracker([]), 5)).toBe('No tracked calls yet.');
+  });
+});
+
+/**
+ * Two production deployments run this image. When they share a bot token,
+ * Telegram answers one of them 409 forever — and the old loop retried every 3s
+ * indefinitely, burying the logs. It buried a real nine-hour attribution stall.
+ */
+describe('409 conflict handling', () => {
+  const origFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = origFetch;
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  });
+
+  const perf = { calls: () => [] } as unknown as PerformanceTracker;
+
+  it('yields the bot after repeated 409s instead of polling forever', async () => {
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return { ok: false, status: 409, json: async () => ({ ok: false }) } as unknown as Response;
+    }) as typeof fetch;
+
+    // The test env configures no bot, so supply one for the duration of the loop.
+    const prior = config.notifications.telegram;
+    config.notifications.telegram = { token: 'test-token', chatId: '123' };
+    const cmds = new TelegramCommands(perf);
+    try {
+      (cmds as unknown as { stopped: boolean }).stopped = false;
+      await (cmds as unknown as { run: () => Promise<void> }).run.call(cmds);
+    } finally {
+      config.notifications.telegram = prior;
+    }
+
+    expect(cmds.yielded).toBe(true);
+    // Bounded: the catch-up call plus at most MAX_CONSECUTIVE_CONFLICTS polls.
+    expect(calls).toBeLessThanOrEqual(5);
+  }, 20_000);
+
+  it('carries the status code so 409 is distinguishable from a transient failure', () => {
+    const err = new TelegramHttpError(409);
+    expect(err.status).toBe(409);
+    expect(String(err)).toContain('409');
+    expect(new TelegramHttpError(502).status).toBe(502);
   });
 });

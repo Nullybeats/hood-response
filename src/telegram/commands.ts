@@ -94,14 +94,47 @@ function sleep(ms: number): Promise<void> {
  * Replies only in the configured alert chat, so wallet-labeled data never
  * reaches a stranger who happens to DM the bot.
  */
+/** Carries the status code, so 409 (a contended bot) is distinguishable from a transient 5xx. */
+export class TelegramHttpError extends Error {
+  constructor(readonly status: number) {
+    super(`HTTP ${status}`);
+    this.name = 'TelegramHttpError';
+  }
+}
+
+/**
+ * Telegram permits exactly ONE getUpdates consumer per bot token and answers
+ * every other caller with 409. Both production deployments run this same image,
+ * so whenever they share a token one of them is structurally the loser — and the
+ * old loop retried it every 3s forever.
+ *
+ * That was not merely noisy. At roughly ten lines a minute the 409s crowded out
+ * everything else in `railway logs`, which is where the silent attribution stall
+ * would otherwise have been visible: the shadow sat dead for nine hours behind a
+ * wall of this. Log spam that hides a real failure is a real failure.
+ */
+const MAX_CONSECUTIVE_CONFLICTS = 3;
+
 export class TelegramCommands {
   private offset = 0;
   private stopped = true;
+  private conflicts = 0;
+  /** Set when this instance yielded the bot to another; surfaced for health output. */
+  private yieldedTo409 = false;
 
   constructor(private readonly performance: PerformanceTracker) {}
 
+  /** True when this instance stopped polling because another owns the bot. */
+  get yielded(): boolean {
+    return this.yieldedTo409;
+  }
+
   start(): void {
     if (!config.notifications.telegram) return;
+    if (!config.TELEGRAM_COMMANDS_ENABLED) {
+      logger.info('telegram commands: disabled (TELEGRAM_COMMANDS_ENABLED=false) — another instance owns the bot');
+      return;
+    }
     this.stopped = false;
     logger.info('telegram commands: listening for /t5 /t10 /l5');
     void this.run();
@@ -128,7 +161,25 @@ export class TelegramCommands {
       let updates: TgUpdate[];
       try {
         updates = await this.getUpdates(tg.token, LONG_POLL_SECONDS);
+        this.conflicts = 0;
       } catch (err) {
+        if (err instanceof TelegramHttpError && err.status === 409) {
+          // Authoritative: another process holds this bot's update stream. Retrying
+          // cannot win it, so yield instead of competing forever. Whichever
+          // instance should own commands keeps them; this one goes quiet.
+          this.conflicts++;
+          if (this.conflicts >= MAX_CONSECUTIVE_CONFLICTS) {
+            this.stopped = true;
+            this.yieldedTo409 = true;
+            logger.warn(
+              { conflicts: this.conflicts },
+              'telegram commands: another instance owns this bot (409) — yielding, commands are served elsewhere',
+            );
+            return;
+          }
+          await sleep(3000);
+          continue;
+        }
         logger.warn({ err: String(err) }, 'telegram commands: poll error');
         await sleep(3000);
         continue;
@@ -150,7 +201,7 @@ export class TelegramCommands {
     const t = setTimeout(() => ctrl.abort(), (timeoutSec + 10) * 1000);
     try {
       const res = await fetch(url, { signal: ctrl.signal });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) throw new TelegramHttpError(res.status);
       const body = (await res.json()) as { ok: boolean; result?: TgUpdate[] };
       return body.result ?? [];
     } finally {
