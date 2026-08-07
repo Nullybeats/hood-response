@@ -46,6 +46,8 @@ export interface V2Providers {
   outcomes(wallet: string): readonly Outcome[];
   /** Durable first-buy claim. Returns true at most once per (wallet, token). */
   claimFirstBuy(wallet: string, token: string, at: number, block: number): boolean;
+  /** How much of the outcome record is usable, for the status endpoint. Optional. */
+  outcomeStats?(): { wallets: number; calls: number };
 }
 
 export interface V2RuntimeOptions {
@@ -152,6 +154,11 @@ export class V2Shadow {
         }),
       ),
       lanes: this.opts.lanes.map((l) => ({ id: l.id, emoji: l.emoji, name: l.name, sentence: l.sentence })),
+      // How many wallets actually have a track record. While this is 0 every
+      // wallet grades U, the `who` dial drops out, and any lane requiring a
+      // grade cannot match — so a lane firing nothing is explained here rather
+      // than mistaken for a quiet market.
+      grades: this.providers.outcomeStats?.() ?? null,
     };
   }
 

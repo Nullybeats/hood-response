@@ -23,6 +23,7 @@ import {
 } from './notify/index.js';
 import { SafetyChecker } from './chain/safety.js';
 import { FirstBuyRegistry } from './v2/facts/firstBuy.js';
+import { WalletOutcomes } from './v2/facts/outcomes.js';
 import { V2Shadow } from './v2/runtime.js';
 import { PerformanceTracker, type TrackedCall } from './engine/performance.js';
 import { SniperRegistry } from './sniper/registry.js';
@@ -256,6 +257,7 @@ async function main(): Promise<void> {
   // — which is why none of them fetch. Blocking the listener to enrich a shadow
   // would let a measurement-only path slow the thing it is measuring.
   const firstBuyRegistry = new FirstBuyRegistry();
+  const walletOutcomes = new WalletOutcomes(performance);
   const v2Shadow = new V2Shadow({
     marketCap: (token) => {
       const t = store.tokensByAddress.get(token.toLowerCase());
@@ -278,13 +280,16 @@ async function main(): Promise<void> {
       if (report.honeypot === false) return true;
       return null;
     },
-    // Wallet outcomes are not yet wired: the performance record identifies calls
-    // by mutable wallet LABELS, not addresses, so attributing an outcome to an
-    // address is not currently sound. Until that is fixed every wallet grades
-    // `U`, which is the honest answer — and `U` is treated as unknown, never as
-    // average, so it cannot inflate a score in the meantime.
-    outcomes: () => [],
+    // Grades come from the tracked-call record, joined on the salted walletId
+    // the performance module already records — NOT on labels, which mutate and
+    // collide. A wallet with no closed calls returns nothing and grades `U`,
+    // which is unknown rather than bad.
+    outcomes: (wallet) => walletOutcomes.for(wallet),
     claimFirstBuy: (wallet, token, at, block) => firstBuyRegistry.claim(wallet, token, at, block),
+    outcomeStats: () => {
+      const s = walletOutcomes.stats();
+      return { wallets: s.wallets, calls: s.calls };
+    },
   });
   v2Shadow.start();
 
