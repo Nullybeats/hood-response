@@ -124,6 +124,13 @@ export const DASHBOARD_V2_HTML = `<!doctype html>
   }
   .tab[aria-selected="true"] { background: var(--lime); color: #0a0a0a; }
 
+  /* ── gains ──────────────────────────────────────────────────────────────── */
+  /* Applied only to a KNOWN number — an unknown renders as an em dash with no
+     colour, so "we could not price it" never wears the green or red of a
+     result. */
+  .up { color: var(--lime); }
+  .dn { color: var(--red); }
+
   /* ── coverage bars, inline ──────────────────────────────────────────────── */
   .bar2 { height: 6px; border: 1px solid var(--ink); background: var(--card); width: 70px; }
   .bar2 > i { display: block; height: 100%; background: var(--lime); }
@@ -154,6 +161,18 @@ export const DASHBOARD_V2_HTML = `<!doctype html>
           <button class="tab" data-o="observed">sells</button>
         </div>
         <div class="rows" id="decisions"><div class="empty">loading…</div></div>
+      </div>
+
+      <div class="card">
+        <h2 title="Every signal followed to an outcome, one row each. 'now' is the current mark, 'peak' the best it ever reached since firing — peak is the honest measure of a call, because it does not depend on when you happened to look. CONTROL rows matched no lane and were never called; they are here so the lane can be proven wrong.">call record — what fired, and what it did</h2>
+        <div class="tabs" id="calltabs">
+          <button class="tab" data-c="matched" aria-selected="true">called</button>
+          <button class="tab" data-c="control">control</button>
+          <button class="tab" data-c="">all</button>
+          <button class="tab" data-c="best">best</button>
+        </div>
+        <div id="callhead" class="empty"></div>
+        <div class="rows" id="calls"><div class="empty">loading…</div></div>
       </div>
 
       <div class="card">
@@ -201,6 +220,7 @@ export const DASHBOARD_V2_HTML = `<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 let outcome = '';
+let calls = 'matched';
 
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const ago = (t) => {
@@ -211,6 +231,13 @@ const ago = (t) => {
 };
 const fmtAge = (ms) => ms == null ? '⏳ never' : (ms < 60000 ? Math.round(ms/1000)+'s' : Math.round(ms/60000)+'m');
 const glyph = (t) => t === 'distribution' ? '🎁' : t === 'verified-sell' ? '🔻' : '🟢';
+/** null renders as an em dash, never as 0 — an unknown gain is not a flat one. */
+const pct = (n) => n == null ? '—' : (n >= 0 ? '+' : '') + (Math.round(n * 10) / 10) + '%';
+const sign = (n) => n == null ? '' : n > 0 ? 'up' : n < 0 ? 'dn' : '';
+const mcap = (n) => n == null ? '—'
+  : n >= 1e6 ? '$' + (Math.round(n / 1e5) / 10) + 'M'
+  : n >= 1e3 ? '$' + Math.round(n / 1e3) + 'k'
+  : '$' + Math.round(n);
 
 /** One dense line. The full text lives in the tooltip, since the row never wraps. */
 const line = (cells, title) =>
@@ -222,7 +249,7 @@ async function load() {
     fetch('/api/v2/decisions?limit=200' + (outcome ? '&outcome=' + outcome : '')).then((r) => r.json()).catch(() => ({ decisions: [] })),
     fetch('/api/v2/lanes').then((r) => r.json()).catch(() => ({ lanes: [] })),
     fetch('/api/debug/metrics').then((r) => r.json()).catch(() => null),
-    fetch('/api/v2/outcomes?limit=1').then((r) => r.json()).catch(() => ({ enabled: false })),
+    fetch('/api/v2/outcomes?limit=300').then((r) => r.json()).catch(() => ({ enabled: false })),
   ]);
 
   $('offbanner').innerHTML = status.enabled
@@ -278,6 +305,64 @@ async function load() {
         '<span class="sc">' + v.measuredPct + '%</span>',
         '<span class="why">' + v.measured + '✅ ' + v.unknown + '⏳ ' + v.failed + '❌</span>',
       ], fact + ': measured on ' + v.measuredPct + '% of sheets')).join('');
+
+  // ── Call record ───────────────────────────────────────────────────────────
+  // The per-signal view the scoreboard aggregates. Both are needed: an average
+  // hides the one 5x that paid for forty flat calls, and a list of rows hides
+  // whether the lane beats doing nothing.
+  if (!outcomes || outcomes.enabled === false) {
+    $('calls').innerHTML = '<div class="empty">Ledger is OFF. Set <code>V2_LEDGER_ENABLED=true</code> to follow signals to an outcome.</div>';
+    $('callhead').innerHTML = '';
+  } else {
+    const recs = outcomes.records || [];
+    const pick = calls === 'best'
+      ? recs.filter((r) => r.entryPrice != null).slice().sort((a, b) => (b.maxGainPct ?? 0) - (a.maxGainPct ?? 0))
+      : calls === 'matched' ? recs.filter((r) => r.matched)
+      : calls === 'control' ? recs.filter((r) => !r.matched)
+      : recs;
+
+    // Averages are computed over PRICED rows only. An unpriced record has a
+    // maxGainPct of 0 that means "never quotable", not "went nowhere", and
+    // folding it in would drag every average toward a number nobody earned.
+    const priced = pick.filter((r) => r.entryPrice != null);
+    const wins = priced.filter((r) => (r.maxGainPct ?? 0) >= 50).length;
+    const avg = priced.length ? priced.reduce((a, r) => a + (r.maxGainPct ?? 0), 0) / priced.length : 0;
+    const best = priced.length ? Math.max(...priced.map((r) => r.maxGainPct ?? 0)) : 0;
+    $('callhead').innerHTML = pick.length === 0 ? '' :
+      pick.length + ' signals · ' + priced.length + ' priced · win ' +
+      (priced.length ? Math.round((100 * wins) / priced.length) : 0) + '% · avg peak ' +
+      pct(avg) + ' · best ' + pct(best) + ' · win = peak ≥ +50%';
+
+    const emptyCalls = calls === 'matched'
+      ? 'No lane has matched yet. Rows appear here the moment one does — the control tab shows what the lanes are turning down in the meantime.'
+      : calls === 'control'
+        ? 'No unmatched signals recorded yet.'
+        : 'No signals followed yet. A record opens for every sheet that reaches a verdict.';
+
+    $('calls').innerHTML = pick.length === 0
+      ? '<div class="empty">' + esc(emptyCalls) + '</div>'
+      : pick.map((r) => {
+          const lane = (r.lanes && r.lanes.length) ? r.lanes.join('+') : 'control';
+          // An unpriced row must never render as 0% — that is a claim we cannot
+          // make. It says so instead, and is excluded from the header above.
+          const unpriced = r.entryPrice == null;
+          return line([
+            '<span class="b ' + (r.matched ? 'b-matched' : 'b-skipped') + '">' + esc(r.matched ? lane.slice(0, 5) : 'ctrl') + '</span>',
+            '<span>' + glyph(r.eventType) + '</span>',
+            '<span class="sym">' + esc(r.tokenSymbol) + '</span>',
+            '<span class="sc">' + (r.score == null ? '—' : r.score) + '</span>',
+            '<span class="sc">' + mcap(r.entryMarketCap) + '</span>',
+            '<span class="why">' + (unpriced
+              ? 'never quotable — no entry price, excluded from the averages'
+              : 'now <b class="' + sign(r.lastGainPct) + '">' + pct(r.lastGainPct) + '</b>' +
+                ' · peak <b class="' + sign(r.maxGainPct) + '">' + pct(r.maxGainPct) + '</b>' +
+                (r.closed ? ' · closed (' + esc(r.closedReason || 'window') + ')' : ' · open') +
+                (r.cohortSize > 1 ? ' · ' + r.cohortSize + ' in wave' : ' · solo')) + '</span>',
+            '<span class="age">' + ago(r.firedAt) + '</span>',
+          ], r.tokenSymbol + ' · ' + lane + ' · ' + (unpriced ? 'unpriced' : 'peak ' + pct(r.maxGainPct)) +
+             ' · seed ' + (r.seedTier || '—') + ' · grade at fire ' + (r.walletGradeAtFire || '—'));
+        }).join('');
+  }
 
   // The scoreboard. A bucket with nothing priced says so, rather than rendering
   // a 0% win rate that reads as "these all failed".
@@ -359,11 +444,21 @@ async function load() {
   ], l.conditions ? l.conditions.join(' · ') : l.sentence)).join('');
 }
 
+$('calltabs').addEventListener('click', (e) => {
+  const b = e.target.closest('.tab');
+  if (!b) return;
+  calls = b.dataset.c;
+  [...$('calltabs').querySelectorAll('.tab')].forEach((t) => t.setAttribute('aria-selected', String(t === b)));
+  load();
+});
+
 $('tabs').addEventListener('click', (e) => {
   const b = e.target.closest('.tab');
   if (!b) return;
   outcome = b.dataset.o;
-  [...document.querySelectorAll('.tab')].forEach((t) => t.setAttribute('aria-selected', String(t === b)));
+  // Scoped to THIS tab strip. A document-wide querySelectorAll deselects the
+  // call-record tabs too, silently resetting a filter the operator just set.
+  [...$('tabs').querySelectorAll('.tab')].forEach((t) => t.setAttribute('aria-selected', String(t === b)));
   load();
 });
 

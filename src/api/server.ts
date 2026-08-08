@@ -256,8 +256,16 @@ export async function buildServer(
     return {
       enabled: true,
       summary: ledger.summary(),
-      // No wallet addresses, matching the rule the other aggregate endpoints follow.
-      records: ledger.list(limit).map(({ wallet: _w, ...rest }) => rest),
+      // No wallet addresses, matching the rule the other aggregate endpoints
+      // follow. `cohortWallets` holds MEMBERS, not just a count — stripping only
+      // `wallet` published every one of them in the clear. Cohort membership is
+      // still worth exposing (it is how a repeated seeder becomes visible), so
+      // it is mapped to the same opaque handle the emit path uses rather than
+      // dropped.
+      records: ledger.list(limit).map(({ wallet: _w, cohortWallets, ...rest }) => ({
+        ...rest,
+        cohortWalletIds: (cohortWallets ?? []).map((a) => walletId(a)),
+      })),
     };
   });
 
