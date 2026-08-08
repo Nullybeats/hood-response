@@ -35,7 +35,7 @@ import { PonsWatcher } from './pons/watch.js';
 import { tickPaper, paperEnabled } from './pons/paper.js';
 import { TelegramCommands } from './telegram/commands.js';
 import type { Swarm, SwapEvent } from './types.js';
-import { walletIdSaltMissing } from './walletId.js';
+import { walletId, walletIdSaltMissing } from './walletId.js';
 
 type CandidateMode = PersistedSignalCandidate['mode'];
 type CandidateResult = 'resolved' | 'retry' | 'discard';
@@ -378,10 +378,15 @@ async function main(): Promise<void> {
       return { wallets: s.wallets, calls: s.calls, basis: s.basis };
     },
     reportCard: (now) => walletOutcomes.reportCard(now),
+    walletIdOf: (address) => walletId(address),
   },
   DEFAULT_V2_RUNTIME_OPTIONS,
   journal,
   v2Ledger,
+  // The emit path. Gated on its own flag, separate from V2_SHADOW_ENABLED:
+  // observing and BROADCASTING are different acts, and the second one is what
+  // reaches a funded wallet. Left off, v2 stays exactly the shadow it has been.
+  config.V2_EMIT_ENABLED ? (match) => store.emit('v2match', match) : undefined,
   );
   v2Shadow.start();
 
@@ -439,6 +444,7 @@ async function main(): Promise<void> {
     // history). Computed last, after conviction is finalized above.
     swarm.prime =
       config.PRIME_ALERTS &&
+      !!swarm.kind &&
       config.primeKinds.has(swarm.kind) &&
       swarm.conviction >= config.PRIME_MIN_CONVICTION;
   };
@@ -452,7 +458,9 @@ async function main(): Promise<void> {
     if (config.ignoreSymbols.has(swarm.tokenSymbol.toUpperCase())) return;
     // Blue-chip buy/sell filter: suppress tracked-wallet trades of the coins we
     // already track when that side is toggled off (whales just moving money).
-    const blueChipSuppressed = store.blueChipSuppressed(swarm.kind, swarm.token);
+    // A v2 signal has no kind; the blue-chip filter is a legacy buy/sell toggle
+    // and simply does not apply to one.
+    const blueChipSuppressed = swarm.kind ? store.blueChipSuppressed(swarm.kind, swarm.token) : false;
     if (config.SAFETY_FILTER && !blueChipSuppressed) {
       swarm.safety = await safety.check(swarm.token, price.liquidityOf(swarm.token));
     }

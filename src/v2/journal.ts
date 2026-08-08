@@ -51,7 +51,14 @@ export type JournalKind =
   /** Score with its per-dial breakdown. */
   | 'score'
   /** A lane's verdict on an alert, including the near-misses. */
-  | 'verdict';
+  | 'verdict'
+  /**
+   * What actually went on the wire. Distinct from 'verdict': a verdict is what
+   * v2 concluded, an emit is what consumers were told — and once money follows
+   * these, "what did we send, exactly?" has to be answerable from the record
+   * rather than reconstructed from a decision that may have been re-evaluated.
+   */
+  | 'emit';
 
 export interface JournalRecord {
   /** Monotonic within a process run; makes ordering explicit rather than implied by file position. */

@@ -12,6 +12,7 @@ import type {
 import { SEED_TOKENS, SEED_WALLETS } from '../data/seed.js';
 import { applyWalletOverrides } from './walletOverrides.js';
 import { config } from '../config/env.js';
+import type { V2Match } from '../v2/emit.js';
 import { logger } from '../logger.js';
 
 interface PersistedSettings {
@@ -50,6 +51,13 @@ export interface StoreEvents {
   swarm: (s: Swarm) => void;
   alert: (a: Alert) => void;
   metrics: (m: LatencyMetrics) => void;
+  /**
+   * A v2 lane match. Carried on the same fan-out as the legacy events but under
+   * its own name, never as an `alert`: the two describe different things, and a
+   * consumer that cannot tell them apart would apply legacy kind/conviction
+   * rules to a decision that has neither.
+   */
+  v2match: (m: V2Match) => void;
 }
 
 export interface LatencyMetrics {

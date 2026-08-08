@@ -156,7 +156,34 @@ export type SwarmKind = 'BUY' | 'SELL' | 'ROTATION' | 'SOLO' | 'ENTRY';
 
 export interface Swarm {
   id: string;
-  kind: SwarmKind;
+  /**
+   * Legacy taxonomy. ABSENT on a v2 signal, which is deliberate: a v2 match may
+   * be an allocation (a wallet RECEIVING a token), which is none of SOLO/ENTRY/
+   * BUY. Inventing a kind for it is exactly how 47e1 printed "1 alpha bought @
+   * $101k MC" over a bare transfer, so the field is optional and every reader is
+   * forced to decide what to do without one.
+   */
+  kind?: SwarmKind;
+  /** Present ⇒ produced by the v2 brain. The discriminator for `isV2Signal`. */
+  source?: 'v2';
+  /** v2: lane ids that matched. Replaces `kind` as the reason a signal exists. */
+  lanes?: string[];
+  /** v2: one human line per matched lane. */
+  laneReasons?: string[];
+  /** v2: 0–100 quality score. Replaces `conviction`; null fails closed. */
+  score?: number | null;
+  /** v2: when the decision was made (NOT block time) — the freshness input. */
+  emittedAt?: number;
+  /** v2: verified-buy | distribution | verified-sell. */
+  eventType?: string;
+  /** v2: distinct watched wallets on this token in the window. 1 = solo. */
+  cohortSize?: number;
+  /** v2: static holder-rank tier, never a performance grade. */
+  seedTier?: string | null;
+  /** v2: market-cap band at fire time. */
+  capBand?: string | null;
+  /** v2: earned wallet grade at fire time; `U` while under the sample floor. */
+  walletGrade?: string;
   token: string;
   tokenSymbol: string;
   /** For rotation swarms, the token being rotated into. */
@@ -287,4 +314,15 @@ export interface NotificationDelivery {
   ok: boolean;
   detail?: string;
   at: number;
+}
+
+/**
+ * Is this a v2 lane match rather than a legacy alert?
+ *
+ * Keyed on `source`, not on the absence of `kind`: absence is ambiguous (a
+ * malformed legacy payload also lacks it), and a buy rule must never fall into
+ * the v2 branch by accident. Presence of the discriminator is a positive claim.
+ */
+export function isV2Signal(s: Swarm): s is Swarm & { source: 'v2'; lanes: string[]; score: number | null } {
+  return s.source === 'v2' && Array.isArray(s.lanes);
 }

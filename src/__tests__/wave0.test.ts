@@ -127,9 +127,29 @@ describe('Wave 0 — defaults & sticky state', () => {
   });
 
   it('mode survives a simulated restart (durable live → engine boots live)', async () => {
-    const state = stubState({ mode: 'live', settingsSchemaVersion: 2, settings: {} as unknown });
+    // Schema 3 = already migrated, so this tests persistence itself rather than
+    // the one-time migration below.
+    const state = stubState({ mode: 'live', settingsSchemaVersion: 3, settings: {} as unknown });
     const eng = new SniperEngine(stubPrice({ '0xtok': 1 }), stubExecutor([]), stubSafety(), { owner: 'op@x.com', state });
     await eng.load();
     expect(eng.executionMode).toBe('live');
+  });
+
+  /**
+   * The v3 migration DISARMS, once.
+   *
+   * Lanes replaced kinds/conviction for v2 signals, and an operator who armed
+   * for "ENTRY,SOLO at conviction 0" never consented to a rule written in a
+   * vocabulary that did not exist when they armed it. Re-arming is an explicit
+   * act — which is why this test is the exception to the rule above, not a
+   * contradiction of it.
+   */
+  it('the lane migration disarms an armed sniper exactly once', async () => {
+    const state = stubState({ mode: 'live', settingsSchemaVersion: 2, settings: {} as unknown });
+    const eng = new SniperEngine(stubPrice({ '0xtok': 1 }), stubExecutor([]), stubSafety(), { owner: 'op@x.com', state });
+    await eng.load();
+    expect(eng.executionMode).toBe('off');
+    // And it buys from no lane until an operator names one.
+    expect((await eng.snapshot()).settings.enabledLanes).toEqual([]);
   });
 });

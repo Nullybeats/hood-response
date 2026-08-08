@@ -7,7 +7,7 @@ import { recordPonsDecision } from '../pons/journal.js';
 import { openPaperPosition, paperHolds } from '../pons/paper.js';
 import { logger } from '../logger.js';
 import type { PriceOracle } from '../chain/price.js';
-import type { Swarm } from '../types.js';
+import { isV2Signal, type Swarm } from '../types.js';
 import { SwapExecutor } from './executor.js';
 import { SafetyChecker } from '../chain/safety.js';
 import { type SniperMode, type SniperStateStore, type StoredSniperState } from './state.js';
@@ -21,7 +21,7 @@ const SAMPLE_MS = 60_000;
  *  default change must be forced onto existing operators (whose durable settings
  *  otherwise shadow the new env defaults). The migration in load() runs once per
  *  bump. v2 (2026-08): kinds → ENTRY,SOLO · conviction ungated · roundtrip cap 5. */
-const SETTINGS_SCHEMA_VERSION = 2;
+const SETTINGS_SCHEMA_VERSION = 3;
 
 export interface Position {
   id: string;
@@ -151,6 +151,25 @@ export interface SniperSettings {
   primeOnly: boolean;
   /** Comma-separated alert kinds to snipe, e.g. "BUY,ENTRY" (non-SOLO). Case-insensitive. */
   kinds: string;
+  /**
+   * v2 lane ids this sniper will buy from, e.g. ['allocation'].
+   *
+   * Replaces kinds/conviction/primeOnly for v2 signals — a v2 match has no
+   * `kind` (an allocation is not a SOLO or a BUY) and no `conviction`. EMPTY
+   * MEANS BUY NOTHING, which is deliberately the migrated default: an operator
+   * who armed for "ENTRY,SOLO at conviction 60" never consented to lane rules
+   * they have not seen.
+   *
+   * The legacy fields above are kept and still applied to legacy alerts, so the
+   * two streams cannot bleed into each other and a rollback loses no config.
+   */
+  enabledLanes: string[];
+  /**
+   * Minimum v2 score (0–100). A null score FAILS CLOSED — see onAlert. The
+   * legacy comparison `conviction < minConviction` would have let a null score
+   * through, because `null < 0` is false in JS.
+   */
+  minScore: number;
   /** Depth gate: skip a buy when the round-trip loss at our size exceeds this %. 0 = off. */
   maxRoundtripPct: number;
   /** After a token stops us out at a loss, don't re-buy it for this many minutes — stops the
@@ -251,6 +270,9 @@ export class SniperEngine {
     requireSafe: config.SNIPER_REQUIRE_SAFE,
     primeOnly: config.SNIPER_PRIME_ONLY,
     kinds: [...config.sniperKinds].join(','),
+    // Empty by default: v2 buys nothing until an operator names a lane.
+    enabledLanes: [...config.sniperLanes],
+    minScore: config.SNIPER_MIN_SCORE,
     maxRoundtripPct: config.SNIPER_MAX_ROUNDTRIP_PCT,
     lossCooldownMin: config.SNIPER_LOSS_COOLDOWN_MIN,
     newCoinsOnly: config.SNIPER_NEW_COINS_ONLY,
@@ -485,8 +507,11 @@ export class SniperEngine {
     this.decisions.push({
       at: Date.now(),
       tokenSymbol: swarm.tokenSymbol,
-      kind: swarm.kind,
-      conviction: swarm.conviction,
+      // A v2 decision is identified by its LANES, not by a kind it does not
+      // have. Recording 'BUY' here would make the audit log claim a taxonomy
+      // the signal never used.
+      kind: swarm.kind ?? swarm.lanes?.join('+') ?? 'v2',
+      conviction: swarm.conviction ?? swarm.score ?? 0,
       action,
       reason,
     });
@@ -670,13 +695,31 @@ export class SniperEngine {
     if (this.settings.newCoinsOnly && !swarm.firstSignal) {
       return this.decide(swarm, 'skipped', 'new coins only: token already appeared in Signals');
     }
-    if (this.settings.primeOnly) {
+    // Two streams, two rule sets, never mixed. A v2 match carries `lanes` and a
+    // `score`; it has no `kind` (an allocation is not a SOLO or a BUY) and no
+    // `conviction`. Applying the legacy gates to it would compare `undefined`
+    // against a threshold and let everything through.
+    if (isV2Signal(swarm)) {
+      const enabled = new Set(this.settings.enabledLanes.map((l) => l.trim().toLowerCase()));
+      if (enabled.size === 0) return this.decide(swarm, 'skipped', 'no v2 lane is enabled for buying');
+      const matched = (swarm.lanes ?? []).map((l) => l.toLowerCase());
+      if (!matched.some((l) => enabled.has(l))) {
+        return this.decide(swarm, 'skipped', `lanes ${matched.join('+') || 'none'} not enabled`);
+      }
+      // FAILS CLOSED. The legacy line compared `conviction < minConviction`, and
+      // `null < 0` is false in JS — an unscored signal would have sailed past it.
+      if (swarm.score == null) return this.decide(swarm, 'skipped', 'unscored — refusing to buy');
+      if (swarm.score < this.settings.minScore) {
+        return this.decide(swarm, 'skipped', `score ${swarm.score} below floor ${this.settings.minScore}`);
+      }
+    } else if (this.settings.primeOnly) {
       // PRIME-only: the single backtested-good tier (PRIME_KINDS × conviction ≥ PRIME_MIN_CONVICTION).
       // Collapses the buy set to just those — the broad kinds/conviction gates are intentionally bypassed.
       if (!swarm.prime) return this.decide(swarm, 'skipped', 'not a PRIME alert');
     } else {
       const allowedKinds = new Set(this.settings.kinds.split(',').map((k) => k.trim().toUpperCase()).filter(Boolean));
-      if (!allowedKinds.has(swarm.kind)) return this.decide(swarm, 'skipped', `kind ${swarm.kind} not in buy list`);
+      if (!swarm.kind || !allowedKinds.has(swarm.kind))
+        return this.decide(swarm, 'skipped', `kind ${swarm.kind ?? 'none'} not in buy list`);
       if (swarm.conviction < this.settings.minConviction || swarm.conviction > this.settings.maxConviction)
         return this.decide(swarm, 'skipped', `conviction ${swarm.conviction} outside ${this.settings.minConviction}-${this.settings.maxConviction}`);
     }
@@ -684,10 +727,18 @@ export class SniperEngine {
     // >50%-peak winner filled in <2s, while a 38s-late fill bought the top (PIPEDOG). Skip an alert
     // already older than staleMaxSec by the time we see it. Lenient default while we still carry the
     // blocking enrich latency; tighten toward ~5s once Wave 2 gets fills sub-2s.
-    if (config.SNIPER_STALE_MAX_SEC > 0 && swarm.firstSeen) {
-      const ageMs = Date.now() - swarm.firstSeen;
+    //
+    // A v2 match is aged from `emittedAt`, NOT from the block. v2 retries a sheet
+    // for up to 180s while its facts land, and an allocation additionally settles
+    // ~90s so the wave can be counted — so block-age would exceed any sane
+    // threshold on essentially every match and silently skip all of them. What
+    // the gate actually protects against is a slow HOP, and emittedAt measures
+    // exactly that.
+    const agedFrom = isV2Signal(swarm) ? swarm.emittedAt : swarm.firstSeen;
+    if (config.SNIPER_STALE_MAX_SEC > 0 && agedFrom) {
+      const ageMs = Date.now() - agedFrom;
       if (ageMs > config.SNIPER_STALE_MAX_SEC * 1000) {
-        return this.decide(swarm, 'skipped', `stale: alert ${Math.round(ageMs / 1000)}s old > ${config.SNIPER_STALE_MAX_SEC}s`);
+        return this.decide(swarm, 'skipped', `stale: signal ${Math.round(ageMs / 1000)}s old > ${config.SNIPER_STALE_MAX_SEC}s`);
       }
     }
     if (this.holdsOpen(swarm.token)) return this.decide(swarm, 'skipped', 'already holding this token');
@@ -806,8 +857,11 @@ export class SniperEngine {
         id: randomUUID(),
         token: swarm.token,
         tokenSymbol: swarm.tokenSymbol,
-        kind: swarm.kind,
-        conviction: swarm.conviction,
+        // What actually caused this buy. For a v2 signal that is the lane, not
+        // a legacy kind — a position that claims kind 'BUY' when an allocation
+        // triggered it would misreport the strategy in every later review.
+        kind: swarm.kind ?? swarm.lanes?.join('+') ?? 'v2',
+        conviction: swarm.conviction ?? swarm.score ?? 0,
         ethIn: res.ethSpent,
         entryPriceUsd: entryPrice,
         entryMarketCap: swarm.marketCap,
@@ -1505,6 +1559,25 @@ export class SniperEngine {
         'sniper: applied settings migration v2 (ENTRY,SOLO · conviction ungated · roundtrip cap 5)',
       );
     }
+    // v3: lanes replace kinds/conviction for v2 signals. This migration
+    // deliberately DISARMS.
+    //
+    // An operator who armed this sniper for "ENTRY,SOLO at conviction 0" never
+    // consented to a rule written in a vocabulary that did not exist when they
+    // armed it. And the only lane that can currently fire — Allocation — has a
+    // measured record days old with nothing closed. Auto-arming real capital
+    // onto that would be indefensible, so re-arming is an explicit act taken
+    // with the lane's record visible next to the toggle.
+    if (this.settingsSchemaVersion < 3) {
+      this.settings.enabledLanes = [];
+      this.settings.minScore = config.SNIPER_MIN_SCORE;
+      const wasOn = this.mode === 'live';
+      this.mode = 'off';
+      logger.warn(
+        { owner: this.owner, wasArmed: wasOn },
+        'sniper: settings migration v3 — lanes now gate v2 signals; DISARMED, re-arm explicitly',
+      );
+    }
     this.settingsSchemaVersion = SETTINGS_SCHEMA_VERSION;
     void this.persist();
   }
@@ -1538,6 +1611,16 @@ export class SniperEngine {
       const norm = patch.kinds.split(',').map((k) => k.trim().toUpperCase()).filter(Boolean).join(',');
       if (norm) this.settings.kinds = norm;
     }
+    if (Array.isArray(patch.enabledLanes)) {
+      // An EMPTY array is a legitimate instruction here — "buy from no lane" is
+      // how an operator disarms v2 without disarming the whole sniper. That is
+      // the opposite of `kinds` above, where empty is treated as a mistake
+      // because wiping the legacy buy list is never what anyone meant.
+      this.settings.enabledLanes = [
+        ...new Set(patch.enabledLanes.map((l) => String(l).trim().toLowerCase()).filter(Boolean)),
+      ];
+    }
+    if (typeof patch.minScore === 'number') this.settings.minScore = clamp(patch.minScore, 0, 100);
     logger.info({ settings: this.settings }, 'sniper: settings updated');
     void this.persist();
     return this.settings;

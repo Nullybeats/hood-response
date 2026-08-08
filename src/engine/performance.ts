@@ -16,7 +16,8 @@ export interface TrackedCall {
   id: string;
   token: string;
   tokenSymbol: string;
-  kind: SwarmKind;
+  /** Legacy kind. Absent for a v2-sourced call — see Swarm.kind. */
+  kind?: SwarmKind;
   conviction: number;
   walletCount: number;
   walletSummary: string;

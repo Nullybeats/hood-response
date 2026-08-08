@@ -2,7 +2,7 @@ import type { Swarm } from '../types.js';
 import type { TrackedCall } from '../engine/performance.js';
 import { explorerUrl, sigmaBuyUrl, basedBuyUrl } from '../links.js';
 
-export const KIND_EMOJI: Record<Swarm['kind'], string> = {
+export const KIND_EMOJI: Record<string, string> = {
   BUY: '🟢😼',
   SELL: '🔴🙀',
   ROTATION: '🔄🐈',
@@ -13,9 +13,19 @@ export const KIND_EMOJI: Record<Swarm['kind'], string> = {
 /** Brand title every alert card opens with. */
 const BRAND = 'SNIPURR ALERT';
 
+/**
+ * The icon for a signal. A v2 match has no legacy kind — it has a lane — so it
+ * gets the lane's own mark rather than being dressed as a BUY.
+ */
+function kindIcon(s: Swarm): string {
+  if (s.kind && KIND_EMOJI[s.kind]) return KIND_EMOJI[s.kind]!;
+  if (s.lanes?.includes('allocation')) return '🎁🐱';
+  return '🐾';
+}
+
 /** PRIME multiplies the kind icon itself — the swarm literally gets bigger. */
 function primeIcon(s: Swarm): string {
-  return s.prime ? KIND_EMOJI[s.kind].repeat(3) : KIND_EMOJI[s.kind];
+  return s.prime ? kindIcon(s).repeat(3) : kindIcon(s);
 }
 
 // ── formatting helpers ────────────────────────────────────────────────────────
@@ -112,7 +122,7 @@ function typeTitle(s: Swarm): string {
 export function headline(s: Swarm): string {
   return s.prime
     ? `👑 PRIME 👑 ${primeIcon(s)} ${typeTitle(s)}`
-    : `${KIND_EMOJI[s.kind]} ${typeTitle(s)}`;
+    : `${kindIcon(s)} ${typeTitle(s)}`;
 }
 
 /** The loud, fly-swarming banner PRIME alerts open with — more flies, and the

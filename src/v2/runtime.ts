@@ -22,13 +22,14 @@ import { config } from '../config/env.js';
 import { logger } from '../logger.js';
 import type { SwapEvent, WalletTier } from '../types.js';
 import { buildEntry, Diary, type DiaryEntry } from './diary.js';
+import { buildMatch, type V2Match } from './emit.js';
 import type { Outcome } from './facts/grade.js';
 import { buildFactSheet, type FactSheet, type SheetInputs } from './facts/sheet.js';
 import { gate, type GateVerdict } from './gate.js';
 import { journal, type Journal } from './journal.js';
 import { DEFAULT_LANES, evaluateLanes, type Lane } from './lanes.js';
 import type { OutcomeLedger } from './ledger.js';
-import { scoreSheet } from './score.js';
+import { scoreSheet, type ScoreResult } from './score.js';
 
 /**
  * Everything the pipeline needs from the outside world.
@@ -57,6 +58,8 @@ export interface V2Providers {
   reportCard?(now: number): { walletId: string; grade: string; index: number | null; sample: number; reason: string }[];
   /** Static seed holder-rank tier for a wallet, or null when not in the catalog. */
   seedTier?(wallet: string): WalletTier | null;
+  /** Opaque public handle for an address. Emitted signals never carry the address itself. */
+  walletIdOf?(address: string): string;
   /**
    * Value a token amount at the CURRENT price, for trades whose usdValue was
    * null at detection time. Recovers the `howMuch` dial on new pairs; the fact
@@ -147,12 +150,36 @@ export class V2Shadow {
    */
   private readonly cohort = new Map<string, CrowdMark[]>();
 
+  /**
+   * Transactions already emitted, so one decision produces one signal.
+   *
+   * A sheet legitimately goes `waiting → matched` as its facts land, and a later
+   * re-evaluation can match MORE lanes — without this, each pass would emit
+   * again and the sniper would see the same allocation three times. Bounded, and
+   * insertion-ordered so the oldest fall out first.
+   */
+  private readonly emitted = new Set<string>();
+
+  /**
+   * What was actually emitted, newest last, for replay after a disconnect.
+   *
+   * Railway caps an SSE stream at 900s, so every consumer reconnects several
+   * times an hour; without a replay source each gap silently swallows whatever
+   * matched during it. The legacy feed already solves this with /api/alerts.
+   */
+  private readonly matches: V2Match[] = [];
+
   constructor(
     private readonly providers: V2Providers,
     private readonly opts: V2RuntimeOptions = DEFAULT_V2_RUNTIME_OPTIONS,
     private readonly jrnl: Journal = journal,
     /** Follows matched decisions to an outcome. Absent ⇒ decisions are recorded but never scored. */
     private readonly ledger?: OutcomeLedger,
+    /**
+     * Where a matched decision goes. Absent ⇒ v2 stays a pure shadow, which is
+     * what it was built as and what it remains until an operator wires this.
+     */
+    private readonly onMatch?: (match: V2Match) => void,
   ) {}
 
   get enabled(): boolean {
@@ -298,6 +325,11 @@ export class V2Shadow {
     this.jrnl.write('trade', swap);
     this.jrnl.write('verdict', entry);
     this.diary.record(entry);
+  }
+
+  /** Emitted matches, oldest first — the SSE catch-up source. */
+  recentMatches(): readonly V2Match[] {
+    return this.matches;
   }
 
   /** The outcome ledger, for the scoreboard endpoint. Undefined when disabled. */
@@ -449,11 +481,46 @@ export class V2Shadow {
     }
 
     if (entry.outcome === 'matched') {
+      this.emit(sheet, score, entry, now);
+    }
+  }
+
+  /**
+   * Put a matched decision on the wire, at most once per transaction.
+   *
+   * Guarded rather than fired from `record()` directly, because `record()` runs
+   * on every retry pass: a sheet that goes `waiting → matched` and then matches
+   * an additional lane would otherwise emit two or three times, and the sniper
+   * would treat each as a fresh signal for the same token.
+   */
+  private emit(sheet: FactSheet, score: ScoreResult, entry: DiaryEntry, now: number): void {
+    if (!this.onMatch) {
       logger.info(
         { token: sheet.tokenSymbol, score: score.score, lanes: entry.matchedLanes },
         'v2 shadow: WOULD HAVE ALERTED (nothing emitted)',
       );
+      return;
     }
+    if (this.emitted.has(sheet.txHash)) return;
+    this.emitted.add(sheet.txHash);
+    if (this.emitted.size > 5_000) {
+      const oldest = this.emitted.values().next().value;
+      if (oldest) this.emitted.delete(oldest);
+    }
+    const match = buildMatch(sheet, score, entry, this.providers.walletIdOf ?? ((a) => a), now);
+    this.matches.push(match);
+    if (this.matches.length > 200) this.matches.shift();
+    this.jrnl.write('emit', match);
+    try {
+      this.onMatch(match);
+    } catch (err) {
+      // A consumer that throws must not take down the pipeline that fed it.
+      logger.warn({ err: String(err).slice(0, 200) }, 'v2: match consumer threw');
+    }
+    logger.info(
+      { token: sheet.tokenSymbol, score: score.score, lanes: entry.matchedLanes, cohort: match.cohortSize },
+      'v2: MATCH EMITTED',
+    );
   }
 
   /** Cohort members currently inside the window for a token. */

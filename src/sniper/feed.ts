@@ -4,7 +4,55 @@ import { notifyBotState } from '../notify/state.js';
 import type { PriceOracle } from '../chain/price.js';
 import type { SniperRegistry } from './registry.js';
 import type { Alert, Swarm } from '../types.js';
+import type { V2Match } from '../v2/emit.js';
 import { selectCatchUp, remember } from './feedCatchUp.js';
+
+/**
+ * Carry a v2 match on the same rails as a legacy alert.
+ *
+ * Everything downstream of the buy gate — price enrichment, the in-flight lock,
+ * position bookkeeping, exits — is shared, and duplicating it for v2 would mean
+ * two copies of the code that spends money. So the match is widened to the same
+ * shape, WITHOUT inventing the fields it does not have:
+ *
+ *   kind        stays undefined — an allocation is not SOLO/ENTRY/BUY
+ *   conviction  stays undefined — `score` is its own field, on its own scale
+ *   prime       stays undefined — a v2 lane is not the legacy PRIME tier
+ *
+ * `isV2Signal` routes it to the lane rules before any of those are consulted, so
+ * their absence is a guarantee rather than a gap.
+ */
+function v2ToSignal(m: V2Match): Swarm {
+  return {
+    // Identity and timing.
+    id: m.id,
+    token: m.token,
+    tokenSymbol: m.tokenSymbol,
+    firstSeen: m.firedAt,
+    // v2 discriminator + everything the lane rules read.
+    source: 'v2',
+    lanes: m.lanes,
+    laneReasons: m.laneReasons,
+    score: m.score,
+    emittedAt: m.emittedAt,
+    eventType: m.eventType,
+    cohortSize: m.cohortSize,
+    seedTier: m.seedTier,
+    capBand: m.capBand,
+    walletGrade: m.walletGrade,
+    marketCap: m.marketCap,
+    pairAgeHours: m.pairAgeHours,
+    // Crowd shape, stated honestly: v2 knows how many watched wallets touched
+    // the token, and deliberately does not publish which.
+    walletCount: m.cohortSize,
+    walletSummary: m.cohortSize === 1 ? '1 wallet' : `${m.cohortSize} wallets`,
+    walletLabels: [],
+    walletIds: [m.walletId],
+    wallets: [],
+    // Price is filled by the local enrichment below; the sniper fails closed
+    // without it, which is the behaviour we want either way.
+  } as unknown as Swarm;
+}
 
 /** How far back a reconnect may replay. Deliberately just wider than the observed ~1.4s gap: this
  *  recovers what we were blind for, never resurrects history. The engine's own 15s freshness gate is
@@ -207,7 +255,26 @@ export class FeedSubscriber {
       if (line.startsWith('event:')) event = line.slice(6).trim();
       else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
     }
-    if (event !== 'alert' || dataLines.length === 0) return; // only rule-passed alerts drive buys
+    // Two streams, kept distinct all the way down: `alert` is the legacy engine
+    // (kind + conviction), `v2-match` is the v2 brain (lanes + score). They are
+    // gated by different rules in the sniper, so conflating them here would
+    // apply legacy thresholds to a signal that has none.
+    if (dataLines.length === 0) return;
+    if (event !== 'alert' && event !== 'v2-match') return;
+
+    if (event === 'v2-match') {
+      let match: V2Match;
+      try {
+        match = JSON.parse(dataLines.join('\n')) as V2Match;
+      } catch {
+        return;
+      }
+      if (!match?.token || !Array.isArray(match.lanes) || match.lanes.length === 0) return;
+      if (match.id) remember(this.seen, this.seenOrder, match.id, SEEN_CAP);
+      void this.handle(v2ToSignal(match));
+      return;
+    }
+
     let alert: Alert;
     try {
       alert = JSON.parse(dataLines.join('\n')) as Alert;
@@ -245,10 +312,21 @@ export class FeedSubscriber {
     // Entry-latency diagnostic (every alert, not just buys): ageMs = how old the alert already is when
     // the box receives it = Railway detection→emit + SSE hop. If this dominates, the entry latency is
     // upstream (feed-side), not box-side, and the box can only gate staleness — not speed entries up.
-    const ageMs = swarm.firstSeen ? receivedAt - swarm.firstSeen : null;
+    // For a v2 match the meaningful age is since it was EMITTED: v2 waits up to
+    // ~3 minutes for facts to land and settles an allocation for 90s, so block
+    // age would look catastrophic while the hop was in fact instant.
+    const agedFrom = swarm.source === 'v2' ? swarm.emittedAt : swarm.firstSeen;
+    const ageMs = agedFrom ? receivedAt - agedFrom : null;
     logger.info(
-      { token: swarm.tokenSymbol, kind: swarm.kind, ageMs, enrichMs: swarm.enrichMs, conviction: swarm.conviction },
-      'sniper feed: alert received (entry-latency diag)',
+      {
+        token: swarm.tokenSymbol,
+        source: swarm.source ?? 'legacy',
+        kind: swarm.kind ?? swarm.lanes?.join('+'),
+        ageMs,
+        enrichMs: swarm.enrichMs,
+        conviction: swarm.conviction ?? swarm.score,
+      },
+      'sniper feed: signal received (entry-latency diag)',
     );
     this.registry.onAlert(swarm);
   }

@@ -131,7 +131,8 @@ async function sendTelegram(
       chat_id: chatId,
       text: cardHtml,
       parse_mode: 'HTML',
-      link_preview_options: previewOptions(s.kind, s.prime === true),
+      // A v2 match has no legacy kind; its lane names the mascot instead.
+      link_preview_options: previewOptions(s.kind ?? s.lanes?.[0] ?? 'SOLO', s.prime === true),
     });
     if (res.ok) {
       // Remember which message this call owns. Failing to read the id only costs
@@ -178,7 +179,7 @@ export async function editAlertResult(
       parse_mode: 'HTML',
       // Same preview the card was sent with — omitting it would strip the mascot
       // off the message the first time a result footer lands.
-      link_preview_options: previewOptions(call.kind, cardHtml.includes('PRIME SIGNAL')),
+      link_preview_options: previewOptions(call.kind ?? 'SOLO', cardHtml.includes('PRIME SIGNAL')),
     });
     if (res.ok) return true;
     const reason = await res

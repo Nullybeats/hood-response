@@ -78,6 +78,8 @@ const ruleBody = z.object({
   ignoredWallets: z.array(z.string()).default([]),
 });
 
+const LANE_IDS = DEFAULT_LANES.map((l) => l.id);
+
 const sniperSettingsBody = z.object({
   enabled: z.boolean().optional(),
   minConviction: z.number().min(0).max(100).optional(),
@@ -95,6 +97,12 @@ const sniperSettingsBody = z.object({
   rugGuard: z.boolean().optional(),
   rugDropPct: z.number().min(0).max(100).optional(),
   kinds: z.string().optional(),
+  // An ENUM, not a free string. `kinds` is a free string and that is exactly how
+  // a typo ("ENTREE") could be stored happily and match nothing forever — a
+  // sniper that silently buys nothing looks identical to a quiet market. Lane
+  // ids come from DEFAULT_LANES so the two can never drift.
+  enabledLanes: z.array(z.enum(LANE_IDS as [string, ...string[]])).optional(),
+  minScore: z.number().min(0).max(100).optional(),
 });
 const sniperModeBody = z.object({ mode: z.enum(['off', 'live']) });
 // Per-position exit overrides. A positive number sets the override; null/0 clears it (→ global).
@@ -321,6 +329,18 @@ export async function buildServer(
             journalStopped: v2s.journalStopped,
           }
         : null,
+    };
+  });
+
+  // Catch-up for the SSE stream. Railway caps a stream at 900s, so every
+  // consumer reconnects several times an hour — without a replay source, every
+  // match during the gap is silently lost, which is precisely the failure
+  // /api/alerts already exists to solve for the legacy feed.
+  app.get('/api/v2/matches', async (req) => {
+    const limit = Math.min(Number((req.query as { limit?: string }).limit) || 100, 500);
+    return {
+      enabled: config.V2_EMIT_ENABLED,
+      matches: (v2?.recentMatches() ?? []).slice(-limit).reverse(),
     };
   });
 
@@ -910,10 +930,16 @@ export async function buildServer(
     const onSwarm = (s: Swarm) => send('swarm')(displaySwarm(s));
     const onAlert = (a: Alert) => send('alert')(displayAlert(a));
     const onMetrics = send('metrics');
+    // v2 matches go out under their OWN event name. Reusing 'alert' would have
+    // needed no consumer change, which is exactly the trap: the box sniper would
+    // then apply legacy kind/conviction rules to a decision that has neither,
+    // and snipurr would blend two incompatible taxonomies into one table.
+    const onV2Match = send('v2-match');
     store.on('swap', onSwap);
     store.on('swarm', onSwarm);
     store.on('alert', onAlert);
     store.on('metrics', onMetrics);
+    store.on('v2match', onV2Match);
 
     const keepAlive = setInterval(() => reply.raw.write(': ping\n\n'), 15000);
 
@@ -923,6 +949,7 @@ export async function buildServer(
       store.off('swarm', onSwarm);
       store.off('alert', onAlert);
       store.off('metrics', onMetrics);
+      store.off('v2match', onV2Match);
     });
   });
 

@@ -119,7 +119,10 @@ export class AlertEngine {
 
   private matches(rule: AlertRule, swarm: Swarm): boolean {
     if (!rule.enabled) return false;
-    if (!rule.kinds.includes(swarm.kind)) return false;
+    // A rule is written in the legacy taxonomy, so a signal without a kind (a
+    // v2 match) can never satisfy one. Refusing here is the honest answer —
+    // v2 signals reach consumers on their own channel, not through these rules.
+    if (!swarm.kind || !rule.kinds.includes(swarm.kind)) return false;
     if (rule.ignoredTokens.includes(swarm.token)) return false;
     if (swarm.windowSeconds > rule.windowSeconds) return false;
 
@@ -187,7 +190,7 @@ export class AlertEngine {
   async evaluate(swarm: Swarm): Promise<Alert[]> {
     const now = Date.now();
     const fired: Alert[] = [];
-    const isMulti = !SINGLE_WALLET_KINDS.has(swarm.kind);
+    const isMulti = !swarm.kind || !SINGLE_WALLET_KINDS.has(swarm.kind);
     let counted = false;
     for (const rule of this.store.rules.values()) {
       if (!this.matches(rule, swarm)) continue;

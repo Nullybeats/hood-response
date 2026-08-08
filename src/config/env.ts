@@ -587,6 +587,17 @@ const schema = z.object({
   // that tracker's self-wiping counter as a lifetime total is how the alert-rate
   // comparison against 47e1 came out ~5x wrong.
   V2_LEDGER_ENABLED: bool(false),
+  // Whether a matched decision is BROADCAST (SSE `v2-match` + /api/v2/matches).
+  // Deliberately separate from V2_SHADOW_ENABLED: observing and telling the
+  // world are different acts, and only the second one can reach a funded wallet.
+  // Off ⇒ v2 remains the pure shadow it was built as.
+  V2_EMIT_ENABLED: bool(false),
+  // Which v2 lanes the sniper may buy from, comma-separated (e.g. "allocation").
+  // EMPTY = buy nothing, which is the intended default: lanes gate real capital
+  // and the Allocation lane's measured record is still only days old.
+  SNIPER_LANES: z.string().default(''),
+  // Minimum v2 score to buy. A null score always fails closed regardless.
+  SNIPER_MIN_SCORE: num(60),
   V2_LEDGER_PATH: z.string().default('/data/v2-outcomes.json'),
   // 24h matches the window a launch resolves in on this chain, and matches the
   // legacy tracker so the two records compare like for like.
@@ -688,6 +699,12 @@ export const config = {
       .map((s) => s.trim().toUpperCase())
       .filter(Boolean),
   ),
+  // Lane ids are lower-case by definition (see v2/lanes.ts) and are NOT
+  // upper-cased like kinds — an id is matched exactly, and 'ALLOCATION' would
+  // silently match nothing, which is the failure the lane enum exists to stop.
+  sniperLanes: env.SNIPER_LANES.split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean),
   // Only a configured, syntactically valid address can be trusted as a native
   // settlement entry point. Keep these lower-cased because receipt addresses
   // and classifier contract sets are normalized that way.
