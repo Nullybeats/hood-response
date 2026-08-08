@@ -68,9 +68,19 @@ describe('toOutcome', () => {
     expect(o.at).toBe(NOW - DAY);
   });
 
-  /** A record still moving is not yet a result. */
-  it('ignores a record that has not closed', () => {
-    expect(toOutcome(rec({ closed: false }))).toBeNull();
+  /**
+   * An OPEN record is a result. The ledger tracks entry, peak and now — it does not model an exit,
+   * because when a position actually closes is decided by the operator's own config (trailing
+   * stop, take-profit, recoup), which differs per tenant and can change mid-position.
+   *
+   * Waiting for a ledger "close" measured nothing but elapsed time, and cost every grade a 24h
+   * latency floor. Peak can only rise, so judging early understates a wallet and never flatters
+   * it — the safe direction to be wrong in.
+   */
+  it('judges a record that is still open', () => {
+    const o = toOutcome(rec({ closed: false, maxGainPct: 150 }))!;
+    expect(o).not.toBeNull();
+    expect(o.peakMultiple).toBeCloseTo(2.5, 5);
   });
 
   /**
@@ -191,9 +201,11 @@ describe('WalletOutcomes', () => {
   });
 
   it('reports how much of the record is usable', () => {
-    const wo = new WalletOutcomes(ledger([rec(), rec({ closed: false })]));
+    // Open and closed alike count; only an unpriced record is dropped, because it is unmeasured
+    // rather than flat.
+    const wo = new WalletOutcomes(ledger([rec(), rec({ closed: false }), rec({ entryPrice: null })]));
     const s = wo.stats();
-    expect(s.calls).toBe(1); // the open one is not a result yet
+    expect(s.calls).toBe(2);
     expect(s.wallets).toBe(1);
   });
 });

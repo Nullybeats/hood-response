@@ -164,7 +164,7 @@ export const DASHBOARD_V2_HTML = `<!doctype html>
       </div>
 
       <div class="card">
-        <h2 title="Every signal followed to an outcome, one row each. 'now' is the current mark, 'peak' the best it ever reached since firing — peak is the honest measure of a call, because it does not depend on when you happened to look. CONTROL rows matched no lane and were never called; they are here so the lane can be proven wrong.">call record — what fired, and what it did</h2>
+        <h2 title="Every signal followed to an outcome, one row each. This tracks exactly three things: ENTRY, PEAK and NOW. It does NOT model an exit — when a position actually closes is decided by your own trailing stop / take-profit config, which is per-operator and can change mid-position. Peak is the honest measure of a call because it does not depend on when you happened to look. CONTROL rows matched no lane and were never called; they are here so the lane can be proven wrong.">call record — entry, peak, now</h2>
         <div class="tabs" id="calltabs">
           <button class="tab" data-c="matched" aria-selected="true">called</button>
           <button class="tab" data-c="control">control</button>
@@ -189,7 +189,7 @@ export const DASHBOARD_V2_HTML = `<!doctype html>
 
       <div class="card">
         <details open>
-          <summary title="Grades are earned from ALLOCATION outcomes — 'when this wallet is allocated a token, does it pump?' — not from purchases, because the engine sees almost no verified buys. A wallet needs 5 closed outcomes before it grades at all; until then U is the honest answer.">wallet grades</summary>
+          <summary title="Grades are earned from ALLOCATION outcomes — 'when this wallet is allocated a token, does it pump?' — not from purchases, because the engine sees almost no verified buys. A wallet needs 5 priced outcomes before it grades at all; until then U is the honest answer. Peak is read live and can only rise, so an early grade understates a wallet rather than flattering it.">wallet grades</summary>
           <div class="rows" id="grades"></div>
         </details>
       </div>
@@ -356,7 +356,9 @@ async function load() {
               ? 'never quotable — no entry price, excluded from the averages'
               : 'now <b class="' + sign(r.lastGainPct) + '">' + pct(r.lastGainPct) + '</b>' +
                 ' · peak <b class="' + sign(r.maxGainPct) + '">' + pct(r.maxGainPct) + '</b>' +
-                (r.closed ? ' · closed (' + esc(r.closedReason || 'window') + ')' : ' · open') +
+                // "tracking ended", never "closed" — when a POSITION closes is the operator's
+                // trailing stop / take-profit, not ours. This flag only says we stopped sampling.
+                (r.closed ? ' · tracking ended (' + esc(r.closedReason || 'window') + ')' : ' · tracking') +
                 (r.cohortSize > 1 ? ' · ' + r.cohortSize + ' in wave' : ' · solo')) + '</span>',
             '<span class="age">' + ago(r.firedAt) + '</span>',
           ], r.tokenSymbol + ' · ' + lane + ' · ' + (unpriced ? 'unpriced' : 'peak ' + pct(r.maxGainPct)) +
@@ -404,7 +406,7 @@ async function load() {
   $('grades').innerHTML = wg.length === 0
     ? '<div class="empty">No wallet has a recorded outcome yet' +
       (gstats.calls != null ? ' (' + gstats.calls + ' closed, basis: ' + (gstats.basis || '—') + ')' : '') +
-      '. A grade needs 5 closed allocation outcomes, each 24h after it fired.</div>'
+      '. A grade needs 5 PRICED allocation outcomes — a record we could never quote is dropped, not counted as flat.</div>'
     : wg.map((w) => line([
         '<span class="b ' + (w.grade === 'U' ? 'b-skipped' : 'b-matched') + '">' + esc(w.grade) + '</span>',
         '<span class="sym">' + esc(w.walletId.slice(0, 8)) + '</span>',

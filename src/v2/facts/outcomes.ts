@@ -148,22 +148,24 @@ export class WalletOutcomes {
 }
 
 /**
- * One ledger record → one outcome, or null when it cannot yet be judged.
+ * One ledger record → one outcome, or null when it cannot be judged.
  *
- * Two exclusions, both deliberate:
+ * The ledger tracks exactly three things: ENTRY, PEAK, and NOW. It does not model an exit, and it
+ * must not pretend to — when a position is actually closed is decided by the OPERATOR's config
+ * (trailing stop, take-profit, recoup), which differs per tenant and can change mid-position. A
+ * ledger "close" is only the end of our sampling window, so waiting for one before judging a
+ * wallet measured nothing except elapsed time. It used to gate this function, which imposed a 24h
+ * latency floor on every grade for no measurement benefit.
  *
- *  - An OPEN record is excluded. `maxGainPct` is a running maximum, so grading
- *    on it would let a wallet's grade swing on a token that has not finished
- *    moving. This imposes a real latency floor: one outcome per record, no
- *    sooner than the ledger's tracking window.
- *  - An UNPRICED record is excluded rather than counted as a flat result. A
- *    record that closed `no-price` carries `maxGainPct: 0`, which reads as a
- *    1.0x peak and falls below the hit threshold — so counting it would grade a
- *    wallet DOWN for our own inability to quote its token. Same discipline the
- *    scorer applies to an unknown dial: dropped, never zeroed.
+ * Peak is judged as soon as there is a price. It is a running maximum and can only rise, so an
+ * early read understates a wallet and never flatters it — the conservative direction.
+ *
+ * The one remaining exclusion is deliberate: an UNPRICED record is dropped rather than counted as
+ * a flat result. It carries `maxGainPct: 0`, which reads as a 1.0x peak and falls below the hit
+ * threshold — so counting it would grade a wallet DOWN for our own inability to quote its token.
+ * Same discipline the scorer applies to an unknown dial: dropped, never zeroed.
  */
 export function toOutcome(record: LedgerRecord): Outcome | null {
-  if (!record.closed) return null;
   if (record.entryPrice == null) return null;
   if (!Number.isFinite(record.maxGainPct)) return null;
   return {
