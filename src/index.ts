@@ -8,6 +8,7 @@ import {
   type PersistedSignalCandidate,
 } from './store/feedState.js';
 import { PriceOracle } from './chain/price.js';
+import { DEFAULT_HEAD_POLLER_OPTIONS, HeadPoller } from './chain/head.js';
 import { createListener } from './chain/listener.js';
 import { HyperSyncShadow } from './chain/shadow.js';
 import { AttributionShadow } from './attrib/runtime.js';
@@ -561,15 +562,20 @@ async function main(): Promise<void> {
     // cards are fiction). ensureToken above is deliberate — the price oracle
     // can only quote tokens the store knows about.
     if (swap.distribution === true) {
-      // Metrics only, never the feed: the chain-head and last-event tiles must
-      // reflect that the listener is alive even when every event is an
-      // allocation — otherwise a distribution-heavy hour renders as "block –"
-      // and reads as a dead listener. The swap ring, SSE stream and aggregator
-      // stay distribution-free.
+      // Shown, never counted. Allocations are ~90% of watched-wallet activity,
+      // so a feed that hides them renders a busy hour as an empty page — but
+      // they must not reach the aggregator, walletStats or the swap totals,
+      // which is how 47e1 came to describe an airdrop as "1 alpha bought @ $101k".
+      // recordDisplayEvent draws that line: the ring and the SSE stream get it,
+      // the trade maths does not.
+      store.recordDisplayEvent(swap);
       store.updateMetrics({
         lastBlock: Math.max(store.metrics.lastBlock, swap.blockNumber),
         lastEventAt: swap.timestamp,
       });
+      // Quote it like any other row, so the feed can show what the allocation
+      // was worth instead of a permanent "pricing…".
+      price.requestRefresh(swap.token);
       try {
         v2Shadow.onSwap(swap);
       } catch (err) {
@@ -638,6 +644,19 @@ async function main(): Promise<void> {
   }
   listener.start();
 
+  // The chain head, off-meter. Independent of wallet activity by design: the
+  // log stream cannot advance the head during a quiet hour, and a frozen head
+  // is indistinguishable from a dead feed.
+  const headPoller =
+    config.HEAD_POLL_MS > 0
+      ? new HeadPoller(store, {
+          ...DEFAULT_HEAD_POLLER_OPTIONS,
+          url: config.FEED_HYPERSYNC_URL,
+          intervalMs: config.HEAD_POLL_MS,
+        })
+      : null;
+  headPoller?.start();
+
   // Shadow measurement. Reads the chain independently and classifies what it
   // finds; it is handed NOTHING from the live pipeline and hands nothing back.
   const shadow = new HyperSyncShadow([...store.wallets.keys()]);
@@ -677,6 +696,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info({ signal }, 'shutting down gracefully');
     listener.stop();
+    headPoller?.stop();
     pendingSignals.stop();
     shadow.stop();
     attribution.stop();

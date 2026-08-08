@@ -52,6 +52,16 @@ export const DASHBOARD_HTML = /* html */ `<!doctype html>
   .tag { font:600 10px/1 ui-sans-serif,system-ui,sans-serif; padding:4px 6px; border-radius:4px; letter-spacing:.015em; }
   .tag.BUY { background:#052e16; color:#86efac; }
   .tag.SELL { background:#4c0519; color:#fda4af; }
+  /* Allocations are deliberately a THIRD colour, not a shade of BUY: they are
+     tokens arriving without a swap, and colouring them like a purchase is the
+     mislabelling this whole rebuild exists to undo. */
+  .tag.XFER { background:#2e1065; color:#d8b4fe; }
+  .ffilter { display:flex; gap:4px; margin-left:8px; }
+  .ffilter button {
+    font:inherit; font-size:11px; padding:1px 7px; cursor:pointer;
+    background:transparent; color:var(--muted); border:1px solid #333; border-radius:3px;
+  }
+  .ffilter button[aria-selected="true"] { color:#fff; border-color:#666; background:#1f1f1f; }
   .tag.ROTATION { background:#3b0764; color:#d8b4fe; }
   .tag.SOLO { background:#422006; color:#fde68a; }
   .tag.ENTRY { background:#14532d; color:#bbf7d0; }
@@ -121,7 +131,7 @@ export const DASHBOARD_HTML = /* html */ `<!doctype html>
   <div class="spacer"></div>
   <div class="metrics">
     <span>block <b id="m-block">–</b></span>
-    <span>rpc <b id="m-rpc">–</b>ms</span>
+    <span title="round trip of the head lookup — HyperSync (free), not the metered chain RPC">head <b id="m-rpc">–</b>ms</span>
     <span>swaps <b id="m-swaps">0</b></span>
     <span>swarms <b id="m-swarms">0</b></span>
     <span>alerts <b id="m-alerts">0</b></span>
@@ -148,8 +158,15 @@ export const DASHBOARD_HTML = /* html */ `<!doctype html>
   </section>
 
   <section class="card">
-    <h2>Live Feed <span class="mono" id="feed-count"></span></h2>
-    <div class="body" id="feed"><div class="empty">waiting for swaps…</div></div>
+    <h2>Live Feed <span class="mono" id="feed-count"></span>
+      <span class="ffilter" id="ffilter">
+        <button data-f="" aria-selected="true">all</button>
+        <button data-f="BUY">buys</button>
+        <button data-f="SELL">sells</button>
+        <button data-f="XFER">transfers</button>
+      </span>
+    </h2>
+    <div class="body" id="feed"><div class="empty">waiting for events…</div></div>
   </section>
 
   <section class="card">
@@ -295,14 +312,31 @@ const athLabel = (s) => {
   return ' · 🏔️ ATH '+usd(s.athMarketCap)+(down!=null?' ('+down+'%)':'');
 };
 
+/**
+ * What KIND of event a feed row is.
+ *
+ * A transfer-in is not a buy. 47e1 called them buys and its cards read
+ * "1 alpha bought @ $101k MC" for what was actually an allocation — on-chain
+ * checks found 0 of 14 winning "buy" receipts contained a swap. The feed shows
+ * all three, each named for what it is.
+ */
+const feedKind = (s) => s.distribution ? 'XFER' : s.direction;
+const FEED_LABEL = { BUY:'BUY', SELL:'SELL', XFER:'TRANSFER' };
+const FEED_NOTE = {
+  BUY:'verified swap in',
+  SELL:'verified swap out',
+  XFER:'tokens received — no swap in the receipt (allocation/airdrop)',
+};
+
 function feedRow(s){
   const d=document.createElement('div'); d.className='row flash';
   const q=quoteFor(s);
+  const k=feedKind(s);
   const value=s.usdValue!=null ? usd(s.usdValue) : q&&q.priceUsd!=null
     ? '~'+usd(q.priceUsd*s.amount) : quoteLabel(q);
-  d.innerHTML='<span class="tag '+s.direction+'">'+s.direction+'</span>'+
+  d.innerHTML='<span class="tag '+k+'" title="'+FEED_NOTE[k]+'">'+FEED_LABEL[k]+'</span>'+
     '<span class="sym">'+s.tokenSymbol+'</span>'+
-    '<span class="grow mono">tracked wallet</span>'+
+    '<span class="grow mono">'+(k==='XFER'?'allocation to tracked wallet':'tracked wallet')+'</span>'+
     '<span class="usd">'+value+'</span>'+
     '<span class="mono">'+time(s.timestamp)+'</span>';
   return d;
@@ -708,11 +742,16 @@ async function loadMuted(){
 function applyStats(m){
   if(!m) return;
   $('m-block').textContent=m.lastBlock||'–';
-  $('m-rpc').textContent=m.rpcLatencyMs==null?'–':m.rpcLatencyMs;
+  // Prefer the head poller's latency: it is what actually keeps the block moving.
+  // Falls back to the chain-RPC probe if someone enables it for an investigation.
+  const lat = m.headLatencyMs != null ? m.headLatencyMs : m.rpcLatencyMs;
+  $('m-rpc').textContent = lat == null ? '–' : lat;
   const mode=$('mode');
   mode.textContent=(m.mode||'').toUpperCase()+(m.wsConnected?' · connected':' · offline');
   mode.className='pill '+(m.mode==='live'?'live':'sim');
 }
+
+let FEED_FILTER='';
 
 // Quotes arrive asynchronously after chain detection. Rebuild these small,
 // bounded lists so a row that first said “pricing…” updates without needing a
@@ -727,8 +766,19 @@ async function loadFeeds(){
     fetch('/api/alerts?limit=30').then(r=>r.json()),
   ]);
   const feed=$('feed'); feed.innerHTML='';
-  if(feedSwaps.length) feedSwaps.slice().reverse().forEach(s=>feed.prepend(feedRow(s)));
-  else feed.innerHTML='<div class="empty">waiting for swaps…</div>';
+  // Counts are of everything received; the list is what the filter selects. A
+  // filter that also hid the count would make an active feed look empty, which
+  // is the failure this panel keeps running into.
+  const counts={BUY:0,SELL:0,XFER:0};
+  feedSwaps.forEach(s=>{counts[feedKind(s)]++;});
+  $('feed-count').textContent=feedSwaps.length
+    ? counts.BUY+' buy · '+counts.SELL+' sell · '+counts.XFER+' transfer'
+    : '';
+  const shown=FEED_FILTER ? feedSwaps.filter(s=>feedKind(s)===FEED_FILTER) : feedSwaps;
+  if(shown.length) shown.slice().reverse().forEach(s=>feed.prepend(feedRow(s)));
+  else feed.innerHTML='<div class="empty">'+(feedSwaps.length
+    ? 'no '+FEED_FILTER.toLowerCase()+' events in the last '+feedSwaps.length+' — try “all”'
+    : 'waiting for events…')+'</div>';
 
   const se=$('swarms'); se.innerHTML='';
   const nc=$('newcoins'); nc.innerHTML='';
@@ -768,13 +818,23 @@ async function boot(){
     finally{ btn.disabled=false; btn.textContent='🔄 Reset'; }
   };
   document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>showTab(t.dataset.tab));
+  document.querySelectorAll('#ffilter button').forEach(b=>b.onclick=()=>{
+    FEED_FILTER=b.dataset.f;
+    document.querySelectorAll('#ffilter button').forEach(x=>x.setAttribute('aria-selected', String(x===b)));
+    void loadFeeds();
+  });
   setInterval(loadTables, 8000);
   setInterval(loadFeeds, 8000);
   setInterval(loadPerformance, 30000);
 
   const es=new EventSource('/events');
-  es.addEventListener('swap', e=>{ const s=JSON.parse(e.data); const f=$('feed'); clearEmpty(f);
-    f.prepend(feedRow(s)); cap(f,60); $('m-swaps').textContent=++swaps; });
+  es.addEventListener('swap', e=>{ const s=JSON.parse(e.data);
+    // Only real swaps move the swaps counter. Transfers appear in the feed but
+    // are not trades, and counting them here would restate an airdrop wave as
+    // trading volume — the same lie in a different place.
+    if(!s.distribution) $('m-swaps').textContent=++swaps;
+    if(FEED_FILTER && feedKind(s)!==FEED_FILTER) return;
+    const f=$('feed'); clearEmpty(f); f.prepend(feedRow(s)); cap(f,60); });
   es.addEventListener('swarm', e=>{ const s=JSON.parse(e.data); const se=$('swarms'); clearEmpty(se);
     $('swarms').prepend(swarmRow(s)); cap($('swarms'),40); $('m-swarms').textContent=++sw;
     if(s.newToken){ const nc=$('newcoins'); clearEmpty(nc); nc.prepend(newCoinRow(s)); cap(nc,40); } });

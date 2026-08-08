@@ -91,13 +91,19 @@ const schema = z.object({
   // block is only useful for dashboard telemetry. Keep the expensive stream
   // off by default on fast L2s.
   CHAIN_WS_INCLUDE_HEADS: bool(false),
-  // Websocket round-trip probe. It asks for the head, so it supplies BOTH the
-  // latency metric and a liveness-independent `lastBlock` — without it the head
-  // only advances when a watched wallet acts, and a quiet hour is indistinguishable
-  // from a stalled feed (measured: 1,000 blocks behind, purely as display).
-  // One request per interval, versus ~10/second for a newHeads subscription on
-  // this chain, which is why the head comes from here rather than from a stream.
+  // Websocket round-trip probe against the METERED chain RPC. It also carries a
+  // head number, but HEAD_POLL_MS below gets the head off-meter for free, so
+  // leave this at 0 unless you are specifically investigating RPC latency.
   CHAIN_WS_LATENCY_PROBE_MS: num(0),
+  // The chain head, polled from HyperSync's free /height (no token required —
+  // the token gates /query). The head must NOT come from the wallet-log stream:
+  // that only fires when a watched wallet acts, so a quiet hour froze the number
+  // while the chain ran on and the feed read as stalled. 0 disables the poller.
+  //
+  // Off-meter by design. A newHeads subscription on a 0.1s-block chain is ~860k
+  // notifications/day, and an Alchemy probe is ~29k requests/day, for a number
+  // that drives nothing but the dashboard.
+  HEAD_POLL_MS: num(3_000),
   CHAIN_ID: z.string().default('4663'),
   CHAIN_MODE: z.enum(['live', 'simulator', 'auto']).default('auto'),
   // HTTP polling cadence (ms) when using the HTTP listener.

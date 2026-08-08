@@ -57,6 +57,14 @@ export interface LatencyMetrics {
   mode: 'live' | 'simulator';
   rpcLatencyMs: number | null;
   lastBlock: number;
+  /**
+   * Round trip of the head lookup, and who answered it. Separate from
+   * `rpcLatencyMs` on purpose: the head comes from a free indexer (HyperSync),
+   * not from the metered chain RPC, and labelling an indexer's latency "rpc"
+   * would misreport what was measured.
+   */
+  headLatencyMs: number | null;
+  headSource: string | null;
   lastEventAt: number | null;
   /**
    * Scan health. `lastBlock` is the chain HEAD — it advances whether or not we
@@ -104,6 +112,8 @@ export class MemoryStore extends EventEmitter {
     mode: config.chainMode,
     rpcLatencyMs: null,
     lastBlock: 0,
+    headLatencyMs: null,
+    headSource: null,
     lastEventAt: null,
     cursor: 0,
     cursorLag: 0,
@@ -312,6 +322,27 @@ export class MemoryStore extends EventEmitter {
       this.tokensBySymbol.delete(oldSymbol);
       this.tokensBySymbol.set(token.symbol, token);
     }
+  }
+
+  /**
+   * Put an event in the feed WITHOUT letting it count as a trade.
+   *
+   * For allocations/transfers: they belong on screen — they are ~90% of what
+   * watched wallets do, and hiding them is what made a busy hour render as an
+   * empty feed — but they must never touch `totals.swaps`, `walletStats` or
+   * `tokenStats`, because those feed the aggregator's swarm maths. Counting an
+   * airdrop as a buy there is precisely the 47e1 behaviour the receipt check
+   * exists to prevent; the fix is to show it honestly, not to promote it.
+   *
+   * `lastEventAt` IS stamped: the listener is demonstrably alive when one of
+   * these arrives, and a feed that looks dead during an allocation wave was the
+   * original complaint.
+   */
+  recordDisplayEvent(e: SwapEvent): void {
+    this.swaps.push(e);
+    this.metrics.lastEventAt = e.timestamp;
+    this.metrics.lastBlock = Math.max(this.metrics.lastBlock, e.blockNumber);
+    this.emit('swap', e);
   }
 
   recordSwap(e: SwapEvent): void {
