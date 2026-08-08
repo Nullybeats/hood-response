@@ -213,8 +213,10 @@ export class MemoryStore extends EventEmitter {
   }
 
   /** Swarm/alert history for the durable snapshot (oldest first). */
-  exportHistory(): { swarms: Swarm[]; alerts: Alert[] } {
-    return { swarms: this.swarms.drain(), alerts: this.alerts.drain() };
+  exportHistory(): { swarms: Swarm[]; alerts: Alert[]; swaps: SwapEvent[] } {
+    // Swaps capped harder than their ring: 2,000 full events would dominate the
+    // snapshot file for a panel that shows a few dozen.
+    return { swarms: this.swarms.drain(), alerts: this.alerts.drain(), swaps: this.swaps.drain().slice(-200) };
   }
 
   /**
@@ -226,9 +228,13 @@ export class MemoryStore extends EventEmitter {
    * could open duplicate positions. Totals are not restored either; they count
    * this process's work and are reported next to `uptimeSeconds`.
    */
-  restoreHistory(swarms: Swarm[], alerts: Alert[]): void {
+  restoreHistory(swarms: Swarm[], alerts: Alert[], swaps: SwapEvent[] = []): void {
     if (swarms.length) this.swarms.restore(swarms);
     if (alerts.length) this.alerts.restore(alerts);
+    // Display-only, like the rest of the history: restored swaps do NOT touch
+    // totals, walletStats or metrics — they are yesterday's news being kept on
+    // screen, not events happening again.
+    if (swaps.length) this.swaps.restore(swaps);
   }
 
   isTracked(wallet: string): boolean {

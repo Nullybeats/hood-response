@@ -1,6 +1,6 @@
 import { readFile, writeFile, rename, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { Alert, Swarm, TrackedToken } from '../types.js';
+import type { Alert, Swarm, TrackedToken, SwapEvent } from '../types.js';
 import { logger } from '../logger.js';
 
 /**
@@ -67,6 +67,12 @@ export interface FeedStateSnapshot {
   tokens: PersistedToken[];
   swarms: Swarm[];
   alerts: Alert[];
+  /** Recent verified swaps, display-only. Absent in older snapshots. Added
+   *  because every redeploy blanked the Live Feed: swarms and alerts survived a
+   *  restart while the swaps beside them vanished, and with verified swaps
+   *  arriving only a few times an hour the panel stayed empty long enough to
+   *  read as an outage. */
+  swaps?: SwapEvent[];
   /** Bounded deferred candidates; replayed after a restart before new blocks. */
   pendingMetadata?: PersistedMetadataCandidate[];
   /** Candidates are data, not alerts: restoring them retries verification but

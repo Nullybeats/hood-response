@@ -138,7 +138,7 @@ async function main(): Promise<void> {
   let resumeCursor: number | null = null;
   if (feedState) {
     const added = store.importTokens(feedState.tokens);
-    store.restoreHistory(feedState.swarms, feedState.alerts);
+    store.restoreHistory(feedState.swarms, feedState.alerts, feedState.swaps ?? []);
     resumeCursor = feedState.cursor;
     logger.info(
       {
@@ -631,6 +631,7 @@ async function main(): Promise<void> {
       tokens: store.exportDiscoveredTokens().map(toPersistedToken),
       swarms: history.swarms,
       alerts: history.alerts,
+      swaps: history.swaps,
       pendingMetadata: listener.pendingMetadata?.() ?? [],
       pendingSignals: pendingSignals.snapshot(),
     });
