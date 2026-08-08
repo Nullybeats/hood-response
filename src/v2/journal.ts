@@ -30,7 +30,7 @@
  * that holds the trade record is not.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { config } from '../config/env.js';
@@ -151,6 +151,45 @@ export class Journal {
     } catch (err) {
       this.stop(`write failed: ${String(err).slice(0, 160)}`);
     }
+  }
+
+  /**
+   * The most recent records of a kind, newest-first.
+   *
+   * Exists so the dashboard survives a restart. The diary is in memory, so every
+   * redeploy blanked the page even though the record on disk was intact — which
+   * during one afternoon of frequent deploys was indistinguishable from "the
+   * pipeline is broken", and cost more time than the feature it was observing.
+   *
+   * Reads the active segment first and walks back through rotated ones only as
+   * far as `limit` requires, so a full journal is never loaded to show a page.
+   */
+  tail(kind: JournalKind, limit: number): JournalRecord[] {
+    if (this.path.length === 0) return [];
+    const out: JournalRecord[] = [];
+    const files = [this.path, ...this.segments().reverse()];
+    for (const file of files) {
+      if (out.length >= limit) break;
+      let text: string;
+      try {
+        if (!existsSync(file)) continue;
+        text = readFileSync(file, 'utf8');
+      } catch {
+        continue;
+      }
+      const lines = text.split('\n');
+      for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+        const line = lines[i];
+        if (!line) continue;
+        try {
+          const rec = JSON.parse(line) as JournalRecord;
+          if (rec.kind === kind && rec.v === JOURNAL_SCHEMA_VERSION) out.push(rec);
+        } catch {
+          // A torn final line is expected when a process died mid-append.
+        }
+      }
+    }
+    return out;
   }
 
   /** Segment files oldest-first. Exposed for the replay harness and for tests. */

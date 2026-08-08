@@ -104,12 +104,44 @@ export class V2Shadow {
 
   start(): void {
     if (!this.enabled || this.timer) return;
+    this.restoreDiary();
     this.timer = setInterval(() => this.drainPending(), this.opts.retryIntervalMs);
     this.timer.unref?.();
     logger.info(
-      { lanes: this.opts.lanes.map((l) => l.id), journal: this.jrnl.enabled },
+      { lanes: this.opts.lanes.map((l) => l.id), journal: this.jrnl.enabled, restored: this.diary.size },
       'v2 shadow: observing verified trades (emits nothing)',
     );
+  }
+
+  /**
+   * Repopulate the diary from the journal on boot.
+   *
+   * The diary is in memory, so a redeploy blanked the dashboard even though the
+   * record on disk was intact — during an afternoon of frequent deploys that was
+   * indistinguishable from a broken pipeline. The journal is the durable copy;
+   * this just makes the page reflect it.
+   *
+   * Restored entries are NOT re-counted as `seen` or `evaluated`: those describe
+   * what this process has done, and inflating them with history would misreport
+   * throughput. Only the readable record comes back.
+   */
+  private restoreDiary(): void {
+    if (!this.jrnl.enabled) return;
+    try {
+      const records = this.jrnl.tail('verdict', 200);
+      // tail() is newest-first; record() unshifts, so replay oldest-first to
+      // preserve ordering.
+      for (const rec of records.reverse()) {
+        const entry = rec.body as DiaryEntry;
+        if (entry?.txHash && entry.outcome) this.diary.record(entry);
+      }
+      if (records.length > 0) {
+        logger.info({ restored: records.length }, 'v2 shadow: diary restored from journal');
+      }
+    } catch (err) {
+      // A page that starts blank is a nuisance; a boot that fails is an outage.
+      logger.warn({ err: String(err).slice(0, 160) }, 'v2 shadow: could not restore diary');
+    }
   }
 
   stop(): void {

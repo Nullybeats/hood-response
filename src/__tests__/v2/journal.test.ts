@@ -148,3 +148,50 @@ describe('Journal', () => {
     expect(j.stoppedBecause).toMatch(/write failed/);
   });
 });
+
+/**
+ * The dashboard reads the in-memory diary, so a redeploy blanked it even though
+ * the record on disk was intact. During an afternoon of frequent deploys that
+ * was indistinguishable from a broken pipeline.
+ */
+describe('Journal.tail', () => {
+  it('returns the most recent records of a kind, newest first', () => {
+    const j = makeJournal();
+    j.write('trade', { n: 1 });
+    j.write('verdict', { n: 1 });
+    j.write('trade', { n: 2 });
+    j.write('verdict', { n: 2 });
+    j.write('verdict', { n: 3 });
+
+    const verdicts = j.tail('verdict', 10);
+    expect(verdicts).toHaveLength(3);
+    expect(verdicts.map((r) => (r.body as { n: number }).n)).toEqual([3, 2, 1]);
+  });
+
+  it('honours the limit without reading more than it needs', () => {
+    const j = makeJournal();
+    for (let i = 0; i < 50; i++) j.write('verdict', { n: i });
+    expect(j.tail('verdict', 5)).toHaveLength(5);
+  });
+
+  it('reads back across rotated segments', () => {
+    const j = makeJournal({ segment: 300 });
+    for (let i = 0; i < 20; i++) j.write('verdict', { n: i, pad: 'x'.repeat(20) });
+    // Rotation happened, so the newest entries alone cannot satisfy this.
+    expect(j.segments().length).toBeGreaterThan(0);
+    expect(j.tail('verdict', 12).length).toBeGreaterThan(1);
+  });
+
+  it('survives a torn final line from a process that died mid-append', () => {
+    const path = join(dir, 'journal-v2.ndjson');
+    const j = makeJournal();
+    j.write('verdict', { n: 1 });
+    writeFileSync(path, readFileSync(path, 'utf8') + '{"seq":9,"at":1,"kind":"verd', { flag: 'w' });
+    expect(() => j.tail('verdict', 10)).not.toThrow();
+    expect(j.tail('verdict', 10)).toHaveLength(1);
+  });
+
+  it('returns nothing when journaling has no path', () => {
+    expect(new Journal({ path: '', enabled: false, maxSegmentBytes: 1, maxTotalBytes: 1 }).tail('verdict', 5)).toEqual([]);
+  });
+});
