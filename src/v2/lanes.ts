@@ -23,11 +23,14 @@
  * silently reading as false — the same discipline as the gate.
  */
 
-import type { CapBand, FactSheet } from './facts/sheet.js';
+import type { WalletTier } from '../types.js';
+import type { CapBand, FactSheet, SheetEventType } from './facts/sheet.js';
 import { isKnown, type Grade } from './facts/types.js';
 import type { ScoreResult } from './score.js';
 
 export type Condition =
+  | { kind: 'eventType'; is: SheetEventType }
+  | { kind: 'seedTierIn'; in: readonly WalletTier[] }
   | { kind: 'walletGrade'; in: readonly Grade[] }
   | { kind: 'firstBuy'; is: boolean }
   | { kind: 'pairAgeHoursBelow'; hours: number }
@@ -77,6 +80,7 @@ export const DEFAULT_LANES: readonly Lane[] = [
     name: 'Earliest entry',
     sentence: "an A or B wallet's first-ever buy of a pair under 48h old, scoring 80+",
     conditions: [
+      { kind: 'eventType', is: 'verified-buy' },
       { kind: 'walletGrade', in: ['A', 'B'] },
       { kind: 'firstBuy', is: true },
       { kind: 'pairAgeHoursBelow', hours: 48 },
@@ -89,6 +93,7 @@ export const DEFAULT_LANES: readonly Lane[] = [
     name: 'Proven wallets',
     sentence: 'any buy by an A-grade wallet, scoring 70+',
     conditions: [
+      { kind: 'eventType', is: 'verified-buy' },
       { kind: 'walletGrade', in: ['A'] },
       { kind: 'scoreAtLeast', score: 70 },
     ],
@@ -99,8 +104,27 @@ export const DEFAULT_LANES: readonly Lane[] = [
     name: 'Crowd confirm',
     sentence: 'two or more watched wallets buying, averaging a B grade or better',
     conditions: [
+      { kind: 'eventType', is: 'verified-buy' },
       { kind: 'crowdSizeAtLeast', n: 2 },
       { kind: 'crowdGpaAtLeast', gpa: 3.0 },
+    ],
+  },
+  {
+    // The 47e1 signal, made explicit. Its winners (222 +435%, CHILL +359%,
+    // UFROG +187%) were all alpha-seed wallets RECEIVING a young low-cap token
+    // — allocations, not buys (verified on-chain). This lane paper-tracks that
+    // exact pattern so it can be measured against 47e1's own call record.
+    // Seed tier, not grade, is deliberate: grades are mostly U while the
+    // outcome record accrues, and the lane would starve for weeks. [config]
+    id: 'allocation',
+    emoji: '🎁',
+    name: 'Allocation',
+    sentence: 'an alpha/beta-seed wallet RECEIVES a token under 48h old at micro/small cap',
+    conditions: [
+      { kind: 'eventType', is: 'distribution' },
+      { kind: 'seedTierIn', in: ['alpha', 'beta'] },
+      { kind: 'pairAgeHoursBelow', hours: 48 },
+      { kind: 'capBand', in: ['micro', 'small'] },
     ],
   },
 ] as const;
@@ -137,6 +161,20 @@ function check(condition: Condition, sheet: FactSheet, score: ScoreResult): Cond
   const r = (outcome: CheckOutcome, detail: string): ConditionResult => ({ condition, outcome, detail });
 
   switch (condition.kind) {
+    case 'eventType': {
+      // Always known — how an event entered is never a mystery. This is the
+      // guard that keeps buy lanes off distributions and vice versa.
+      return sheet.eventType === condition.is
+        ? r('met', sheet.eventType)
+        : r('unmet', `${sheet.eventType}, lane wants ${condition.is}`);
+    }
+    case 'seedTierIn': {
+      if (!isKnown(sheet.walletSeedTier)) return r('unknown', 'wallet not in the seed holder catalog');
+      const t = sheet.walletSeedTier.value;
+      return condition.in.includes(t)
+        ? r('met', `${t}-seed wallet`)
+        : r('unmet', `${t}-seed wallet, needed ${condition.in.join('/')}`);
+    }
     case 'walletGrade': {
       if (!isKnown(sheet.walletGrade)) return r('unknown', `wallet ungraded (${sheet.walletGradeReason})`);
       const g = sheet.walletGrade.value;
@@ -191,6 +229,10 @@ function check(condition: Condition, sheet: FactSheet, score: ScoreResult): Cond
 /** English rendering of a condition, for the dashboard. One implementation, no drift. */
 export function describeCondition(c: Condition): string {
   switch (c.kind) {
+    case 'eventType':
+      return c.is === 'distribution' ? 'wallet RECEIVES the token (allocation)' : c.is.replace('-', ' ');
+    case 'seedTierIn':
+      return `${c.in.join('/')}-seed wallet (holder rank, not a grade)`;
     case 'walletGrade':
       return `wallet graded ${c.in.join(' or ')}`;
     case 'firstBuy':

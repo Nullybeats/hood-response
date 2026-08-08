@@ -33,7 +33,14 @@ export type DiaryOutcome =
   /** Facts unresolved; the gate asked for a retry. */
   | 'waiting'
   /** The gate blocked it — a proven negative, or unresolved past the budget. */
-  | 'blocked';
+  | 'blocked'
+  /**
+   * Recorded for the record, with no buy reasoning run — verified sells. They
+   * were previously counted and invisible, which made an evening of watched
+   * wallets selling indistinguishable from an outage. Also the raw material
+   * the rug radar will read.
+   */
+  | 'observed';
 
 export interface DiaryEntry {
   at: number;
@@ -41,6 +48,8 @@ export interface DiaryEntry {
   tokenSymbol: string;
   wallet: string;
   txHash: string;
+  /** How the event entered: verified-buy | distribution | verified-sell. */
+  eventType: string;
   outcome: DiaryOutcome;
   /** One line, human-first. This is what the dashboard shows. */
   reason: string;
@@ -102,6 +111,7 @@ export function buildEntry(
     tokenSymbol: sheet.tokenSymbol,
     wallet: sheet.wallet,
     txHash: sheet.txHash,
+    eventType: sheet.eventType,
     outcome,
     reason,
     score: score.score,
@@ -171,7 +181,7 @@ export class Diary {
     counts: Record<DiaryOutcome, number>;
     nearMissesByLane: { laneId: string; n: number; examples: string[] }[];
   } {
-    const counts: Record<DiaryOutcome, number> = { matched: 0, skipped: 0, waiting: 0, blocked: 0 };
+    const counts: Record<DiaryOutcome, number> = { matched: 0, skipped: 0, waiting: 0, blocked: 0, observed: 0 };
     const byLane = new Map<string, { n: number; examples: string[] }>();
 
     for (const e of this.entries) {

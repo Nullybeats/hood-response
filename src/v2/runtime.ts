@@ -20,7 +20,7 @@
 
 import { config } from '../config/env.js';
 import { logger } from '../logger.js';
-import type { SwapEvent } from '../types.js';
+import type { SwapEvent, WalletTier } from '../types.js';
 import { buildEntry, Diary, type DiaryEntry } from './diary.js';
 import type { Outcome } from './facts/grade.js';
 import { buildFactSheet, type FactSheet, type SheetInputs } from './facts/sheet.js';
@@ -48,6 +48,8 @@ export interface V2Providers {
   claimFirstBuy(wallet: string, token: string, at: number, block: number): boolean;
   /** How much of the outcome record is usable, for the status endpoint. Optional. */
   outcomeStats?(): { wallets: number; calls: number };
+  /** Static seed holder-rank tier for a wallet, or null when not in the catalog. */
+  seedTier?(wallet: string): WalletTier | null;
   /**
    * Value a token amount at the CURRENT price, for trades whose usdValue was
    * null at detection time. Recovers the `howMuch` dial on new pairs; the fact
@@ -92,7 +94,17 @@ export class V2Shadow {
   /** Per-fact tallies, so "which enrichment is actually landing" is answerable. */
   private coverage = new Map<string, { measured: number; unknown: number; failed: number }>();
   /** What arrived versus what this pipeline acts on. See onSwap. */
-  private readonly intake = { total: 0, unverified: 0, verifiedSells: 0, verifiedBuys: 0 };
+  private readonly intake = {
+    total: 0,
+    unverified: 0,
+    verifiedSells: 0,
+    verifiedBuys: 0,
+    distributions: 0,
+    /** Same-token allocations collapsed by the cooldown — an airdrop wave counted once. */
+    distributionsCooled: 0,
+  };
+  /** Last time a distribution sheet was built per token; the airdrop-wave collapser. */
+  private readonly distSeenAt = new Map<string, number>();
 
   constructor(
     private readonly providers: V2Providers,
@@ -167,12 +179,40 @@ export class V2Shadow {
     // ignored, and the dashboard showed a blank page with no way to tell that
     // from an outage.
     this.intake.total++;
+
+    // Distributions: allocations/airdrops — the 47e1 signal, typed honestly.
+    if (swap.distribution === true) {
+      this.intake.distributions++;
+      // An airdrop wave hits many watched wallets with the same token in the
+      // same minute. One sheet per token per crowd window is the measurement;
+      // 122 identical sheets are a bill (each would warm quotes and safety).
+      const key = swap.token.toLowerCase();
+      const last = this.distSeenAt.get(key) ?? 0;
+      if (Date.now() - last < this.opts.crowdWindowMs) {
+        this.intake.distributionsCooled++;
+        return;
+      }
+      this.distSeenAt.set(key, Date.now());
+      if (this.distSeenAt.size > 2_000) {
+        const oldest = this.distSeenAt.keys().next().value;
+        if (oldest) this.distSeenAt.delete(oldest);
+      }
+      this.seen++;
+      this.jrnl.write('trade', swap);
+      this.evaluate({ trade: swap, firstSeenAt: Date.now(), attempts: 0 }, Date.now());
+      return;
+    }
+
     if (swap.verifiedTrade !== true) {
       this.intake.unverified++;
       return;
     }
     if (swap.direction !== 'BUY') {
+      // A verified sell gets a diary line — 'observed', no buy reasoning — so a
+      // stretch of selling is visible instead of reading as an outage. Also the
+      // raw material the rug radar will consume.
       this.intake.verifiedSells++;
+      this.recordSell(swap);
       return;
     }
     this.intake.verifiedBuys++;
@@ -180,6 +220,29 @@ export class V2Shadow {
     this.markCrowd(swap);
     this.jrnl.write('trade', swap);
     this.evaluate({ trade: swap, firstSeenAt: Date.now(), attempts: 0 }, Date.now());
+  }
+
+  /** Minimal entry for a verified sell: recorded, journaled, never laned or scored. */
+  private recordSell(swap: SwapEvent): void {
+    const usd = swap.usdValue ?? this.providers.usdValueNow?.(swap.token, swap.amount) ?? null;
+    const entry: DiaryEntry = {
+      at: swap.timestamp,
+      token: swap.token.toLowerCase(),
+      tokenSymbol: swap.tokenSymbol,
+      wallet: swap.wallet.toLowerCase(),
+      txHash: swap.txHash,
+      eventType: 'verified-sell',
+      outcome: 'observed',
+      reason: `verified sell${usd != null ? ` — ~$${Math.round(usd).toLocaleString()}` : ''} of ${swap.tokenSymbol}`,
+      score: null,
+      matchedLanes: [],
+      nearMiss: null,
+      lanes: [],
+      configSnapshot: {},
+    };
+    this.jrnl.write('trade', swap);
+    this.jrnl.write('verdict', entry);
+    this.diary.record(entry);
   }
 
   /** Newest-first decisions, for the dashboard. */
@@ -273,8 +336,13 @@ export class V2Shadow {
       crowdWallets: this.crowdFor(trade.token, trade.wallet, now),
       // Claimed once, on first sight; a retry must not re-ask and get `false`
       // the second time, which would erase the very fact it is waiting on.
-      firstBuy: this.firstBuyMemo(trade),
+      // A distribution is not a buy: it must never claim the (wallet, token)
+      // pair in the durable registry, or the wallet's later REAL first buy
+      // would no longer read as first.
+      firstBuy: trade.distribution === true ? false : this.firstBuyMemo(trade),
       rotatedFrom: null,
+      eventType: trade.distribution === true ? 'distribution' : 'verified-buy',
+      seedTier: this.providers.seedTier?.(trade.wallet) ?? null,
       usdValueLate:
         trade.usdValue == null ? (this.providers.usdValueNow?.(trade.token, trade.amount) ?? null) : null,
     };

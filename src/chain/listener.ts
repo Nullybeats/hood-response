@@ -141,6 +141,7 @@ async function buildSwapFromLog(
   // mean a second RPC round-trip for an answer already established here.
   let verifiedTrade: boolean | undefined;
   let verifiedCategory: string | undefined;
+  let isDistribution = false;
   if (strictMode) {
     const verdict = await liveTradeVerifier.verify(log, transfer, match.wallet, match.direction);
     if (config.LIVE_VERIFIED_TRADE_SHADOW) logLiveTradeShadow(transfer.txHash, verdict);
@@ -149,8 +150,23 @@ async function buildSwapFromLog(
     // Shadow preserves today's live calls exactly; the gate is a separate,
     // explicit promotion after a reviewed measurement window.
     if (!verdict.legacyCandidate || (config.LIVE_VERIFIED_TRADE_GATE && !verdict.confirmed)) {
-      receiptDiagnostic(log);
-      return null;
+      // A succeeded, receipt-exact transfer IN with no swap event is a
+      // DISTRIBUTION — an allocation/airdrop/claim. The untouched 47e1 instance
+      // proved these are a signal (its best calls were exactly this, verified
+      // on-chain: 0 of 14 winning "buy" receipts contained a Swap event), and
+      // the receipt check here was silently discarding it. Let the event
+      // continue through metadata/pricing so the v2 shadow can classify it
+      // honestly; the caller (index.ts) diverts it before any legacy store,
+      // aggregator, alert or snipe path sees it.
+      isDistribution =
+        verdict.receiptOk === true &&
+        verdict.exactTransfer === true &&
+        !verdict.legacyCandidate &&
+        match.direction === 'BUY';
+      if (!isDistribution) {
+        receiptDiagnostic(log);
+        return null;
+      }
     }
   } else if (!(await receiptConfirmsSwap(log, transfer))) {
     receiptDiagnostic(log);
@@ -180,6 +196,7 @@ async function buildSwapFromLog(
     timestamp: Date.now(),
     verifiedTrade,
     verifiedCategory,
+    distribution: isDistribution || undefined,
   };
 }
 

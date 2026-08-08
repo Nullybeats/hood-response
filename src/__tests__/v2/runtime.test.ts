@@ -88,10 +88,77 @@ describe('V2Shadow', () => {
     expect(shadow.diary.size).toBe(1);
   });
 
-  it('ignores sells — this pipeline reasons about buying', () => {
+  /** Sells are recorded, never reasoned about: an evening of selling must be visible, not blank. */
+  it('records a verified sell as observed, with no lanes run', () => {
     shadow = makeShadow();
-    shadow.onSwap(swap({ direction: 'SELL' }));
-    expect(shadow.diary.size).toBe(0);
+    shadow.onSwap(swap({ direction: 'SELL', usdValue: 1100 }));
+    expect(shadow.diary.size).toBe(1);
+    const entry = shadow.diary.recent(1)[0]!;
+    expect(entry.outcome).toBe('observed');
+    expect(entry.eventType).toBe('verified-sell');
+    expect(entry.reason).toMatch(/verified sell/);
+    expect(entry.matchedLanes).toEqual([]);
+    expect(entry.lanes).toEqual([]);
+  });
+
+  describe('distributions — the 47e1 signal', () => {
+    const dist = (over: Partial<SwapEvent> = {}) =>
+      swap({ verifiedTrade: false, distribution: true, verifiedCategory: 'no_successful_swap_receipt', ...over });
+
+    it('evaluates a distribution through the full pipeline as its own event type', () => {
+      shadow = makeShadow(providers({ seedTier: () => 'alpha' }));
+      shadow.onSwap(dist());
+      const entry = shadow.diary.recent(1)[0]!;
+      expect(entry.eventType).toBe('distribution');
+      // alpha-seed wallet, 3h pair, 80k cap → the Allocation lane must match.
+      expect(entry.matchedLanes).toContain('allocation');
+      expect(entry.outcome).toBe('matched');
+    });
+
+    it('never lets a buy lane fire on a distribution', () => {
+      shadow = makeShadow(providers({ seedTier: () => 'alpha' }));
+      shadow.onSwap(dist());
+      const entry = shadow.diary.recent(1)[0]!;
+      for (const lane of entry.lanes) {
+        if (lane.laneId === 'allocation') continue;
+        expect(lane.matched, `${lane.laneId} must not match a distribution`).toBe(false);
+      }
+    });
+
+    it('does not match Allocation for an unseeded wallet, and says why', () => {
+      shadow = makeShadow(providers({ seedTier: () => null }));
+      shadow.onSwap(dist());
+      const entry = shadow.diary.recent(1)[0]!;
+      const alloc = entry.lanes.find((l) => l.laneId === 'allocation')!;
+      expect(alloc.matched).toBe(false);
+      expect(alloc.blockedByUnknown).toBe(true);
+      expect(alloc.reason).toMatch(/seed holder catalog/);
+    });
+
+    /** A distribution is not a buy: it must never consume the wallet's real first-buy. */
+    it('never claims the first-buy registry for a distribution', () => {
+      let claims = 0;
+      shadow = makeShadow(providers({ seedTier: () => 'alpha', claimFirstBuy: () => { claims++; return true; } }));
+      shadow.onSwap(dist());
+      expect(claims).toBe(0);
+    });
+
+    /** The airdrop-wave collapser: 122 recipients of one token = one sheet. */
+    it('cools repeat distributions of the same token inside the crowd window', () => {
+      shadow = makeShadow(providers({ seedTier: () => 'alpha' }));
+      for (let i = 0; i < 10; i++) shadow.onSwap(dist({ wallet: '0xw' + i, txHash: '0xd' + i }));
+      const st = shadow.status() as { intake: { distributions: number; distributionsCooled: number } };
+      expect(st.intake.distributions).toBe(10);
+      expect(st.intake.distributionsCooled).toBe(9);
+      expect(shadow.diary.size).toBe(1);
+    });
+
+    it('does not cool distributions of DIFFERENT tokens', () => {
+      shadow = makeShadow(providers({ seedTier: () => 'alpha' }));
+      shadow.onSwap(dist({ token: '0xtok1', txHash: '0xd1' }));
+      shadow.onSwap(dist({ token: '0xtok2', txHash: '0xd2' }));
+      expect(shadow.diary.size).toBe(2);
+    });
   });
 
   it('records a verdict for every accepted trade', () => {

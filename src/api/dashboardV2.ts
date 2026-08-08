@@ -71,6 +71,8 @@ export const DASHBOARD_V2_HTML = `<!doctype html>
   .b-skipped { background: transparent; }
   .b-waiting { background: var(--amber); color: #0a0a0a; }
   .b-blocked { background: var(--red); color: #fff; }
+  .b-observed { background: var(--blue); color: #0a0a0a; }
+  .ev { font-size: 12px; margin-right: 2px; }
   .row {
     display: flex; gap: 10px; align-items: baseline;
     padding: 8px 0; border-bottom: 1px dashed var(--muted);
@@ -113,6 +115,7 @@ export const DASHBOARD_V2_HTML = `<!doctype html>
         <button class="tab" data-o="skipped">Skipped</button>
         <button class="tab" data-o="waiting">Waiting</button>
         <button class="tab" data-o="blocked">Blocked</button>
+        <button class="tab" data-o="observed">Sells</button>
       </div>
       <div id="decisions"><div class="reason">loading…</div></div>
     </div>
@@ -164,23 +167,26 @@ async function load() {
     ['skipped', c.skipped, ''],
     ['waiting', c.waiting, ''],
     ['blocked', c.blocked, ''],
-    ['buys seen', status.seen, ''],
-    ['sells ignored', (status.intake || {}).verifiedSells, ''],
+    ['evaluated', status.seen, ''],
+    ['🎁 allocs', (status.intake || {}).distributions, ''],
+    ['sells', (status.intake || {}).verifiedSells, ''],
     ['pending', status.pending, ''],
   ].map(([k, n, cls]) => '<div class="tile ' + cls + '"><div class="n">' + (n ?? 0) + '</div><div class="k">' + k + '</div></div>').join('');
 
   const ix = status.intake || {};
   const rows = (decisions.decisions || []);
   const emptyMsg = ix.total
-    ? 'No decisions yet — but the pipeline IS receiving traffic: ' + ix.total + ' swaps seen, ' +
-      ix.verifiedSells + ' verified SELLS (this brain reasons about buying, so those are ignored by design), ' +
-      ix.unverified + ' unverified, ' + ix.verifiedBuys + ' verified buys. A stretch of selling produces no decisions and is not a fault.'
-    : 'No swaps have reached the pipeline yet. Only strictly-verified trades enter, and roughly 1.5% of watched-wallet activity qualifies.';
+    ? 'No decisions yet — but the pipeline IS receiving traffic: ' + ix.total + ' events seen (' +
+      (ix.distributions ?? 0) + ' allocations, ' + (ix.verifiedSells ?? 0) + ' verified sells, ' +
+      (ix.verifiedBuys ?? 0) + ' verified buys, ' + (ix.unverified ?? 0) + ' unverified).'
+    : 'No events have reached the pipeline yet. Verified trades AND allocations (transfers-in) enter it; decisions appear here as they arrive.';
   $('decisions').innerHTML = rows.length === 0
     ? '<div class="reason">' + esc(emptyMsg) + '</div>'
     : rows.map((d) =>
         '<div class="row">' +
           '<span class="badge b-' + esc(d.outcome) + '">' + esc(d.outcome) + '</span>' +
+          '<span class="ev" title="' + esc(d.eventType || 'verified-buy') + '">' +
+            (d.eventType === 'distribution' ? '🎁' : d.eventType === 'verified-sell' ? '🔻' : '🟢') + '</span>' +
           '<span class="sym">' + esc(d.tokenSymbol) + '</span>' +
           '<span class="score">' + (d.score == null ? '—' : d.score) + '</span>' +
           '<span class="reason">' + esc(d.reason) + '</span>' +

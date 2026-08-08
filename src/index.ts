@@ -339,6 +339,9 @@ async function main(): Promise<void> {
     // which is unknown rather than bad.
     outcomes: (wallet) => walletOutcomes.for(wallet),
     claimFirstBuy: (wallet, token, at, block) => firstBuyRegistry.claim(wallet, token, at, block),
+    // Static holder-rank tier for the Allocation lane. Labelled seed data on
+    // the sheet — a hint from who held bags at catalog time, never a grade.
+    seedTier: (wallet) => store.wallets.get(wallet.toLowerCase())?.tier ?? null,
     // Recovers the buy-size dial on brand-new pairs, whose usdValue is null at
     // detection because the pair had no price yet. Sourced as a later price, not
     // as the executed value.
@@ -527,6 +530,21 @@ async function main(): Promise<void> {
     if (config.ignoreSymbols.has(swap.tokenSymbol.toUpperCase())) return;
     // Auto-register unknown tokens so brand-new coins flow through the pipeline.
     store.ensureToken(swap.token, swap.tokenSymbol);
+    // DISTRIBUTIONS divert to the v2 shadow here, before ANY legacy processing.
+    // They are allocations/airdrops, not trades: recording them in the store or
+    // feeding the aggregator would resurrect the exact airdrops-as-buys
+    // behaviour the receipt check was added to kill (the 47e1 instance still
+    // has it, which is both why its calls look plentiful and why its "bought @"
+    // cards are fiction). ensureToken above is deliberate — the price oracle
+    // can only quote tokens the store knows about.
+    if (swap.distribution === true) {
+      try {
+        v2Shadow.onSwap(swap);
+      } catch (err) {
+        logger.warn({ err: String(err).slice(0, 200) }, 'v2 shadow: distribution evaluation failed');
+      }
+      return;
+    }
     // Log only meaningful (non-dust) live buys/sells — these wallets can be very
     // active in low-value tokenised assets, which would otherwise flood the log.
     if (config.chainMode === 'live' && (swap.usdValue ?? 0) >= config.IGNORE_DUST_USD) {

@@ -22,8 +22,20 @@
  * Every field is a `Fact`, so "we did not check" can never be read as "fine".
  */
 
+import type { WalletTier } from '../../types.js';
 import { gradeWallet, crowdGpa, type Outcome } from './grade.js';
 import { measured, unknown, type Fact, type Grade } from './types.js';
+
+/**
+ * What kind of event this sheet describes. A plain field, not a Fact — the
+ * pipeline always knows how an event entered.
+ *
+ * 'distribution' exists because of the 47e1 finding: the untouched instance's
+ * best calls (+435%, +359%) were top-seed wallets RECEIVING fresh allocations,
+ * not buying. Calling those "buys" was a lie; discarding them was a waste. A
+ * typed event keeps the fact honest and the signal.
+ */
+export type SheetEventType = 'verified-buy' | 'distribution' | 'verified-sell';
 
 /** Market-cap band. Named rather than numeric so a lane reads as a sentence. */
 export type CapBand = 'micro' | 'small' | 'mid' | 'large';
@@ -80,6 +92,16 @@ export interface SheetInputs {
   firstBuy: boolean;
   /** Token this wallet sold to fund the buy, when the rotation was established. */
   rotatedFrom: string | null;
+  /** How the event entered the pipeline. Defaults to 'verified-buy'. */
+  eventType?: SheetEventType;
+  /**
+   * Static holder-rank tier (alpha/beta/chroma/delta) from the seed catalog, or
+   * null when the wallet is not in it. Honest sourcing: this is NOT a measured
+   * grade — it is who held a big bag when the catalog was generated. It exists
+   * because the allocation signal keyed on alpha/beta seed wallets and measured
+   * grades are still mostly U; [config] until grades mature, then tighten.
+   */
+  seedTier?: WalletTier | null;
   /**
    * USD value of the buy when the trade itself carried none.
    *
@@ -100,8 +122,11 @@ export interface FactSheet {
   blockNumber: number;
   at: number;
   venue: string;
+  eventType: SheetEventType;
 
   walletGrade: Fact<Grade>;
+  /** Seed holder-rank tier — labelled as seed data, never passed off as a grade. */
+  walletSeedTier: Fact<WalletTier>;
   /** Human-readable justification of the grade, for the card and the report page. */
   walletGradeReason: string;
   firstBuy: Fact<boolean>;
@@ -138,6 +163,7 @@ export function buildFactSheet(trade: VerifiedTrade, inputs: SheetInputs, now: n
     blockNumber: trade.blockNumber,
     at: trade.at,
     venue: trade.venue,
+    eventType: inputs.eventType ?? 'verified-buy',
 
     // `U` is a genuine gap in evidence, so it is reported as unknown rather than
     // as a grade — a wallet without a record must never be scored as average.
@@ -146,6 +172,11 @@ export function buildFactSheet(trade: VerifiedTrade, inputs: SheetInputs, now: n
         ? unknown<Grade>(graded.reason, 'outcomes')
         : measured(graded.grade, 'outcomes'),
     walletGradeReason: graded.reason,
+
+    walletSeedTier:
+      inputs.seedTier == null
+        ? unknown<WalletTier>('wallet is not in the seed holder catalog')
+        : measured(inputs.seedTier, 'holder-rank-seed'),
 
     // firstBuy is measured only when the durable registry answered. A disabled
     // registry yields `false`, which is the conservative reading; see firstBuy.ts.

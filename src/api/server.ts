@@ -209,11 +209,12 @@ export async function buildServer(
     if (!v2) return { enabled: false, decisions: [] };
     const q = req.query as { limit?: string; outcome?: string };
     const limit = Math.min(Number(q.limit) || 100, 500);
-    const outcome = q.outcome as 'matched' | 'skipped' | 'waiting' | 'blocked' | undefined;
+    const outcome = q.outcome as 'matched' | 'skipped' | 'waiting' | 'blocked' | 'observed' | undefined;
     const entries = v2.diary.recent(limit, outcome).map((e) => ({
       at: e.at,
       token: e.token,
       tokenSymbol: e.tokenSymbol,
+      eventType: e.eventType ?? 'verified-buy',
       outcome: e.outcome,
       reason: e.reason,
       score: e.score,

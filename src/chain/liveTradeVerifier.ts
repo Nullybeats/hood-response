@@ -22,6 +22,16 @@ export interface LiveTradeVerdict {
   confirmed: boolean;
   category: string;
   reason: string;
+  /**
+   * The two facts that distinguish an allocation from garbage, carried out of
+   * the verifier because the listener cannot re-derive them without refetching
+   * the receipt. A DISTRIBUTION (allocation/airdrop worth routing to the v2
+   * shadow) is: receipt succeeded, the trigger transfer is genuinely in it, and
+   * there is no swap event. A reverted tx or a transfer absent from its own
+   * receipt is neither a trade nor a distribution — it is nothing.
+   */
+  receiptOk?: boolean;
+  exactTransfer?: boolean;
 }
 
 export type V4PoolMembershipResolver = (poolId: string, token: string) => Promise<'verified' | 'mismatch' | 'pending'>;
@@ -151,9 +161,12 @@ export class LiveTradeVerifier {
   async verify(log: EthLog, transfer: DecodedTransfer, wallet: string, direction: Direction): Promise<LiveTradeVerdict> {
     const bundle = await this.bundle(transfer.txHash);
     if (!bundle) return { legacyCandidate: false, confirmed: false, category: 'no_receipt_available', reason: 'receipt or transaction unavailable' };
+    // Stamped on every bundle-backed verdict below via `facts`: the listener
+    // needs these to tell a distribution from a revert without a second fetch.
     const exact = exactReceiptTransfer(bundle.receipt, log);
+    const facts = { receiptOk: bundle.receipt.status === '0x1', exactTransfer: exact };
     if (bundle.receipt.status !== '0x1' || !exact) {
-      return verifiedTransferVerdict(toContext(bundle, transfer, wallet, new Set()), transfer, direction, exact);
+      return { ...verifiedTransferVerdict(toContext(bundle, transfer, wallet, new Set()), transfer, direction, exact), ...facts };
     }
 
     const provisional = toContext(bundle, transfer, wallet, new Set());
@@ -193,6 +206,7 @@ export class LiveTradeVerifier {
           reason: pending
             ? 'canonical V4 PoolKey provenance is not available yet'
             : 'no canonical V4 PoolKey in this transaction contains the trigger token',
+          ...facts,
         };
       }
     }
@@ -203,7 +217,7 @@ export class LiveTradeVerifier {
       const deltas = await this.traceNativeDeltas(transfer.txHash, wallet);
       verdict = verifiedTransferVerdict(ctx, transfer, direction, exact, deltas);
     }
-    return verdict;
+    return { ...verdict, ...facts };
   }
 
   private async bundle(txHash: string): Promise<Bundle | null> {

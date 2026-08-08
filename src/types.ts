@@ -88,6 +88,18 @@ export interface SwapEvent {
   verifiedTrade?: boolean;
   /** The strict classifier's category, e.g. 'swap_v4_poolmanager'. For the fact sheet's venue. */
   verifiedCategory?: string;
+  /**
+   * True for a receipt-confirmed transfer IN with no swap event in the receipt —
+   * an allocation/airdrop/claim, not a purchase.
+   *
+   * Exists because the untouched 47e1 instance kept alerting on these as "buys"
+   * and its best calls (+435%, +359%) were EXACTLY this: top-seed wallets
+   * receiving fresh tokens before pumps (verified on-chain 2026-08-08 — 0 of 14
+   * trigger receipts contained a Swap event). Newer code correctly refused to
+   * call them buys, but discarded the signal instead of reclassifying it. These
+   * events flow ONLY to the v2 shadow — never into legacy stores or alerts.
+   */
+  distribution?: boolean;
 }
 
 /** Breakdown of the 0..100 conviction score for a detected swarm. */
