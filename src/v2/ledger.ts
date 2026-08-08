@@ -34,6 +34,7 @@ import { config } from '../config/env.js';
 import { logger } from '../logger.js';
 import type { WalletTier } from '../types.js';
 import type { CapBand } from './facts/sheet.js';
+import type { Grade } from './facts/types.js';
 
 /** What the ledger needs to value a token. Injected, like every other v2 provider. */
 export interface LedgerPrice {
@@ -43,17 +44,41 @@ export interface LedgerPrice {
   refreshNow(token: string): Promise<unknown>;
 }
 
-/** One lane match, followed until it closes. */
+/** One evaluated event, followed until it closes. */
 export interface LedgerRecord {
-  /** txHash — one record per matched trade, however many lanes it hit. */
+  /** txHash — one record per trade, however many lanes it hit. */
   id: string;
   token: string;
   tokenSymbol: string;
-  /** Every lane that matched. A record counts in EACH lane's bucket. */
+  /** Every lane that matched. EMPTY is normal — see `matched`. */
   lanes: string[];
+  /**
+   * Whether any lane wanted this. False records are the control group: without
+   * them "the lane picks winners" is unfalsifiable, because we would only ever
+   * measure what the lane already chose.
+   *
+   * They also break a circularity. Grades come from outcomes, outcomes came only
+   * from matches, and two lanes need a grade to match — so no wallet could ever
+   * earn its first grade. Recording every verdict is what lets a wallet OUTSIDE
+   * the 122-wallet seed catalog accumulate a record at all.
+   */
+  matched: boolean;
   eventType: string;
-  /** Opaque-ish: the wallet is already in the journal, this is for cohort math only. */
+  /** Lowercased address. The grading index keys on it; the API strips it. */
   wallet: string;
+  /**
+   * Every distinct watched wallet in the cohort window, not just the trigger.
+   * `cohortSize` alone cannot attribute a wave's outcome to its participants.
+   */
+  cohortWallets: string[];
+  /**
+   * The grade this wallet held WHEN THE RECORD OPENED — never recomputed.
+   *
+   * This is what makes a grade falsifiable: if records fired by A-graded wallets
+   * do not outperform D-graded ones, the grade is noise and must not gate buys.
+   * Comparing against today's grade instead would be circular.
+   */
+  walletGradeAtFire: Grade;
   score: number | null;
   seedTier: WalletTier | null;
   capBand: CapBand | null;
@@ -190,15 +215,21 @@ function ageBand(hours: number | null): string {
 const AGE_BANDS = ['<1h', '1-3h', '3-12h', '12-48h', '48h+', 'unknown'];
 const CAP_BANDS_ORDER: (CapBand | 'unknown')[] = ['micro', 'small', 'mid', 'large', 'unknown'];
 const TIERS: (WalletTier | 'unseeded')[] = ['alpha', 'beta', 'chroma', 'delta', 'unseeded'];
+const GRADES: Grade[] = ['A', 'B', 'C', 'D', 'F', 'U'];
 
 /** What a caller must supply to open a record. */
 export interface LedgerEntryInput {
   txHash: string;
   token: string;
   tokenSymbol: string;
+  /** Lanes that matched. Empty is normal and expected — see LedgerRecord.matched. */
   lanes: string[];
   eventType: string;
   wallet: string;
+  /** Cohort members known at open time; grows later via noteCohort. */
+  cohortWallets?: string[];
+  /** The wallet's grade at fire time. 'U' when ungraded, which is most of them. */
+  walletGradeAtFire?: Grade;
   score: number | null;
   seedTier: WalletTier | null;
   capBand: CapBand | null;
@@ -225,11 +256,14 @@ export class OutcomeLedger {
   ) {}
 
   /**
-   * Open a record for a matched decision.
+   * Open a record for an evaluated decision, matched or not.
    *
    * Idempotent per txHash: a trade re-evaluated by the retry queue must not
-   * open a second record, or a single match would be counted twice in every
-   * bucket. If the later evaluation matched MORE lanes, those are merged in.
+   * open a second record, or one decision would be counted twice in every
+   * bucket. A later evaluation may match MORE lanes — those are merged in, and
+   * a record that started unmatched is promoted, since a sheet legitimately
+   * goes waiting → matched once its facts land. It is never demoted: a lane DID
+   * want it, and erasing that would rewrite history.
    */
   open(input: LedgerEntryInput, now: number): void {
     const existing = this.records.get(input.txHash);
@@ -237,6 +271,7 @@ export class OutcomeLedger {
       for (const lane of input.lanes) {
         if (!existing.lanes.includes(lane)) existing.lanes.push(lane);
       }
+      if (input.lanes.length > 0) existing.matched = true;
       return;
     }
     // A price we already hold is a true entry; otherwise the record opens
@@ -248,8 +283,11 @@ export class OutcomeLedger {
       token: input.token.toLowerCase(),
       tokenSymbol: input.tokenSymbol,
       lanes: [...input.lanes],
+      matched: input.lanes.length > 0,
       eventType: input.eventType,
       wallet: input.wallet.toLowerCase(),
+      cohortWallets: (input.cohortWallets ?? [input.wallet]).map((w) => w.toLowerCase()),
+      walletGradeAtFire: input.walletGradeAtFire ?? 'U',
       score: input.score,
       seedTier: input.seedTier,
       capBand: input.capBand,
@@ -276,16 +314,23 @@ export class OutcomeLedger {
   }
 
   /**
-   * Record how many distinct watched wallets touched this token in the window.
+   * Record the distinct watched wallets that touched this token in the window.
    *
-   * Called as the wave arrives, AFTER the record opened — a match fires on the
+   * Called as the wave arrives, AFTER the record opened — a decision fires on the
    * first event, when a wave of one and a wave of forty look identical. Only ever
    * grows, so a later quiet window cannot erase a wave that happened.
+   *
+   * Members are kept, not just the count: an outcome has to be attributable to
+   * every wallet in the wave, or grading can only ever credit whichever wallet
+   * happened to trigger first.
    */
-  noteCohort(token: string, size: number): void {
+  noteCohort(token: string, wallets: readonly string[]): void {
     const key = token.toLowerCase();
+    const members = wallets.map((w) => w.toLowerCase());
     for (const r of this.records.values()) {
-      if (r.token === key && !r.closed && size > r.cohortSize) r.cohortSize = size;
+      if (r.token !== key || r.closed) continue;
+      for (const w of members) if (!r.cohortWallets.includes(w)) r.cohortWallets.push(w);
+      if (r.cohortWallets.length > r.cohortSize) r.cohortSize = r.cohortWallets.length;
     }
   }
 
@@ -419,6 +464,8 @@ export class OutcomeLedger {
     total: number;
     open: number;
     priced: number;
+    /** How many of `total` any lane actually wanted. The rest are the control group. */
+    matched: number;
     winThresholdPct: number;
     trackHours: number;
     byLane: LedgerBucket[];
@@ -427,6 +474,8 @@ export class OutcomeLedger {
     byPairAge: LedgerBucket[];
     byCohort: LedgerBucket[];
     byEventType: LedgerBucket[];
+    byMatched: LedgerBucket[];
+    byWalletGrade: LedgerBucket[];
   } {
     const all = [...this.records.values()];
     const win = this.opts.winThresholdPct;
@@ -435,6 +484,7 @@ export class OutcomeLedger {
       total: all.length,
       open: all.filter((r) => !r.closed).length,
       priced: all.filter((r) => r.entryPrice != null).length,
+      matched: all.filter((r) => r.matched).length,
       winThresholdPct: win,
       trackHours: this.opts.trackHours,
       byLane: laneIds.map((id) => bucket(id, all.filter((r) => r.lanes.includes(id)), win)),
@@ -453,6 +503,19 @@ export class OutcomeLedger {
       byEventType: [...new Set(all.map((r) => r.eventType))].sort().map((t) =>
         bucket(t, all.filter((r) => r.eventType === t), win),
       ),
+      // The control group. If matched and unmatched perform the same, the lanes
+      // are decoration — and that claim is only checkable because unmatched
+      // decisions are recorded too.
+      byMatched: [
+        bucket('matched a lane', all.filter((r) => r.matched), win),
+        bucket('no lane matched', all.filter((r) => !r.matched), win),
+      ],
+      // Is the grade real? Compared on the grade held AT FIRE, so a wallet's
+      // later grade cannot leak backwards into its own evidence. If A ≈ D here,
+      // the grade is noise and must not gate a buy.
+      byWalletGrade: GRADES.map((g) =>
+        bucket(g, all.filter((r) => (r.walletGradeAtFire ?? 'U') === g), win),
+      ),
     };
   }
 
@@ -463,7 +526,18 @@ export class OutcomeLedger {
       const raw = await readFile(this.opts.storePath, 'utf8');
       const arr = JSON.parse(raw) as unknown;
       if (!Array.isArray(arr)) return;
-      for (const r of arr as LedgerRecord[]) if (r && r.id) this.records.set(r.id, r);
+      for (const r of arr as LedgerRecord[]) {
+        if (!r || !r.id) continue;
+        // Backfill fields added after these records were written. `matched` is
+        // the one that matters: every record predating it WAS a match (the
+        // ledger only followed matches then), and defaulting it to false would
+        // file real matches under the control group and corrupt the very
+        // comparison the control group exists for.
+        if (r.matched === undefined) r.matched = (r.lanes?.length ?? 0) > 0;
+        if (!r.cohortWallets) r.cohortWallets = r.wallet ? [r.wallet] : [];
+        if (!r.walletGradeAtFire) r.walletGradeAtFire = 'U';
+        this.records.set(r.id, r);
+      }
       logger.info({ loaded: this.records.size }, 'v2 ledger: restored snapshot');
     } catch (err) {
       const e = err as NodeJS.ErrnoException;

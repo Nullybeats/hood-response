@@ -88,6 +88,18 @@ export interface SheetInputs {
   outcomesByWallet: ReadonlyMap<string, readonly Outcome[]>;
   /** Other watched wallets that bought this token inside the crowd window. */
   crowdWallets: readonly string[];
+  /**
+   * Distinct watched wallets that TOUCHED this token in the window, by buying or
+   * by being allocated it.
+   *
+   * Deliberately separate from `crowdWallets`: that one describes wallets which
+   * CHOSE to buy and feeds crowdSize/crowdGpa, and folding allocation recipients
+   * into it would restate "forty wallets were airdropped" as "forty wallets
+   * bought" — the exact 47e1 lie. This one exists so a lane can tell a single
+   * deliberate seeding from a mass airdrop, which 47e1's record says is the
+   * difference between a 90% and a 0% win rate.
+   */
+  cohortSize?: number;
   /** Whether this (wallet, token) pair had never been claimed before. */
   firstBuy: boolean;
   /** Token this wallet sold to fund the buy, when the rotation was established. */
@@ -136,6 +148,8 @@ export interface FactSheet {
   canSell: Fact<boolean>;
   buyUsd: Fact<number>;
   crowdSize: Fact<number>;
+  /** Watched wallets that touched the token at all — buys AND allocations. */
+  cohortSize: Fact<number>;
   /** Grade-point average of the crowd. Unknown when nobody in it is graded. */
   crowdGpa: Fact<number>;
   rotatedFrom: Fact<string>;
@@ -212,6 +226,7 @@ export function buildFactSheet(trade: VerifiedTrade, inputs: SheetInputs, now: n
           : unknown<number>('no price for this pair, at trade time or since'),
 
     crowdSize: measured(inputs.crowdWallets.length, 'crowd-window'),
+    cohortSize: measured(inputs.cohortSize ?? inputs.crowdWallets.length, 'cohort-window'),
     crowdGpa:
       gpa.gpa == null
         ? unknown<number>(`no graded wallets among ${gpa.ungraded} in the crowd`)

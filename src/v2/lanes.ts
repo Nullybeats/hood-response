@@ -37,6 +37,17 @@ export type Condition =
   | { kind: 'capBand'; in: readonly CapBand[] }
   | { kind: 'crowdSizeAtLeast'; n: number }
   | { kind: 'crowdGpaAtLeast'; gpa: number }
+  /**
+   * A ceiling on how many watched wallets touched the token in the window.
+   *
+   * The mirror of `crowdSizeAtLeast`, and it exists because 47e1's record says
+   * the two are opposite signals: solo allocations won 90% of the time averaging
+   * +234%, while multi-wallet ones won 0%. One leaderboard wallet being seeded is
+   * a launch team's deliberate act; forty wallets receiving the same token in the
+   * same minute is a marketing airdrop. Without this the lane cannot tell them
+   * apart, and the airdrops are the bulk of the volume.
+   */
+  | { kind: 'cohortAtMost'; n: number }
   | { kind: 'scoreAtLeast'; score: number };
 
 export interface Lane {
@@ -116,15 +127,28 @@ export const DEFAULT_LANES: readonly Lane[] = [
     // exact pattern so it can be measured against 47e1's own call record.
     // Seed tier, not grade, is deliberate: grades are mostly U while the
     // outcome record accrues, and the lane would starve for weeks. [config]
+    //
+    // SOLO is load-bearing, not a threshold to nudge. In 47e1's record a single
+    // seeded wallet won 90% of the time (+234% average) and two or more won 0%.
+    // Those are different events wearing the same shape: a deliberate seeding
+    // versus a marketing airdrop. Without `cohortAtMost` the lane matched both,
+    // which is most of why it fired ~17 times an hour against 47e1's ~1.9.
+    //
+    // The score floor is the other half. A matched allocation could carry a null
+    // score, which downstream renders as "—" and silently suppresses the alert
+    // tier entirely — a signal that fires and is never seen.
     id: 'allocation',
     emoji: '🎁',
     name: 'Allocation',
-    sentence: 'an alpha/beta-seed wallet RECEIVES a token under 48h old at micro/small cap',
+    sentence:
+      'ONE alpha/beta-seed wallet RECEIVES a token under 48h old at micro/small cap, scoring 60+',
     conditions: [
       { kind: 'eventType', is: 'distribution' },
       { kind: 'seedTierIn', in: ['alpha', 'beta'] },
+      { kind: 'cohortAtMost', n: 1 },
       { kind: 'pairAgeHoursBelow', hours: 48 },
       { kind: 'capBand', in: ['micro', 'small'] },
+      { kind: 'scoreAtLeast', score: 60 },
     ],
   },
 ] as const;
@@ -208,6 +232,15 @@ function check(condition: Condition, sheet: FactSheet, score: ScoreResult): Cond
         ? r('met', `${n} wallets`)
         : r('unmet', `${n} wallet(s), needed ${condition.n}`);
     }
+    case 'cohortAtMost': {
+      // cohortSize, NOT crowdSize: crowdSize counts wallets that chose to buy
+      // and is always 1 for an allocation, which would make this condition a
+      // silent no-op on the exact event type it exists to filter.
+      const n = sheet.cohortSize.value ?? 1;
+      return n <= condition.n
+        ? r('met', n === 1 ? 'solo' : `${n} wallets`)
+        : r('unmet', `${n} wallets in the window, needed at most ${condition.n}`);
+    }
     case 'crowdGpaAtLeast': {
       if (!isKnown(sheet.crowdGpa)) return r('unknown', 'no graded wallets in the crowd');
       const g = sheet.crowdGpa.value;
@@ -243,6 +276,8 @@ export function describeCondition(c: Condition): string {
       return `${c.in.join(' or ')} market cap`;
     case 'crowdSizeAtLeast':
       return `at least ${c.n} watched wallets`;
+    case 'cohortAtMost':
+      return c.n === 1 ? 'no other watched wallet in the window (solo)' : `at most ${c.n} watched wallets`;
     case 'crowdGpaAtLeast':
       return `crowd averaging ${c.gpa.toFixed(1)} GPA`;
     case 'scoreAtLeast':

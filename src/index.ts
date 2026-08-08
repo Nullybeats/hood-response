@@ -260,7 +260,6 @@ async function main(): Promise<void> {
   // — which is why none of them fetch. Blocking the listener to enrich a shadow
   // would let a measurement-only path slow the thing it is measuring.
   const firstBuyRegistry = new FirstBuyRegistry();
-  const walletOutcomes = new WalletOutcomes(performance);
 
   /**
    * Screen a token for the shadow, at most once at a time.
@@ -311,6 +310,14 @@ async function main(): Promise<void> {
     await v2Ledger.load();
     v2Ledger.start();
   }
+
+  // Grades are earned from v2's OWN record, not the legacy tracker's. That
+  // tracker only follows legacy alerts, of which this feed fires almost none —
+  // measured at 12 calls across 7 wallets against a 5-outcome floor, so no
+  // wallet could ever reach a first grade. The basis is 'distribution' because
+  // the engine sees ~zero verified buys and a steady stream of allocations; the
+  // grade reason says "allocations" out loud rather than implying purchases.
+  const walletOutcomes = new WalletOutcomes(v2Ledger, 'distribution');
 
   const v2Shadow = new V2Shadow({
     marketCap: (token) => {
@@ -368,8 +375,9 @@ async function main(): Promise<void> {
     usdValueNow: (token, amount) => price.usdValue(token, amount),
     outcomeStats: () => {
       const s = walletOutcomes.stats();
-      return { wallets: s.wallets, calls: s.calls };
+      return { wallets: s.wallets, calls: s.calls, basis: s.basis };
     },
+    reportCard: (now) => walletOutcomes.reportCard(now),
   },
   DEFAULT_V2_RUNTIME_OPTIONS,
   journal,

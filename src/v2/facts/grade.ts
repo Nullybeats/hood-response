@@ -9,7 +9,7 @@
  * it: across every alert, `historicalAccuracy` only ever emitted 58, 72, 90 or
  * 96. It never once described how a wallet's calls actually performed.
  *
- * A grade here means one thing: this wallet's recent verified buys, and what
+ * A grade here means one thing: this wallet's recent EVENTS OF ONE KIND, and what
  * happened to the price afterwards. Nothing about how large a bag they hold.
  *
  * Three properties the legacy tier could not express:
@@ -87,7 +87,18 @@ export interface GradeResult {
  * `now` is injected rather than read from the clock so a replay produces the same
  * grade it produced live — the determinism contract the whole harness rests on.
  */
-export function gradeWallet(outcomes: readonly Outcome[], now: number): GradeResult {
+export function gradeWallet(
+  outcomes: readonly Outcome[],
+  now: number,
+  /**
+   * What the outcomes are, for the human-readable reason only — never for the
+   * maths. Grades are earned from ALLOCATIONS today (the engine sees ~zero
+   * verified buys), and "62% hit rate over 8 buys" would be a false description
+   * of a record made entirely of airdrops. A measurement that quietly changes
+   * meaning is exactly the failure this rebuild exists to stop.
+   */
+  noun: string = 'allocations',
+): GradeResult {
   const fresh = outcomes
     .filter((o) => now - o.at <= WINDOW_DAYS * DAY_MS)
     .sort((a, b) => b.at - a.at)
@@ -109,7 +120,7 @@ export function gradeWallet(outcomes: readonly Outcome[], now: number): GradeRes
       grade: 'U',
       index: null,
       sample: fresh.length,
-      reason: `no verified buy in ${days} days — track record is stale`,
+      reason: `no ${noun.replace(/s$/, '')} in ${days} days — track record is stale`,
     };
   }
 
@@ -150,7 +161,7 @@ export function gradeWallet(outcomes: readonly Outcome[], now: number): GradeRes
     index: Math.round(index),
     sample: fresh.length,
     reason:
-      `${Math.round(hitRate * 100)}% hit rate over ${fresh.length} buys, ` +
+      `${Math.round(hitRate * 100)}% hit rate over ${fresh.length} ${noun}, ` +
       `avg peak ${avgPeak.toFixed(2)}x` +
       (rugRate > 0 ? `, ${Math.round(rugRate * 100)}% rugged` : ''),
   };

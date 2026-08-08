@@ -170,6 +170,13 @@ export const DASHBOARD_V2_HTML = `<!doctype html>
 
       <div class="card">
         <details open>
+          <summary title="Grades are earned from ALLOCATION outcomes — 'when this wallet is allocated a token, does it pump?' — not from purchases, because the engine sees almost no verified buys. A wallet needs 5 closed outcomes before it grades at all; until then U is the honest answer.">wallet grades</summary>
+          <div class="rows" id="grades"></div>
+        </details>
+      </div>
+
+      <div class="card">
+        <details open>
           <summary title="Which rule turns away the most trades, and by how much. This is the tuning signal.">near misses by lane</summary>
           <div class="rows" id="nearmiss"></div>
         </details>
@@ -279,11 +286,15 @@ async function load() {
   } else {
     const s = outcomes.summary || {};
     const groups = [
+      // The control group first: if matched and unmatched perform the same, the
+      // lanes are decoration, and every bucket below it is beside the point.
+      ['lane matched?', s.byMatched], ['wallet grade at fire', s.byWalletGrade],
       ['lane', s.byLane], ['seed tier', s.bySeedTier], ['cap at entry', s.byCapBand],
       ['pair age', s.byPairAge], ['solo vs wave', s.byCohort], ['event type', s.byEventType],
     ];
-    const head = '<div class="empty">' + (s.total ?? 0) + ' followed · ' + (s.priced ?? 0) +
-      ' priced · ' + (s.open ?? 0) + ' open · ' + (s.trackHours ?? 24) + 'h window</div>';
+    const head = '<div class="empty">' + (s.total ?? 0) + ' followed · ' + (s.matched ?? 0) +
+      ' matched · ' + (s.priced ?? 0) + ' priced · ' + (s.open ?? 0) + ' open · ' +
+      (s.trackHours ?? 24) + 'h window</div>';
     const table = (bs) => (bs || []).filter((b) => b.count > 0).map((b) => line([
         '<span class="k">' + esc(b.label) + '</span>',
         '<span class="sc">' + b.count + '</span>',
@@ -299,6 +310,22 @@ async function load() {
     }).join('');
     $('scoreboard').innerHTML = head + (body || '<div class="empty">No matches followed yet — records open as new matches fire.</div>');
   }
+
+  // Wallet grades, with the reason. While every wallet reads U, the reason is
+  // the whole value: it says "3 of 5 outcomes" rather than leaving a blank that
+  // looks like a broken pipeline.
+  const wg = status.walletGrades || [];
+  const gstats = status.grades || {};
+  $('grades').innerHTML = wg.length === 0
+    ? '<div class="empty">No wallet has a recorded outcome yet' +
+      (gstats.calls != null ? ' (' + gstats.calls + ' closed, basis: ' + (gstats.basis || '—') + ')' : '') +
+      '. A grade needs 5 closed allocation outcomes, each 24h after it fired.</div>'
+    : wg.map((w) => line([
+        '<span class="b ' + (w.grade === 'U' ? 'b-skipped' : 'b-matched') + '">' + esc(w.grade) + '</span>',
+        '<span class="sym">' + esc(w.walletId.slice(0, 8)) + '</span>',
+        '<span class="sc">' + (w.index == null ? '—' : w.index) + '</span>',
+        '<span class="why">' + esc(w.reason) + '</span>',
+      ], w.walletId + ': ' + w.reason)).join('');
 
   const nm = status.nearMissesByLane || [];
   $('nearmiss').innerHTML = nm.length === 0

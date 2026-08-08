@@ -48,7 +48,13 @@ export interface V2Providers {
   /** Durable first-buy claim. Returns true at most once per (wallet, token). */
   claimFirstBuy(wallet: string, token: string, at: number, block: number): boolean;
   /** How much of the outcome record is usable, for the status endpoint. Optional. */
-  outcomeStats?(): { wallets: number; calls: number };
+  outcomeStats?(): { wallets: number; calls: number; basis?: string };
+  /**
+   * Per-wallet grades with their justification. Optional: a grade nobody can
+   * interrogate is not verifiable, and while every wallet reads `U` this is what
+   * distinguishes "no record yet" from "the pipeline is broken".
+   */
+  reportCard?(now: number): { walletId: string; grade: string; index: number | null; sample: number; reason: string }[];
   /** Static seed holder-rank tier for a wallet, or null when not in the catalog. */
   seedTier?(wallet: string): WalletTier | null;
   /**
@@ -64,12 +70,26 @@ export interface V2RuntimeOptions {
   crowdWindowMs: number;
   /** How often pending sheets are re-evaluated. */
   retryIntervalMs: number;
+  /**
+   * How long an allocation waits before it is judged, so the wave can be counted.
+   *
+   * A decision fires on the FIRST event, when a seeding of one and an airdrop to
+   * forty are indistinguishable — which makes any solo condition a no-op unless
+   * we let the window fill first. 47e1's record says that distinction is worth
+   * 90% versus 0%, so it is worth the delay.
+   *
+   * [config] 90s. Well inside the gate's 180s patience, and allocations are a
+   * leading indicator measured in hours — the edge is being early to the LAUNCH,
+   * not to the airdrop. A live buy path would need a much tighter number.
+   */
+  distributionSettleMs: number;
   lanes: readonly Lane[];
 }
 
 export const DEFAULT_V2_RUNTIME_OPTIONS: V2RuntimeOptions = {
   crowdWindowMs: 300_000,
   retryIntervalMs: 3_000,
+  distributionSettleMs: 90_000,
   lanes: DEFAULT_LANES,
 };
 
@@ -325,6 +345,9 @@ export class V2Shadow {
       // grade cannot match — so a lane firing nothing is explained here rather
       // than mistaken for a quiet market.
       grades: this.providers.outcomeStats?.() ?? null,
+      // Top of the wallet report card. Bounded: this is a status payload, and
+      // the full list belongs on its own endpoint if it ever grows.
+      walletGrades: this.providers.reportCard?.(Date.now())?.slice(0, 25) ?? null,
       // Headline only; the full scoreboard is /api/v2/outcomes. `priced` vs
       // `total` is the number to watch: a ledger full of unpriced records is
       // measuring nothing, however many matches it holds.
@@ -337,7 +360,24 @@ export class V2Shadow {
   /** Build, gate, score, judge, record. */
   private evaluate(p: Pending, now: number): void {
     const sheet = this.buildSheet(p.trade, now);
-    const verdict = gate(sheet, p.attempts, now - p.firstSeenAt);
+    const elapsed = now - p.firstSeenAt;
+
+    // Let an allocation's wave land before judging it. Deciding on the first
+    // event means a seeding of one and an airdrop to forty look identical, which
+    // would make the lane's solo condition silently useless — and solo-vs-wave
+    // is the difference between 47e1's 90% and 0% win rates. Deliberately
+    // expressed as a retry so it flows through the same pending queue, appears
+    // in the diary as 'waiting' with a reason, and is bounded by the same budget.
+    const settling = p.trade.distribution === true && elapsed < this.opts.distributionSettleMs;
+    const verdict: GateVerdict = settling
+      ? {
+          decision: 'retry',
+          fact: 'cohortSize',
+          reason: `settling — counting how many watched wallets receive this token (${Math.round(
+            (this.opts.distributionSettleMs - elapsed) / 1000,
+          )}s left)`,
+        }
+      : gate(sheet, p.attempts, elapsed);
 
     if (verdict.decision === 'retry') {
       p.attempts++;
@@ -368,9 +408,22 @@ export class V2Shadow {
     }
     this.diary.record(entry);
 
-    if (entry.outcome === 'matched') {
-      // Follow it. Without this the diary can say a lane matched and nothing
-      // more, which is how seventeen matches an hour stayed unrankable.
+    // Follow EVERY settled decision, not only the matches.
+    //
+    // Two reasons, both structural. First, a scoreboard of only what the lanes
+    // chose cannot say whether the lanes chose well — the unmatched decisions
+    // are the control group, and without them "the lane picks winners" is
+    // unfalsifiable. Second, grades come from outcomes, outcomes came only from
+    // matches, and two lanes require a grade to match: no wallet could ever earn
+    // a first grade. Recording every verdict is what breaks that circle, and it
+    // is what lets a wallet OUTSIDE the seed catalog build a record at all.
+    //
+    // `waiting` is excluded — its facts have not landed, so its sheet would
+    // record an entry price against a decision that has not been made yet. A
+    // blocked-on-unknown-marketCap sheet IS recorded: that is a brand-new coin,
+    // exactly what we want measured, and the ledger's late-entry adoption exists
+    // to price it once a pool appears.
+    if (!pendingOnly && entry.outcome !== 'waiting' && entry.outcome !== 'observed') {
       this.ledger?.open(
         {
           txHash: sheet.txHash,
@@ -379,6 +432,11 @@ export class V2Shadow {
           lanes: entry.matchedLanes,
           eventType: sheet.eventType,
           wallet: sheet.wallet,
+          cohortWallets: this.cohortFor(sheet.token),
+          // The grade held right now, frozen. Comparing outcomes against a grade
+          // that keeps moving would let a wallet's later record leak backwards
+          // into its own evidence.
+          walletGradeAtFire: sheet.walletGrade.value ?? 'U',
           score: score.score,
           seedTier: sheet.walletSeedTier.value ?? null,
           capBand: sheet.capBand.value ?? null,
@@ -388,11 +446,21 @@ export class V2Shadow {
         },
         now,
       );
+    }
+
+    if (entry.outcome === 'matched') {
       logger.info(
         { token: sheet.tokenSymbol, score: score.score, lanes: entry.matchedLanes },
         'v2 shadow: WOULD HAVE ALERTED (nothing emitted)',
       );
     }
+  }
+
+  /** Cohort members currently inside the window for a token. */
+  private cohortFor(token: string): string[] {
+    const now = Date.now();
+    const marks = this.cohort.get(token.toLowerCase()) ?? [];
+    return [...new Set(marks.filter((m) => now - m.at <= this.opts.crowdWindowMs).map((m) => m.wallet))];
   }
 
   private buildSheet(trade: SwapEvent, now: number): FactSheet {
@@ -404,6 +472,9 @@ export class V2Shadow {
       canSell: this.providers.canSell(trade.token),
       outcomesByWallet: this.outcomesFor(trade, now),
       crowdWallets: this.crowdFor(trade.token, trade.wallet, now),
+      // Buys AND allocations. Kept apart from crowdWallets so the crowd facts
+      // keep meaning "wallets that chose to buy".
+      cohortSize: Math.max(1, this.cohortFor(trade.token).length),
       // Claimed once, on first sight; a retry must not re-ask and get `false`
       // the second time, which would erase the very fact it is waiting on.
       // A distribution is not a buy: it must never claim the (wallet, token)
@@ -469,10 +540,13 @@ export class V2Shadow {
   }
 
   /**
-   * Record this wallet against the token and return how many DISTINCT watched
-   * wallets have touched it inside the window — the solo-vs-wave number.
+   * Record this wallet against the token and return every DISTINCT watched
+   * wallet that has touched it inside the window — the solo-vs-wave cohort.
+   *
+   * Members, not a count: an outcome must be attributable to each wallet in a
+   * wave, otherwise grading can only ever credit whoever triggered first.
    */
-  private markCohort(swap: SwapEvent): number {
+  private markCohort(swap: SwapEvent): string[] {
     const key = swap.token.toLowerCase();
     const now = Date.now();
     const marks = (this.cohort.get(key) ?? []).filter((m) => now - m.at <= this.opts.crowdWindowMs);
@@ -482,7 +556,7 @@ export class V2Shadow {
       const oldest = this.cohort.keys().next().value;
       if (oldest) this.cohort.delete(oldest);
     }
-    return new Set(marks.map((m) => m.wallet)).size;
+    return [...new Set(marks.map((m) => m.wallet))];
   }
 
   /** Distinct watched wallets that bought this token inside the window, including this one. */

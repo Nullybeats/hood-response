@@ -6,6 +6,10 @@
  * adopted entry prices — a win rate that looks measured but is quietly comparing
  * a token to itself an hour after the signal.
  */
+import { mkdtemp, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { describe, expect, it, vi } from 'vitest';
 
 import { OutcomeLedger, DEFAULT_LEDGER_OPTIONS, type LedgerEntryInput } from '../../v2/ledger.js';
@@ -149,10 +153,21 @@ describe('OutcomeLedger', () => {
     const ledger = make();
     ledger.open(input(), NOW);
     expect(ledger.list()[0]!.cohortSize).toBe(1);
-    ledger.noteCohort(TOKEN, 12);
-    expect(ledger.list()[0]!.cohortSize).toBe(12);
-    ledger.noteCohort(TOKEN, 3); // window emptied; the wave still happened
-    expect(ledger.list()[0]!.cohortSize).toBe(12);
+    // 12 others, plus the trigger wallet the record opened with.
+    ledger.noteCohort(TOKEN, Array.from({ length: 12 }, (_, i) => '0xw' + i));
+    expect(ledger.list()[0]!.cohortSize).toBe(13);
+    ledger.noteCohort(TOKEN, ['0xw0', '0xw1']); // window emptied; the wave still happened
+    expect(ledger.list()[0]!.cohortSize).toBe(13);
+  });
+
+  /** An outcome has to be attributable to every wallet in the wave, not just the trigger. */
+  it('keeps the cohort MEMBERS, so a wave outcome can credit each participant', () => {
+    const ledger = make();
+    ledger.open(input({ wallet: '0xTrigger' }), NOW);
+    ledger.noteCohort(TOKEN, ['0xAAA', '0xBBB']);
+    const r = ledger.list()[0]!;
+    expect(r.cohortWallets.sort()).toEqual(['0xaaa', '0xbbb', '0xtrigger']);
+    expect(r.cohortSize).toBe(3);
   });
 
   describe('summary', () => {
@@ -162,7 +177,7 @@ describe('OutcomeLedger', () => {
       const ledger = make(book);
       ledger.open(input({ txHash: '0xsolo' }), NOW);
       ledger.open(input({ txHash: '0xwave', token: '0xtok2' }), NOW);
-      ledger.noteCohort('0xtok2', 8);
+      ledger.noteCohort('0xtok2', Array.from({ length: 8 }, (_, i) => '0xw' + i));
 
       book.set(TOKEN, 4); // solo runs +300%
       book.set('0xtok2', 1.1); // wave goes nowhere
@@ -214,6 +229,66 @@ describe('OutcomeLedger', () => {
       expect(s.bySeedTier.find((b) => b.label === 'alpha')!.bestMaxGainPct).toBe(400);
       expect(s.bySeedTier.find((b) => b.label === 'beta')!.bestMaxGainPct).toBe(0);
       vi.useRealTimers();
+    });
+  });
+
+  /**
+   * Records written before `matched` existed were, by definition, matches — the
+   * ledger only followed matches then. Reading them as unmatched would file real
+   * matches under the control group and corrupt the comparison it exists for.
+   */
+  describe('loading older records', () => {
+    const legacyShape = (over: Record<string, unknown> = {}) => ({
+      id: '0xold',
+      token: TOKEN,
+      tokenSymbol: 'OLD',
+      lanes: ['allocation'],
+      eventType: 'distribution',
+      wallet: '0xw1',
+      score: 68,
+      seedTier: 'beta',
+      capBand: 'micro',
+      entryMarketCap: 90_000,
+      pairAgeHours: 1,
+      firedAt: NOW,
+      entryPrice: 1,
+      entryDelayMs: 0,
+      lastPrice: 1,
+      lastGainPct: 0,
+      maxPrice: 1,
+      maxGainPct: 0,
+      maxGainAt: NOW,
+      gain1hPct: null,
+      gain6hPct: null,
+      gain24hPct: null,
+      cohortSize: 1,
+      updatedAt: NOW,
+      nextSampleAt: NOW,
+      closed: false,
+      closedReason: null,
+      ...over,
+    });
+
+    async function loadWith(records: Record<string, unknown>[]) {
+      const dir = await mkdtemp(join(tmpdir(), 'v2-ledger-'));
+      const path = join(dir, 'outcomes.json');
+      await writeFile(path, JSON.stringify(records));
+      const ledger = new OutcomeLedger(priceBook().provider, { ...DEFAULT_LEDGER_OPTIONS, storePath: path });
+      await ledger.load();
+      return ledger;
+    }
+
+    it('treats a pre-`matched` record with lanes as a match', async () => {
+      const ledger = await loadWith([legacyShape()]);
+      expect(ledger.list()[0]!.matched).toBe(true);
+      expect(ledger.summary().matched).toBe(1);
+    });
+
+    it('backfills the cohort and the grade-at-fire without inventing either', async () => {
+      const ledger = await loadWith([legacyShape()]);
+      const r = ledger.list()[0]!;
+      expect(r.cohortWallets).toEqual(['0xw1']);
+      expect(r.walletGradeAtFire).toBe('U');
     });
   });
 

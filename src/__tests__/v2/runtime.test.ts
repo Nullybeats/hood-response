@@ -65,11 +65,28 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-/** config is read at import time, so force `enabled` for these tests. */
-function makeShadow(p: V2Providers = providers(), jrnl?: Journal): V2Shadow {
+/**
+ * config is read at import time, so force `enabled` for these tests.
+ *
+ * `distributionSettleMs: 0` by default: most tests here are about the decision,
+ * not the wave-counting delay, and a settle window would turn every allocation
+ * into a 'waiting' entry. The settle behaviour has its own tests below, with a
+ * real window set.
+ */
+function makeShadow(
+  p: V2Providers = providers(),
+  jrnl?: Journal,
+  over: Partial<ConstructorParameters<typeof V2Shadow>[1]> = {},
+): V2Shadow {
   const s = new V2Shadow(
     p,
-    { crowdWindowMs: 300_000, retryIntervalMs: 10_000, lanes: DEFAULT_LANES },
+    {
+      crowdWindowMs: 300_000,
+      retryIntervalMs: 10_000,
+      distributionSettleMs: 0,
+      lanes: DEFAULT_LANES,
+      ...over,
+    },
     jrnl,
   );
   Object.defineProperty(s, 'enabled', { get: () => true });
@@ -153,6 +170,62 @@ describe('V2Shadow', () => {
       expect(shadow.diary.size).toBe(1);
     });
 
+    /**
+     * The solo rule, and the delay that makes it possible.
+     *
+     * 47e1's record: one seeded wallet won 90% of the time, two or more won 0%.
+     * A decision fires on the wave's FIRST event, when both look identical — so
+     * without a settle window the condition would pass for every airdrop and be
+     * a silent no-op on exactly the traffic it exists to filter.
+     */
+    describe('solo vs wave', () => {
+      it('holds an allocation while the wave is still landing, and says so', () => {
+        shadow = makeShadow(providers({ seedTier: () => 'alpha' }), undefined, {
+          distributionSettleMs: 90_000,
+        });
+        shadow.onSwap(dist());
+        const entry = shadow.diary.recent(1)[0]!;
+        expect(entry.outcome).toBe('waiting');
+        expect(entry.reason).toMatch(/settling/);
+      });
+
+      it('matches a lone seeded wallet once the window has settled', () => {
+        shadow = makeShadow(providers({ seedTier: () => 'alpha' }));
+        shadow.onSwap(dist());
+        expect(shadow.diary.recent(1)[0]!.matchedLanes).toContain('allocation');
+      });
+
+      /**
+       * The airdrop case, end to end: six wallets receive the same token inside
+       * the window, and once the wave has settled the lane must refuse it.
+       * The cooldown collapses them to one sheet — but every one still joins the
+       * cohort, which is the whole reason the cohort is counted before the
+       * cooldown returns.
+       */
+      it('refuses a wave once the window has settled', () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(NOW);
+        shadow = makeShadow(providers({ seedTier: () => 'alpha' }), undefined, {
+          distributionSettleMs: 90_000,
+        });
+        for (let i = 0; i < 6; i++) {
+          shadow.onSwap(dist({ wallet: '0xw' + i, txHash: '0xd' + i }));
+        }
+        expect(shadow.diary.recent(1)[0]!.outcome).toBe('waiting');
+
+        // Past the settle window: the sheet is judged with the wave visible.
+        vi.setSystemTime(NOW + 91_000);
+        (shadow as unknown as { drainPending: () => void }).drainPending();
+
+        const entry = shadow.diary.recent(1)[0]!;
+        const alloc = entry.lanes.find((l) => l.laneId === 'allocation')!;
+        expect(alloc.matched).toBe(false);
+        expect(alloc.reason).toMatch(/6 wallets in the window/);
+        expect(entry.outcome).not.toBe('matched');
+        vi.useRealTimers();
+      });
+    });
+
     it('does not cool distributions of DIFFERENT tokens', () => {
       shadow = makeShadow(providers({ seedTier: () => 'alpha' }));
       shadow.onSwap(dist({ token: '0xtok1', txHash: '0xd1' }));
@@ -167,15 +240,23 @@ describe('V2Shadow', () => {
    * stayed unrankable against 47e1's record.
    */
   describe('outcome ledger wiring', () => {
+    interface Opened {
+      txHash: string;
+      lanes: string[];
+      seedTier: unknown;
+      capBand: unknown;
+      cohortWallets?: string[];
+      walletGradeAtFire?: string;
+    }
     function ledgerSpy() {
-      const opened: { txHash: string; lanes: string[]; seedTier: unknown; capBand: unknown }[] = [];
-      const cohorts: { token: string; size: number }[] = [];
+      const opened: Opened[] = [];
+      const cohorts: { token: string; wallets: readonly string[] }[] = [];
       return {
         opened,
         cohorts,
         ledger: {
-          open: (i: { txHash: string; lanes: string[]; seedTier: unknown; capBand: unknown }) => opened.push(i),
-          noteCohort: (token: string, size: number) => cohorts.push({ token, size }),
+          open: (i: Opened) => opened.push(i),
+          noteCohort: (token: string, wallets: readonly string[]) => cohorts.push({ token, wallets }),
         } as unknown as ConstructorParameters<typeof V2Shadow>[3],
       };
     }
@@ -196,12 +277,40 @@ describe('V2Shadow', () => {
       expect(spy.opened[0]!.capBand).toBe('micro');
     });
 
-    it('does not follow a decision that no lane matched', () => {
+    /**
+     * The control group. A scoreboard of only what the lanes chose cannot say
+     * whether the lanes chose well — and grading needs outcomes from wallets no
+     * lane has ever matched, or no wallet could earn its first grade.
+     */
+    it('follows a decision that no lane matched, flagged as unmatched', () => {
       const spy = ledgerSpy();
       // Unseeded wallet ⇒ the Allocation lane cannot match.
       shadow = shadowWith(providers({ seedTier: () => null }), spy);
       shadow.onSwap(swap({ verifiedTrade: false, distribution: true }));
+      expect(spy.opened).toHaveLength(1);
+      expect(spy.opened[0]!.lanes).toEqual([]);
+    });
+
+    /** A sheet still waiting on its facts has not been decided; recording it would
+     *  stamp an entry price against a decision that has not happened. */
+    it('does not follow a decision still waiting on evidence', () => {
+      const spy = ledgerSpy();
+      shadow = shadowWith(providers({ canSell: () => null }), spy);
+      shadow.onSwap(swap());
+      expect(shadow.diary.recent(1)[0]!.outcome).toBe('waiting');
       expect(spy.opened).toHaveLength(0);
+    });
+
+    /** A brand-new coin with no pool yet is exactly what we want measured. */
+    it('follows a decision blocked on an unresolved market cap', () => {
+      const spy = ledgerSpy();
+      shadow = shadowWith(providers({ marketCap: () => null }), spy);
+      const s = swap();
+      shadow.onSwap(s);
+      // Drain past the retry budget so the gate blocks rather than retries.
+      for (let i = 0; i < 40; i++) (shadow as unknown as { drainPending: () => void }).drainPending();
+      expect(shadow.diary.recent(1)[0]!.outcome).toBe('blocked');
+      expect(spy.opened).toHaveLength(1);
     });
 
     /**
@@ -217,8 +326,9 @@ describe('V2Shadow', () => {
       }
       expect(shadow.diary.size).toBe(1);
       expect(spy.opened).toHaveLength(1);
-      // Every one of the six was counted toward the cohort.
-      expect(Math.max(...spy.cohorts.map((c) => c.size))).toBe(6);
+      // Every one of the six was counted toward the cohort, members and all.
+      expect(Math.max(...spy.cohorts.map((c) => c.wallets.length))).toBe(6);
+      expect(spy.opened[0]!.cohortWallets).toContain('0xw0');
     });
   });
 
