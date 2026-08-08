@@ -282,8 +282,17 @@ export async function buildServer(
         rpcLatencyMs: {
           value: m.rpcLatencyMs,
           ageMs: age('rpcLatencyMs'),
-          verdict: verdict(age('rpcLatencyMs'), 120_000, 'not measured yet; renders as "rpc –ms"'),
+          verdict: verdict(age('rpcLatencyMs'), 120_000, 'metered RPC probe is off by default — the head comes from HEAD_POLL_MS instead'),
         },
+        // The head's own latency, kept distinct from the chain RPC's: this one
+        // comes from a free indexer, and reporting it as "rpc" would misname
+        // what was measured.
+        headLatencyMs: {
+          value: m.headLatencyMs,
+          ageMs: age('headLatencyMs'),
+          verdict: verdict(age('headLatencyMs'), 30_000, 'head poller has not answered yet (HEAD_POLL_MS=0 disables it)'),
+        },
+        headSource: { value: m.headSource, note: 'who answered the head lookup' },
         swaps: {
           sinceBoot: store.totals.swaps,
           ageMs: age('swaps'),
