@@ -231,6 +231,69 @@ export async function buildServer(
     return { enabled: true, decisions: entries };
   });
 
+  // ── Metric diagnostics ──────────────────────────────────────────────────────
+  // Every number the dashboards show, WITH its freshness and a plain verdict.
+  // Exists because "block – / rpc –ms / swaps 0" after a restart was
+  // indistinguishable from a dead listener: values without ages cannot tell
+  // "just booted" from "broken". Each entry answers: what is it, when did it
+  // last move, and is that normal?
+  app.get('/api/debug/metrics', async () => {
+    const now = Date.now();
+    const bootedAt = now - Math.round(process.uptime() * 1000);
+    const m = store.metrics;
+    const age = (key: string) => store.metricAgeMs(key);
+    const verdict = (ageMs: number | null, staleMs: number, neverHint: string): string => {
+      if (ageMs == null) return `never this boot — ${neverHint}`;
+      return ageMs > staleMs ? `STALE (${Math.round(ageMs / 1000)}s old)` : 'ok';
+    };
+
+    const v2s = v2 ? (v2.status() as Record<string, unknown>) : null;
+    return {
+      bootedAt,
+      uptimeSeconds: Math.round(process.uptime()),
+      metrics: {
+        wsConnected: { value: m.wsConnected, note: 'socket state only — says nothing about data flowing' },
+        lastBlock: {
+          value: m.lastBlock || null,
+          ageMs: age('lastBlock'),
+          verdict: verdict(age('lastBlock'), 30_000, 'no head/log processed yet; renders as "block –"'),
+        },
+        rpcLatencyMs: {
+          value: m.rpcLatencyMs,
+          ageMs: age('rpcLatencyMs'),
+          verdict: verdict(age('rpcLatencyMs'), 120_000, 'not measured yet; renders as "rpc –ms"'),
+        },
+        swaps: {
+          sinceBoot: store.totals.swaps,
+          ageMs: age('swaps'),
+          verdict: verdict(age('swaps'), 3_600_000, 'none accepted this boot — counters reset on restart'),
+        },
+        swarms: {
+          sinceBoot: store.totals.swarms,
+          restoredHistory: store.recentSwarms(500).length,
+          ageMs: age('swarms'),
+          note: 'dashboard lists restored history; totals count this boot only — the "swarms 40, swaps 0" confusion',
+        },
+        alerts: {
+          sinceBoot: store.totals.alerts,
+          restoredHistory: store.recentAlerts(500).length,
+          ageMs: age('alerts'),
+        },
+      },
+      price: price ? (price as unknown as { debug?: () => Record<string, unknown> }).debug?.() ?? null : null,
+      v2: v2s
+        ? {
+            enabled: v2s.enabled,
+            intake: v2s.intake,
+            intakeAges: v2s.intakeAges,
+            pending: v2s.pending,
+            journalEnabled: v2s.journalEnabled,
+            journalStopped: v2s.journalStopped,
+          }
+        : null,
+    };
+  });
+
   app.get('/api/v2/lanes', async () => ({
     lanes: DEFAULT_LANES.map((l) => ({
       id: l.id,
@@ -842,6 +905,12 @@ export async function buildServer(
   // The v2 brain's view, served ALONGSIDE the legacy dashboard rather than
   // replacing it: the old engine is still the one on the wire, so the old view
   // stays authoritative until it isn't.
+  // Browsers request /favicon.ico unconditionally; a 404 in every console
+  // session reads as breakage next to real diagnostics. 204 is the quiet truth.
+  app.get('/favicon.ico', async (_req, reply) => {
+    reply.code(204).send();
+  });
+
   app.get('/v2', async (_req, reply) => {
     reply.header('cache-control', 'no-store').type('text/html').send(DASHBOARD_V2_HTML);
   });

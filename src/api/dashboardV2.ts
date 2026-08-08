@@ -136,6 +136,12 @@ export const DASHBOARD_V2_HTML = `<!doctype html>
       <h2>Lanes</h2>
       <div id="lanes"></div>
     </div>
+
+    <div class="card wide">
+      <h2>Diagnostics — every metric, with its age</h2>
+      <div class="sub" style="margin:0 0 8px">A value without freshness cannot tell "just booted" from "broken". Ages update live; ⚠ means stale, ⏳ means never this boot.</div>
+      <div id="diag"></div>
+    </div>
   </div>
 
 <script>
@@ -151,10 +157,11 @@ const ago = (t) => {
 };
 
 async function load() {
-  const [status, decisions, lanes] = await Promise.all([
+  const [status, decisions, lanes, diag] = await Promise.all([
     fetch('/api/v2/status').then((r) => r.json()).catch(() => ({})),
     fetch('/api/v2/decisions?limit=120' + (outcome ? '&outcome=' + outcome : '')).then((r) => r.json()).catch(() => ({ decisions: [] })),
     fetch('/api/v2/lanes').then((r) => r.json()).catch(() => ({ lanes: [] })),
+    fetch('/api/debug/metrics').then((r) => r.json()).catch(() => null),
   ]);
 
   $('offbanner').innerHTML = status.enabled
@@ -207,6 +214,26 @@ async function load() {
     : nm.map((n) =>
         '<div style="margin-bottom:8px"><b>' + esc(n.laneId) + '</b> — ' + n.n + '×' +
         n.examples.map((e) => '<div class="reason">· ' + esc(e) + '</div>').join('') + '</div>').join('');
+
+  if (diag) {
+    const fmtAge = (ms) => ms == null ? '⏳ never this boot' : (ms < 60000 ? Math.round(ms/1000)+'s ago' : Math.round(ms/60000)+'m ago');
+    const rowsD = [];
+    const met = diag.metrics || {};
+    rowsD.push(['uptime', Math.round(diag.uptimeSeconds/60) + 'm', 'counters below reset at boot']);
+    rowsD.push(['ws', met.wsConnected?.value ? 'connected' : 'DOWN', met.wsConnected?.note || '']);
+    rowsD.push(['last block', met.lastBlock?.value ?? '—', fmtAge(met.lastBlock?.ageMs) + ' · ' + (met.lastBlock?.verdict || '')]);
+    rowsD.push(['rpc latency', (met.rpcLatencyMs?.value ?? '—') + 'ms', fmtAge(met.rpcLatencyMs?.ageMs) + ' · ' + (met.rpcLatencyMs?.verdict || '')]);
+    rowsD.push(['swaps (boot)', met.swaps?.sinceBoot ?? 0, fmtAge(met.swaps?.ageMs)]);
+    rowsD.push(['swarms', (met.swarms?.sinceBoot ?? 0) + ' boot / ' + (met.swarms?.restoredHistory ?? 0) + ' restored', met.swarms?.note || '']);
+    const ia = diag.v2?.intakeAges || {};
+    rowsD.push(['v2 intake', JSON.stringify(diag.v2?.intake || {}), 'last: buy ' + fmtAge(ia.verifiedBuy) + ' · alloc ' + fmtAge(ia.distribution) + ' · sell ' + fmtAge(ia.verifiedSell)]);
+    if (diag.price) rowsD.push(['price sweep', 'q=' + diag.price.backgroundQueue + ' prio=' + diag.price.priorityQueue, 'last ' + fmtAge(diag.price.lastSweepAgeMs) + ' · 429s: ' + diag.price.dex429Count]);
+    rowsD.push(['journal', diag.v2?.journalEnabled ? 'writing' : 'off', diag.v2?.journalStopped || '']);
+    $('diag').innerHTML = rowsD.map(([k, v, note]) =>
+      '<div class="row"><span class="sym" style="min-width:110px">' + esc(k) + '</span>' +
+      '<span class="score">' + esc(String(v)) + '</span>' +
+      '<span class="reason">' + esc(String(note)) + '</span></div>').join('');
+  }
 
   $('lanes').innerHTML = (lanes.lanes || []).map((l) =>
     '<div class="lane"><div class="name">' + esc(l.emoji) + ' ' + esc(l.name) + '</div>' +

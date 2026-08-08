@@ -105,6 +105,14 @@ export class V2Shadow {
   };
   /** Last time a distribution sheet was built per token; the airdrop-wave collapser. */
   private readonly distSeenAt = new Map<string, number>();
+  /** When each intake type last arrived — the freshness half of every counter. */
+  private readonly intakeLastAt: Record<string, number | null> = {
+    any: null,
+    verifiedBuy: null,
+    verifiedSell: null,
+    distribution: null,
+    unverified: null,
+  };
 
   constructor(
     private readonly providers: V2Providers,
@@ -179,10 +187,12 @@ export class V2Shadow {
     // ignored, and the dashboard showed a blank page with no way to tell that
     // from an outage.
     this.intake.total++;
+    this.intakeLastAt.any = Date.now();
 
     // Distributions: allocations/airdrops — the 47e1 signal, typed honestly.
     if (swap.distribution === true) {
       this.intake.distributions++;
+      this.intakeLastAt.distribution = Date.now();
       // An airdrop wave hits many watched wallets with the same token in the
       // same minute. One sheet per token per crowd window is the measurement;
       // 122 identical sheets are a bill (each would warm quotes and safety).
@@ -205,6 +215,7 @@ export class V2Shadow {
 
     if (swap.verifiedTrade !== true) {
       this.intake.unverified++;
+      this.intakeLastAt.unverified = Date.now();
       return;
     }
     if (swap.direction !== 'BUY') {
@@ -212,10 +223,12 @@ export class V2Shadow {
       // stretch of selling is visible instead of reading as an outage. Also the
       // raw material the rug radar will consume.
       this.intake.verifiedSells++;
+      this.intakeLastAt.verifiedSell = Date.now();
       this.recordSell(swap);
       return;
     }
     this.intake.verifiedBuys++;
+    this.intakeLastAt.verifiedBuy = Date.now();
     this.seen++;
     this.markCrowd(swap);
     this.jrnl.write('trade', swap);
@@ -262,6 +275,11 @@ export class V2Shadow {
       // about buying, so a stretch of verified SELLS produces no decisions and
       // is not a fault.
       intake: { ...this.intake },
+      // Ages, not just counts: "0 buys" reads differently when the last one was
+      // 4 minutes ago versus never this boot.
+      intakeAges: Object.fromEntries(
+        Object.entries(this.intakeLastAt).map(([k, at]) => [k, at == null ? null : Date.now() - at]),
+      ),
       pending: this.pending.length,
       diarySize: this.diary.size,
       outcomes: summary.counts,

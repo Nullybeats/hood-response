@@ -311,6 +311,7 @@ export class MemoryStore extends EventEmitter {
   recordSwap(e: SwapEvent): void {
     this.swaps.push(e);
     this.totals.swaps += 1;
+    this.metricStamps.set('swaps', Date.now());
     this.metrics.lastEventAt = e.timestamp;
     this.metrics.lastBlock = Math.max(this.metrics.lastBlock, e.blockNumber);
 
@@ -355,6 +356,7 @@ export class MemoryStore extends EventEmitter {
   recordSwarm(s: Swarm): void {
     this.swarms.push(s);
     this.totals.swarms += 1;
+    this.metricStamps.set('swarms', Date.now());
     const ts = this.tokenStats.get(s.token);
     if (ts) ts.swarms += 1;
     this.emit('swarm', s);
@@ -363,12 +365,32 @@ export class MemoryStore extends EventEmitter {
   recordAlert(a: Alert): void {
     this.alerts.push(a);
     this.totals.alerts += 1;
+    this.metricStamps.set('alerts', Date.now());
     this.emit('alert', a);
   }
 
+  /**
+   * When each metric was last actually written, keyed by field name.
+   *
+   * Exists because the dashboard renders values with no freshness: after a
+   * restart, `lastBlock: 0` and `rpcLatencyMs: null` rendered as "block – /
+   * rpc –ms" and were indistinguishable from a dead listener. A metric's age is
+   * the difference between "just booted" and "broken", and without a stamp
+   * nobody can compute it.
+   */
+  private readonly metricStamps = new Map<string, number>();
+
   updateMetrics(patch: Partial<LatencyMetrics>): void {
+    const now = Date.now();
+    for (const key of Object.keys(patch)) this.metricStamps.set(key, now);
     this.metrics = { ...this.metrics, ...patch };
     this.emit('metrics', this.metrics);
+  }
+
+  /** ms since a metric was last written, or null if never this boot. */
+  metricAgeMs(key: string): number | null {
+    const at = this.metricStamps.get(key);
+    return at == null ? null : Date.now() - at;
   }
 
   recentSwaps(limit = 100): SwapEvent[] {

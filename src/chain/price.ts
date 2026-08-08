@@ -447,6 +447,27 @@ export class PriceOracle {
    * intentionally asynchronous: chain detection never waits on DexScreener,
    * but a new visible row must not sit behind hundreds of restored tokens.
    */
+  /**
+   * Why a price is missing, made countable. "marketCap unresolved" was
+   * undiagnosable without knowing whether the sweep is running, how deep the
+   * queue is, and whether DexScreener is throttling — each a different fix.
+   */
+  private readonly debugCounters = { dex429: 0, dexErrors: 0, lastSweepAt: 0 };
+
+  debug(): Record<string, unknown> {
+    return {
+      backgroundQueue: this.queue.size,
+      priorityQueue: this.priorityQueue.size,
+      inflight: this.inflight.size,
+      lastSweepAt: this.debugCounters.lastSweepAt || null,
+      lastSweepAgeMs: this.debugCounters.lastSweepAt ? Date.now() - this.debugCounters.lastSweepAt : null,
+      dex429Count: this.debugCounters.dex429,
+      dexErrorCount: this.debugCounters.dexErrors,
+      sweepPerTick: 1,
+      sweepIntervalMs: config.PRICE_REFRESH_MS,
+    };
+  }
+
   requestRefresh(tokenAddress: string): void {
     if (!this.liveEnabled) return;
     const key = tokenAddress.toLowerCase();
@@ -503,7 +524,10 @@ export class PriceOracle {
     }
     // Do not leave a recovered dashboard blank until the first interval.
     void this.refresh();
-    this.timer = setInterval(() => void this.refresh(), config.PRICE_REFRESH_MS);
+    this.timer = setInterval(() => {
+      this.debugCounters.lastSweepAt = Date.now();
+      void this.refresh();
+    }, config.PRICE_REFRESH_MS);
   }
 
   stop(): void {
@@ -568,6 +592,8 @@ export class PriceOracle {
         `https://api.dexscreener.com/token-pairs/v1/${encodeURIComponent(chain)}/${address}`,
       );
       if (!res.ok) {
+        if (res.status === 429) this.debugCounters.dex429++;
+        else this.debugCounters.dexErrors++;
         logger.warn({ token: address, status: res.status }, 'price: DexScreener request failed');
         // A public-indexer throttle is not evidence the pool lacks a price.
         // Establish it on chain immediately; Dex is optional enrichment.
