@@ -149,10 +149,21 @@ export interface LedgerOptions {
 }
 
 export const DEFAULT_LEDGER_OPTIONS: LedgerOptions = {
-  trackHours: 24,
+  // Three days, not one. A record stops sampling when the window ends, so its peak FREEZES there —
+  // and peak is the whole measurement. At 24h a coin that ran on day two was recorded as flat, and
+  // every wallet behind it was graded on a number that never happened.
+  //
+  // This mattered more once grading stopped waiting for a record to close: `closed` no longer
+  // means "ready to judge", it only means "we stopped looking", so the window is now purely a
+  // question of how long we are willing to keep watching.
+  trackHours: 72,
   winThresholdPct: 50,
   priceGraceHours: 6,
-  maxRefreshPerTick: 20,
+  // Raised with the window. Steady state at ~10 signals/hr over 72h is ~40 tokens/tick across all
+  // four tiers; 20 would have silently starved the tail, which is exactly the late peak the longer
+  // window exists to catch. Affordable now that the price bucket runs at its configured 8/s with a
+  // zero queue — before that fix this would have compounded the backlog.
+  maxRefreshPerTick: 60,
   tickMs: 60_000,
   maxRecords: 5_000,
   storePath: '',
@@ -162,14 +173,20 @@ const gainPct = (entry: number, now: number): number =>
   entry > 0 ? Math.round(((now - entry) / entry) * 1000) / 10 : 0;
 
 /**
- * How soon to resample, by age. The first hour is where a launch either runs or
- * does not, so it is sampled every tick; a day-old record is nearly settled and
- * a coarse sample is enough to catch a late peak.
+ * How soon to resample, by age.
+ *
+ * The first hour is where a launch either runs or does not, so it is sampled every tick. Past a
+ * day the coin is mostly settled and an hourly sample is enough to notice a late run — the point
+ * of watching that long is not precision, it is not MISSING a peak that arrives on day two.
+ *
+ * The tiers exist so a long tail of old records cannot crowd out the young ones, which are the
+ * only records where a minute of resolution changes the number.
  */
 function sampleIntervalMs(ageMs: number): number {
   if (ageMs < 3_600_000) return 60_000;
   if (ageMs < 6 * 3_600_000) return 5 * 60_000;
-  return 15 * 60_000;
+  if (ageMs < 24 * 3_600_000) return 15 * 60_000;
+  return 60 * 60_000;
 }
 
 function bucket(label: string, records: LedgerRecord[], winPct: number): LedgerBucket {

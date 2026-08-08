@@ -333,3 +333,52 @@ describe('OutcomeLedger', () => {
     vi.useRealTimers();
   });
 });
+
+/**
+ * The tracking window is the measurement window.
+ *
+ * A record stops sampling when the window ends, so its peak FREEZES there — and peak is the whole
+ * measurement, and now the whole basis for a wallet grade. At 24h a coin that ran on day two was
+ * recorded as flat, and every wallet behind it was graded on a number that never happened.
+ *
+ * This became the binding constraint once grading stopped waiting for a record to close: `closed`
+ * no longer means "ready to judge", only "we stopped looking".
+ */
+describe('a peak that arrives after the first day', () => {
+  const HOUR = 3_600_000;
+
+  it('is caught inside the window', async () => {
+    vi.useFakeTimers();
+    const book = priceBook({ [TOKEN]: 1 });
+    const ledger = make(book);
+    ledger.open(input(), NOW);
+
+    // Flat for a day and a half, then it runs.
+    await sampleAt(ledger, NOW + 36 * HOUR);
+    book.set(TOKEN, 4);
+    await sampleAt(ledger, NOW + 48 * HOUR);
+
+    const r = ledger.list(10)[0]!;
+    expect(r.closed).toBe(false);
+    expect(r.maxGainPct).toBeCloseTo(300, 0);
+    vi.useRealTimers();
+  });
+
+  it('is missed once the window has ended, which is what bounds the cost', async () => {
+    vi.useFakeTimers();
+    const book = priceBook({ [TOKEN]: 1 });
+    const ledger = make(book);
+    ledger.open(input(), NOW);
+
+    // Past the 72h window: the record closes, and a later run is not recorded.
+    await sampleAt(ledger, NOW + 73 * HOUR);
+    book.set(TOKEN, 10);
+    await sampleAt(ledger, NOW + 96 * HOUR);
+
+    const r = ledger.list(10)[0]!;
+    expect(r.closed).toBe(true);
+    expect(r.closedReason).toBe('tracked-out');
+    expect(r.maxGainPct).toBeCloseTo(0, 0);
+    vi.useRealTimers();
+  });
+});

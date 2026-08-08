@@ -617,14 +617,14 @@ const schema = z.object({
   V2_LEDGER_PATH: z.string().default('/data/v2-outcomes.json'),
   // 24h matches the window a launch resolves in on this chain, and matches the
   // legacy tracker so the two records compare like for like.
-  V2_LEDGER_TRACK_HOURS: num(24),
+  V2_LEDGER_TRACK_HOURS: num(72),
   // Same +50% bar 47e1's record uses. Change this and the benchmark stops being
   // a comparison.
   V2_LEDGER_WIN_PCT: num(50),
   // Rate-limit guard. Every open record wants a fresh quote; a few hundred of
   // them polled freely is how the last CU runaway started. Quotes are deduped by
   // token and capped per tick, with the youngest records first.
-  V2_LEDGER_MAX_REFRESH_PER_TICK: num(20),
+  V2_LEDGER_MAX_REFRESH_PER_TICK: num(60),
 
   // Secret salt for the opaque wallet ids exposed on alerts and /api/wallets (see walletId.ts).
   // Addresses are public and enumerable, so an unsalted hash is reversible by brute force.
