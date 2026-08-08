@@ -33,6 +33,7 @@ import { dirname } from 'node:path';
 import { config } from '../config/env.js';
 import { logger } from '../logger.js';
 import type { WalletTier } from '../types.js';
+import { V2_RULES_EPOCH_MS } from './epoch.js';
 import type { CapBand } from './facts/sheet.js';
 import type { Grade } from './facts/types.js';
 
@@ -146,6 +147,13 @@ export interface LedgerOptions {
   tickMs: number;
   maxRecords: number;
   storePath: string;
+  /**
+   * Decisions older than this are not this build's record — dropped on load, refused on open.
+   * See epoch.ts for what bumping it means. Injected rather than read straight from the module so
+   * the behaviour is testable at all: a fixed wall-clock constant would otherwise silently reject
+   * every fixture the day someone bumps it, which is how a guard turns into a mystery.
+   */
+  rulesEpochMs: number;
 }
 
 export const DEFAULT_LEDGER_OPTIONS: LedgerOptions = {
@@ -167,6 +175,7 @@ export const DEFAULT_LEDGER_OPTIONS: LedgerOptions = {
   tickMs: 60_000,
   maxRecords: 5_000,
   storePath: '',
+  rulesEpochMs: V2_RULES_EPOCH_MS,
 };
 
 const gainPct = (entry: number, now: number): number =>
@@ -283,6 +292,11 @@ export class OutcomeLedger {
    * want it, and erasing that would rewrite history.
    */
   open(input: LedgerEntryInput, now: number): void {
+    // The retry queue re-evaluates trades minutes to hours after their block time, so without this
+    // a decision retired at load can walk straight back in through the side door. `firedAt` is the
+    // BLOCK time, which is the right key: what matters is which rules were live when the event
+    // happened, not when we got around to judging it.
+    if (input.firedAt < this.opts.rulesEpochMs) return;
     const existing = this.records.get(input.txHash);
     if (existing) {
       for (const lane of input.lanes) {
@@ -543,8 +557,16 @@ export class OutcomeLedger {
       const raw = await readFile(this.opts.storePath, 'utf8');
       const arr = JSON.parse(raw) as unknown;
       if (!Array.isArray(arr)) return;
+      let retired = 0;
       for (const r of arr as LedgerRecord[]) {
         if (!r || !r.id) continue;
+        // Snapshots outlive rule changes. A record decided under retired rules is not evidence
+        // about this build, so it is dropped on the way in rather than filtered on the way out —
+        // see epoch.ts. Dropping at load is also what stops it costing a price sample per tick.
+        if (r.firedAt < this.opts.rulesEpochMs) {
+          retired += 1;
+          continue;
+        }
         // Backfill fields added after these records were written. `matched` is
         // the one that matters: every record predating it WAS a match (the
         // ledger only followed matches then), and defaulting it to false would
@@ -555,7 +577,7 @@ export class OutcomeLedger {
         if (!r.walletGradeAtFire) r.walletGradeAtFire = 'U';
         this.records.set(r.id, r);
       }
-      logger.info({ loaded: this.records.size }, 'v2 ledger: restored snapshot');
+      logger.info({ loaded: this.records.size, retired }, 'v2 ledger: restored snapshot');
     } catch (err) {
       const e = err as NodeJS.ErrnoException;
       if (e.code !== 'ENOENT') logger.warn({ err: String(err).slice(0, 160) }, 'v2 ledger: could not load');

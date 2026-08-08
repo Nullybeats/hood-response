@@ -17,6 +17,14 @@ import { OutcomeLedger, DEFAULT_LEDGER_OPTIONS, type LedgerEntryInput } from '..
 const NOW = 1_786_000_000_000;
 const TOKEN = '0xtoken0000000000000000000000000000000001';
 
+/**
+ * Every test here except the epoch suite predates the rules epoch on the wall clock, and none of
+ * them is ABOUT it. `rulesEpochMs: 0` opts them out so a future epoch bump cannot silently turn
+ * this whole file green-by-vacancy — a fixture the ledger refuses still "passes" every assertion
+ * that only checks what is absent.
+ */
+const TEST_OPTIONS = { ...DEFAULT_LEDGER_OPTIONS, rulesEpochMs: 0 };
+
 /** A price book we can move between samples. */
 function priceBook(initial: Record<string, number | null> = {}) {
   const prices = new Map<string, number | null>(Object.entries(initial));
@@ -56,7 +64,7 @@ async function sampleAt(ledger: OutcomeLedger, at: number): Promise<void> {
 }
 
 function make(book = priceBook({ [TOKEN]: 1 })) {
-  return new OutcomeLedger(book.provider, { ...DEFAULT_LEDGER_OPTIONS, storePath: '' });
+  return new OutcomeLedger(book.provider, { ...TEST_OPTIONS, storePath: '' });
 }
 
 describe('OutcomeLedger', () => {
@@ -124,7 +132,7 @@ describe('OutcomeLedger', () => {
     vi.useFakeTimers();
     const book = priceBook({ [TOKEN]: null });
     const ledger = new OutcomeLedger(book.provider, {
-      ...DEFAULT_LEDGER_OPTIONS,
+      ...TEST_OPTIONS,
       storePath: '',
       priceGraceHours: 1,
     });
@@ -273,7 +281,7 @@ describe('OutcomeLedger', () => {
       const dir = await mkdtemp(join(tmpdir(), 'v2-ledger-'));
       const path = join(dir, 'outcomes.json');
       await writeFile(path, JSON.stringify(records));
-      const ledger = new OutcomeLedger(priceBook().provider, { ...DEFAULT_LEDGER_OPTIONS, storePath: path });
+      const ledger = new OutcomeLedger(priceBook().provider, { ...TEST_OPTIONS, storePath: path });
       await ledger.load();
       return ledger;
     }
@@ -290,6 +298,58 @@ describe('OutcomeLedger', () => {
       expect(r.cohortWallets).toEqual(['0xw1']);
       expect(r.walletGradeAtFire).toBe('U');
     });
+
+    /**
+     * The rules epoch. A snapshot outlives a rule change, so without this the ledger keeps serving
+     * decisions the current lanes would reject — which is not a stale number but a false one: they
+     * land in the scoreboard's averages and in the wallet grades computed off it.
+     */
+    describe('the rules epoch', () => {
+      const HOUR_MS = 3_600_000;
+      const EPOCH = NOW + 10 * HOUR_MS;
+
+      /** Same fixture, same load path — only the epoch moves. */
+      async function loadAt(epochMs: number, firedAt: number) {
+        const dir = await mkdtemp(join(tmpdir(), 'v2-epoch-'));
+        const path = join(dir, 'outcomes.json');
+        await writeFile(path, JSON.stringify([legacyShape({ firedAt })]));
+        const ledger = new OutcomeLedger(priceBook().provider, { ...TEST_OPTIONS, storePath: path, rulesEpochMs: epochMs });
+        await ledger.load();
+        return ledger;
+      }
+
+      it('drops a snapshot record decided under retired rules', async () => {
+        const ledger = await loadAt(EPOCH, EPOCH - 1);
+        expect(ledger.size).toBe(0);
+        expect(ledger.summary().total).toBe(0);
+        expect(ledger.summary().matched).toBe(0);
+      });
+
+      /**
+       * NEGATIVE CONTROL. The same record, one millisecond the other side of the same epoch, must
+       * survive — otherwise "drops it" above would also pass on a ledger that loads nothing at all,
+       * which is the failure mode a load-time filter is most likely to have.
+       */
+      it('keeps the same record when it falls on or after the epoch', async () => {
+        const ledger = await loadAt(EPOCH, EPOCH);
+        expect(ledger.size).toBe(1);
+        expect(ledger.summary().matched).toBe(1);
+      });
+
+      /**
+       * The retry queue re-evaluates trades long after their block time, so the load-time drop is
+       * only half the guard: without this a retired decision walks straight back in seconds later.
+       */
+      it('refuses to open a record whose event predates the epoch', () => {
+        const ledger = new OutcomeLedger(priceBook().provider, { ...TEST_OPTIONS, storePath: '', rulesEpochMs: EPOCH });
+        ledger.open(input({ txHash: '0xold', firedAt: EPOCH - 1 }), EPOCH + HOUR_MS);
+        expect(ledger.size).toBe(0);
+        // Judged late, but the EVENT is under current rules — kept, because what matters is which
+        // rules were live when it happened, not when we got around to deciding.
+        ledger.open(input({ txHash: '0xnew', firedAt: EPOCH }), EPOCH + HOUR_MS);
+        expect(ledger.size).toBe(1);
+      });
+    });
   });
 
   /** The rate-limit guard: a wave of allocations of one coin must cost one quote. */
@@ -305,7 +365,7 @@ describe('OutcomeLedger', () => {
           prices.set(t.toLowerCase(), 1);
         },
       },
-      { ...DEFAULT_LEDGER_OPTIONS, storePath: '', maxRefreshPerTick: 3 },
+      { ...TEST_OPTIONS, storePath: '', maxRefreshPerTick: 3 },
     );
     // 10 allocations of ONE token, plus 10 distinct tokens.
     for (let i = 0; i < 10; i++) ledger.open(input({ txHash: `0xsame${i}` }), NOW);
@@ -322,7 +382,7 @@ describe('OutcomeLedger', () => {
     let refreshes = 0;
     const ledger = new OutcomeLedger(
       { priceOf: () => 1, refreshNow: async () => void refreshes++ },
-      { ...DEFAULT_LEDGER_OPTIONS, storePath: '' },
+      { ...TEST_OPTIONS, storePath: '' },
     );
     ledger.open(input(), NOW);
     await sampleAt(ledger, NOW + 1_000);
