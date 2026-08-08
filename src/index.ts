@@ -538,6 +538,15 @@ async function main(): Promise<void> {
     // cards are fiction). ensureToken above is deliberate — the price oracle
     // can only quote tokens the store knows about.
     if (swap.distribution === true) {
+      // Metrics only, never the feed: the chain-head and last-event tiles must
+      // reflect that the listener is alive even when every event is an
+      // allocation — otherwise a distribution-heavy hour renders as "block –"
+      // and reads as a dead listener. The swap ring, SSE stream and aggregator
+      // stay distribution-free.
+      store.updateMetrics({
+        lastBlock: Math.max(store.metrics.lastBlock, swap.blockNumber),
+        lastEventAt: swap.timestamp,
+      });
       try {
         v2Shadow.onSwap(swap);
       } catch (err) {
