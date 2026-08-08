@@ -1,3 +1,4 @@
+import { logger } from '../logger.js';
 import { rpcHost } from '../chain/rpcLog.js';
 
 /**
@@ -38,6 +39,18 @@ export interface SchedulerStats {
   rateLimitRetries: number;
   /** Currently in a cooldown imposed by a 429. */
   cooling: boolean;
+  /** Sustained requests per second this bucket is admitting. */
+  ratePerSec: number;
+  /** Calls dropped at the front of the queue because their deadline had passed. */
+  expired: number;
+}
+
+/** A queued call whose caller's deadline elapsed before the bucket reached it. */
+export class RpcDeadlineExceeded extends Error {
+  constructor(host: string, waitedMs: number) {
+    super(`rpc scheduler: ${host} deadline exceeded after ${Math.round(waitedMs)}ms in queue`);
+    this.name = 'RpcDeadlineExceeded';
+  }
 }
 
 export interface SchedulerOptions {
@@ -63,6 +76,9 @@ interface QueuedCall {
   fn: () => Promise<unknown>;
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
+  /** Wall-clock time after which dispatching this call is pointless. */
+  expiresAt: number | null;
+  queuedAt: number;
 }
 
 const realSleep = (ms: number): Promise<void> =>
@@ -73,8 +89,8 @@ const realSleep = (ms: number): Promise<void> =>
 export class RpcScheduler {
   private tokens: number;
   private last: number;
-  private readonly capacity: number;
-  private readonly rate: number;
+  private capacity: number;
+  private rate: number;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   /**
@@ -94,6 +110,7 @@ export class RpcScheduler {
   private throttled = 0;
   private throttleWaitMs = 0;
   private rateLimitRetries = 0;
+  private expired = 0;
 
   constructor(
     readonly host: string,
@@ -107,6 +124,26 @@ export class RpcScheduler {
     this.last = this.now();
   }
 
+  /** The sustained rate this bucket admits. Reported so it is verifiable live
+   *  rather than inferred from `dispatched / uptime` after an incident. */
+  get ratePerSec(): number {
+    return this.rate;
+  }
+
+  /**
+   * Raise the sustained rate. Only ever upward, and only from an explicit
+   * configured request — see `schedulerFor`. Lowering is deliberately not
+   * offered: a caller that wants to be gentle should queue less, not slow every
+   * other caller on the host down with it.
+   */
+  raiseRate(ratePerSec: number): void {
+    if (!(ratePerSec > this.rate)) return;
+    const from = this.rate;
+    this.rate = Math.max(ratePerSec, 0.001);
+    this.capacity = Math.max(Math.ceil(this.rate), 1);
+    logger.info({ host: this.host, from, to: this.rate }, 'rpc scheduler: rate raised by an explicit request');
+  }
+
   /**
    * Run `fn` under the bucket.
    *
@@ -115,21 +152,52 @@ export class RpcScheduler {
    * occupying the host. Counting only the waiting ones would report a depth of
    * zero at exactly the moment the host is most loaded.
    */
-  async run<T>(fn: () => Promise<T>, priority: SchedulerPriority = 'normal'): Promise<T> {
+  async run<T>(fn: () => Promise<T>, priority: SchedulerPriority = 'normal', deadlineMs?: number): Promise<T> {
     this.queueDepth += 1;
     if (this.queueDepth > this.peakQueueDepth) this.peakQueueDepth = this.queueDepth;
+    const queuedAt = this.now();
     return new Promise<T>((resolve, reject) => {
       this.queues[priority].push({
         fn: fn as () => Promise<unknown>,
         resolve: resolve as (value: unknown) => void,
         reject,
+        expiresAt: deadlineMs != null && deadlineMs > 0 ? queuedAt + deadlineMs : null,
+        queuedAt,
       });
       void this.drain();
     });
   }
 
+  /**
+   * The next call worth dispatching — dropping any whose deadline passed while
+   * it waited.
+   *
+   * Without this the queue compounds instead of recovering. Measured on the
+   * feed 2026-08-08: v2 asked for a quote on every distribution, ~2,200 pool
+   * reads piled up against a 2/s bucket, and each one was still dispatched
+   * ~18 minutes later — long after the 180s gate that wanted it had given up.
+   * The bucket spent its entire budget answering dead questions, so the live
+   * ones behind them timed out too, and market cap resolved on 0.5% of sheets.
+   *
+   * A caller that has stopped waiting must stop consuming the host's rate.
+   */
   private next(): QueuedCall | undefined {
-    return this.queues.live.shift() ?? this.queues.normal.shift() ?? this.queues.background.shift();
+    for (;;) {
+      const job = this.queues.live.shift() ?? this.queues.normal.shift() ?? this.queues.background.shift();
+      if (!job) return undefined;
+      if (this.dropIfExpired(job)) continue;
+      return job;
+    }
+  }
+
+  /** Reject and account for a job past its deadline. True when it was dropped. */
+  private dropIfExpired(job: QueuedCall): boolean {
+    const t = this.now();
+    if (job.expiresAt == null || t < job.expiresAt) return false;
+    this.expired += 1;
+    this.queueDepth -= 1;
+    job.reject(new RpcDeadlineExceeded(this.host, t - job.queuedAt));
+    return true;
   }
 
   /**
@@ -147,6 +215,14 @@ export class RpcScheduler {
         const job = this.next();
         if (!job) return;
         await this.take();
+        // Waiting for a token is where a queued call spends its life, so the
+        // deadline has to be re-checked here — checking only on dequeue admits
+        // every doomed call that was merely first in line. The token is handed
+        // back: nothing was sent, so nothing was owed to the host.
+        if (this.dropIfExpired(job)) {
+          this.tokens += 1;
+          continue;
+        }
         this.dispatched += 1;
         void job.fn().then(job.resolve, job.reject).finally(() => {
           this.queueDepth -= 1;
@@ -213,6 +289,8 @@ export class RpcScheduler {
       throttleWaitMs: Math.round(this.throttleWaitMs),
       rateLimitRetries: this.rateLimitRetries,
       cooling: this.cooldownUntil > this.now(),
+      ratePerSec: this.rate,
+      expired: this.expired,
     };
   }
 }
@@ -229,7 +307,19 @@ const registry = new Map<string, RpcScheduler>();
 export function schedulerFor(url: string, opts?: Partial<SchedulerOptions>): RpcScheduler {
   const host = rpcHost(url);
   let s = registry.get(host);
-  if (!s) {
+  if (s) {
+    // The bucket is created by whichever subsystem touches the host FIRST, and
+    // every later caller's options were silently discarded. That made the rate
+    // depend on module import order: `PRICE_RPC_RPS=8` was configured, believed
+    // to be in effect, and measured at 2.02/s on the live feed because attrib
+    // had registered the same host at the default first. A rate that quietly
+    // means something other than what it says is the whole bug class this file
+    // was written to prevent, so an explicit higher request now RAISES the
+    // shared bucket — and says so.
+    if (opts?.ratePerSec != null && opts.ratePerSec > s.ratePerSec) s.raiseRate(opts.ratePerSec);
+    return s;
+  }
+  {
     // The free Robinhood RPC has repeatedly 429ed above this rate. Two requests
     // per second sustains the 4-second live poll (head + two Transfer queries)
     // while leaving sparse capacity for shadow enrichment. A source that proves

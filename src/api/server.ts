@@ -13,6 +13,7 @@ import type { PerformanceTracker } from '../engine/performance.js';
 import type { SniperRegistry } from '../sniper/registry.js';
 import type { HyperSyncShadow } from '../chain/shadow.js';
 import type { AttributionShadow } from '../attrib/runtime.js';
+import { allSchedulerStats } from '../attrib/scheduler.js';
 import { liveTradeShadowTally } from '../chain/liveTradeVerifier.js';
 import type { V2Shadow } from '../v2/runtime.js';
 import { DEFAULT_LANES, describeCondition } from '../v2/lanes.js';
@@ -319,6 +320,13 @@ export async function buildServer(
         },
       },
       price: price ? (price as unknown as { debug?: () => Record<string, unknown> }).debug?.() ?? null : null,
+      // The shared per-host RPC buckets. Here rather than only under /api/attrib
+      // because "market cap resolves on 0.5% of sheets" was diagnosed on
+      // 2026-08-08 from `queueDepth` and `dispatched / uptime` — the price
+      // subsystem looked healthy in isolation and was starving on a bucket it
+      // does not own. `ratePerSec` is reported because the configured rate and
+      // the effective one had silently diverged.
+      rpc: allSchedulerStats(),
       v2: v2s
         ? {
             enabled: v2s.enabled,

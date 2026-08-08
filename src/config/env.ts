@@ -519,7 +519,19 @@ const schema = z.object({
   PRICE_RPC_URL: z.string().default(''),
   // Bounded read budget for alert-time canonical pool checks. This is not a
   // WebSocket subscription and defaults to a deliberately modest 8 rps.
+  //
+  // Until 2026-08-08 this number did nothing: the bucket is shared per HOST and
+  // was created by whichever subsystem reached the host first, which discarded
+  // every later caller's options. The live feed measured 2.02 rps here against
+  // the 8 configured. `schedulerFor` now raises the shared bucket instead.
   PRICE_RPC_RPS: num(8),
+  // How long a queued pool read may wait for the shared bucket before it is
+  // dropped unsent. A quote nobody is still waiting for must not spend the
+  // host's rate: with no deadline, one burst of new tokens queues thousands of
+  // reads and every later read — including the live ones — starves behind them.
+  // Sized well under the v2 gate's own patience so an expiry frees budget while
+  // the sheet can still be retried.
+  PRICE_RPC_DEADLINE_MS: num(20000),
   // DEVELOPMENT ONLY. Fabricates a price by hashing the token address when no
   // real source has one, so a chainless dev run still produces numbers.
   //

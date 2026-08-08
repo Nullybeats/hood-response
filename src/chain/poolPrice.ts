@@ -74,7 +74,12 @@ class ScheduledJsonRpcProvider extends JsonRpcProvider {
     try {
       // Pool price and creation-time evidence are alert-critical. They outrank
       // attribution backfills but remain inside this small explicit budget.
-      return await sched.run(() => super._send(payload), 'normal');
+      //
+      // The deadline is what stops a burst from compounding. A quote is wanted
+      // by a gate that gives up at `maxPendingMs`; one that surfaces from the
+      // queue minutes later cannot be used by anybody, and dispatching it just
+      // pushes the next live read further back. Expiring it returns the budget.
+      return await sched.run(() => super._send(payload), 'normal', config.PRICE_RPC_DEADLINE_MS);
     } catch (err) {
       // Ethers wraps HTTP failures. Preserve its error for callers, but make a
       // provider-level 429 cool the same shared bucket as every other caller.

@@ -38,10 +38,17 @@ import { scoreSheet, type ScoreResult } from './score.js';
  * that into a retry rather than a guess.
  */
 export interface V2Providers {
-  /** Verified market cap, or null when supply or price is unestablished. */
-  marketCap(token: string): number | null;
+  /**
+   * Verified market cap, or null when supply or price is unestablished.
+   *
+   * `warm` asks whether it is worth spending a network round trip to go and
+   * FIND OUT when the answer is not already cached. False never changes the
+   * answer — an unknown cap stays unknown either way — it only declines to pay
+   * for one that no lane could act on. See `worthPricing`.
+   */
+  marketCap(token: string, warm?: boolean): number | null;
   /** Hours since the pool was created, with the source that established it. */
-  pairAge(token: string): { hours: number; source: string } | null;
+  pairAge(token: string, warm?: boolean): { hours: number; source: string } | null;
   /** Sellability — null when no honeypot check has actually run. */
   canSell(token: string): boolean | null;
   /** Resolved outcome history for a wallet. Empty ⇒ ungraded (`U`). */
@@ -530,10 +537,38 @@ export class V2Shadow {
     return [...new Set(marks.filter((m) => now - m.at <= this.opts.crowdWindowMs).map((m) => m.wallet))];
   }
 
+  /**
+   * Is a live quote worth a network round trip for this trade?
+   *
+   * Pricing a token nobody has quoted yet costs a cold Uniswap v4/v3 pool
+   * discovery — roughly ten RPC reads through a bucket the whole process
+   * shares. That was affordable when v2 saw a handful of verified buys. It is
+   * not affordable now: the feed intakes ~500 distributions per boot, almost
+   * all of them airdrops, and measured on 2026-08-08 those queued ~2,200 pool
+   * reads against a 2/s host. Every gate then timed out waiting, market cap
+   * resolved on 0.5% of sheets, and NOTHING matched — including the alpha-seed
+   * allocations the whole lane exists for.
+   *
+   * The saving is safe because it is not a guess. An unknown cap stays unknown
+   * and the gate still blocks on it; we simply stop paying to answer a question
+   * whose answer could not change any verdict. Every lane that admits a
+   * DISTRIBUTION requires an alpha/beta seed wallet (asserted in lanes.test.ts,
+   * so adding a lane that breaks the assumption fails the build rather than
+   * silently starving), and no lane matches a distribution from anyone else at
+   * any cap. Verified buys are always warmed: they are rare here and every lane
+   * is open to them.
+   */
+  private worthPricing(trade: SwapEvent, seedTier: WalletTier | null): boolean {
+    if (trade.distribution !== true) return true;
+    return seedTier === 'alpha' || seedTier === 'beta';
+  }
+
   private buildSheet(trade: SwapEvent, now: number): FactSheet {
-    const age = this.providers.pairAge(trade.token);
+    const seedTier = this.providers.seedTier?.(trade.wallet) ?? null;
+    const warm = this.worthPricing(trade, seedTier);
+    const age = this.providers.pairAge(trade.token, warm);
     const inputs: SheetInputs = {
-      marketCap: this.providers.marketCap(trade.token),
+      marketCap: this.providers.marketCap(trade.token, warm),
       pairAgeHours: age?.hours ?? null,
       pairAgeSource: age?.source ?? null,
       canSell: this.providers.canSell(trade.token),
@@ -550,7 +585,7 @@ export class V2Shadow {
       firstBuy: trade.distribution === true ? false : this.firstBuyMemo(trade),
       rotatedFrom: null,
       eventType: trade.distribution === true ? 'distribution' : 'verified-buy',
-      seedTier: this.providers.seedTier?.(trade.wallet) ?? null,
+      seedTier,
       usdValueLate:
         trade.usdValue == null ? (this.providers.usdValueNow?.(trade.token, trade.amount) ?? null) : null,
     };

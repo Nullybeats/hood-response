@@ -230,3 +230,41 @@ describe('diary supersede', () => {
     expect(diary.recent(1)[0]!.outcome).not.toBe('waiting');
   });
 });
+
+/**
+ * `V2Shadow.worthPricing` declines to spend a cold pool read (~10 RPC calls
+ * through a bucket the whole process shares) on a distribution from a wallet
+ * outside the alpha/beta seed catalog. That saving is only safe while no lane
+ * can match such an event — otherwise the lane would never fire and the reason
+ * would be invisible, which is the exact failure mode measured on 2026-08-08.
+ *
+ * This asserts the premise rather than trusting it: adding a distribution lane
+ * with a looser seed requirement breaks the build instead of silently starving.
+ */
+describe('the premise behind skipping a quote', () => {
+  it('every lane that admits a distribution requires an alpha or beta seed', () => {
+    const distributionLanes = DEFAULT_LANES.filter((lane) =>
+      lane.conditions.some((c) => c.kind === 'eventType' && c.is === 'distribution'),
+    );
+    // If this is ever zero the assertion below passes vacuously.
+    expect(distributionLanes.length).toBeGreaterThan(0);
+
+    for (const lane of distributionLanes) {
+      const seed = lane.conditions.find((c) => c.kind === 'seedTierIn');
+      expect(seed, `lane "${lane.id}" admits distributions without a seed-tier condition`).toBeDefined();
+      const tiers = [...(seed as { in: readonly string[] }).in].sort();
+      expect(tiers, `lane "${lane.id}" accepts a seed tier that is never priced`).toEqual(['alpha', 'beta']);
+    }
+  });
+
+  it('no lane admits a distribution without naming the event type', () => {
+    // A lane with no eventType condition would match BOTH buys and
+    // distributions, so the skip rule above would starve it silently.
+    for (const lane of DEFAULT_LANES) {
+      expect(
+        lane.conditions.some((c) => c.kind === 'eventType'),
+        `lane "${lane.id}" does not state which event type it is for`,
+      ).toBe(true);
+    }
+  });
+});

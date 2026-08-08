@@ -108,6 +108,82 @@ describe('shared RPC scheduler', () => {
   });
 });
 
+/**
+ * The failure these prevent was measured, not imagined. On 2026-08-08 the live
+ * feed queued ~2,200 pool reads against a 2/s bucket; each was dispatched about
+ * eighteen minutes later, long after the 180s gate that asked for it had given
+ * up. Market cap resolved on 0.5% of fact sheets and the sniper's only working
+ * lane could never match.
+ */
+describe('a queued call that nobody is waiting for any more', () => {
+  beforeEach(() => resetSchedulers());
+
+  it('is dropped instead of dispatched once its deadline passes', async () => {
+    const c = fakeClock();
+    // One request per second, so the second call waits ~1s for a token.
+    const s = new RpcScheduler('h', { ratePerSec: 1, burst: 1, now: c.now, sleep: c.sleep });
+    const ran: string[] = [];
+    const first = s.run(async () => void ran.push('first'));
+    const doomed = s.run(async () => void ran.push('doomed'), 'normal', 500);
+    await first;
+    await expect(doomed).rejects.toThrow(/deadline exceeded/);
+    expect(ran).toEqual(['first']);
+    expect(s.stats().expired).toBe(1);
+    expect(s.stats().dispatched).toBe(1);
+  });
+
+  /**
+   * The negative control for the fix above: with no deadline the same call is
+   * still dispatched after the same wait. If this ever starts failing, the
+   * expiry is dropping work it was never asked to drop.
+   */
+  it('is still dispatched when the caller set no deadline', async () => {
+    const c = fakeClock();
+    const s = new RpcScheduler('h', { ratePerSec: 1, burst: 1, now: c.now, sleep: c.sleep });
+    const ran: string[] = [];
+    await Promise.all([
+      s.run(async () => void ran.push('first')),
+      s.run(async () => void ran.push('patient')),
+    ]);
+    expect(ran).toEqual(['first', 'patient']);
+    expect(s.stats().expired).toBe(0);
+  });
+
+  it('does not leak queue depth when it expires', async () => {
+    const c = fakeClock();
+    const s = new RpcScheduler('h', { ratePerSec: 1, burst: 1, now: c.now, sleep: c.sleep });
+    const first = s.run(async () => undefined);
+    const doomed = s.run(async () => undefined, 'normal', 1);
+    await first;
+    await expect(doomed).rejects.toThrow();
+    expect(s.stats().queueDepth).toBe(0);
+  });
+});
+
+describe('the rate a host actually gets', () => {
+  beforeEach(() => resetSchedulers());
+
+  /**
+   * `PRICE_RPC_RPS=8` was configured, believed to be in effect, and measured at
+   * 2.02 rps on the live feed — because attribution had registered the same
+   * host at the default first and every later caller's options were discarded.
+   * A knob that silently means something else is worse than no knob.
+   */
+  it('is raised by a later explicit request, not silently discarded', () => {
+    const first = schedulerFor('https://rpc.example.com/attrib');
+    expect(first.ratePerSec).toBe(2);
+    const second = schedulerFor('https://rpc.example.com/price', { ratePerSec: 8 });
+    expect(second).toBe(first);
+    expect(first.ratePerSec).toBe(8);
+  });
+
+  it('is never lowered by a later caller that wants to be gentle', () => {
+    const s = schedulerFor('https://rpc.example.com', { ratePerSec: 8 });
+    schedulerFor('https://rpc.example.com', { ratePerSec: 1 });
+    expect(s.ratePerSec).toBe(8);
+  });
+});
+
 describe('pool verification is deduplicated and single-flight', () => {
   const POOL = '0x2dc56aa90f90a328e0fad9660bf01115bac2d628';
   const FACTORY = V3_FACTORY.toLowerCase();

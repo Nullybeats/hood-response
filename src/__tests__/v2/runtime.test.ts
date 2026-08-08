@@ -433,3 +433,67 @@ describe('V2Shadow', () => {
     expect(s.diary.size).toBe(0);
   });
 });
+
+/**
+ * The pricing budget is the scarcest thing in this pipeline.
+ *
+ * Measured on the live feed 2026-08-08: ~500 distributions per boot each asked
+ * for a cold Uniswap v4/v3 pool discovery, queueing ~2,200 RPC reads against a
+ * 2/s shared bucket. Every fact sheet then timed out waiting, market cap
+ * resolved on 0.5% of them, and the Allocation lane — the only lane that can
+ * fire on this feed — matched nothing at all.
+ *
+ * `warm: false` never changes an answer. It declines to go and LOOK for one
+ * that no lane could act on. See `V2Shadow.worthPricing`.
+ */
+describe('what is worth a network round trip', () => {
+  function spyProviders(seedTier: (w: string) => 'alpha' | 'beta' | 'chroma' | null) {
+    const warmed: { token: string; warm: boolean }[] = [];
+    const p = providers({
+      // Unknown until somebody pays to find out — the state of a new coin.
+      marketCap: (token: string, warm = true) => {
+        warmed.push({ token, warm });
+        return null;
+      },
+      seedTier,
+    });
+    return { p, warmed };
+  }
+
+  it('does not price a distribution to a wallet no lane would accept', () => {
+    const { p, warmed } = spyProviders(() => 'chroma');
+    shadow = makeShadow(p);
+    shadow.onSwap(swap({ distribution: true }));
+    expect(warmed).toHaveLength(1);
+    expect(warmed[0]!.warm).toBe(false);
+  });
+
+  it('still prices a distribution to an alpha or beta seed wallet', () => {
+    for (const tier of ['alpha', 'beta'] as const) {
+      const { p, warmed } = spyProviders(() => tier);
+      shadow = makeShadow(p);
+      shadow.onSwap(swap({ distribution: true }));
+      expect(warmed[0]!.warm, `${tier} seed must still be priced`).toBe(true);
+      shadow.stop();
+    }
+  });
+
+  it('always prices a verified buy, whoever made it', () => {
+    const { p, warmed } = spyProviders(() => null);
+    shadow = makeShadow(p);
+    shadow.onSwap(swap({ distribution: false }));
+    expect(warmed[0]!.warm).toBe(true);
+  });
+
+  /**
+   * The skip must not become a silent third state. An unpriced sheet still
+   * reaches a verdict and still says market cap is unknown — the operator sees
+   * the same honest block, just without paying for it.
+   */
+  it('records a verdict for a skipped sheet exactly as it would for a priced one', () => {
+    const { p } = spyProviders(() => 'chroma');
+    shadow = makeShadow(p);
+    shadow.onSwap(swap({ distribution: true }));
+    expect(shadow.diary.size).toBe(1);
+  });
+});

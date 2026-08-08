@@ -320,18 +320,18 @@ async function main(): Promise<void> {
   const walletOutcomes = new WalletOutcomes(v2Ledger, 'distribution');
 
   const v2Shadow = new V2Shadow({
-    marketCap: (token) => {
+    marketCap: (token, warm = true) => {
       const t = store.tokensByAddress.get(token.toLowerCase());
       const cap = t ? price.marketCap(t) : null;
-      if (cap == null) warmQuote(token);
+      if (cap == null && warm) warmQuote(token);
       return cap;
     },
-    pairAge: (token) => {
+    pairAge: (token, warm = true) => {
       const created = price.pairCreatedAt(token);
       if (created == null) {
         // pairCreatedAt comes with the DexScreener record, which the same quote
         // path fetches when the pool read cannot answer on its own.
-        warmQuote(token);
+        if (warm) warmQuote(token);
         return null;
       }
       // Sourced from the indexer, and labelled as such: an on-chain Initialize
