@@ -133,8 +133,26 @@ export function buildEntry(
  * missing-evidence problem, the second is a real "not good enough", and conflating
  * them is how a data outage reads as a quiet market.
  */
+/**
+ * The lane a small change could have made match — the tuning signal.
+ *
+ * A lane that failed on `eventType` is excluded outright. That is a CATEGORY mismatch, not a near
+ * miss: no threshold anyone can move will turn a verified buy into an allocation, so reporting it
+ * as "closest" points the operator at a knob that does not exist. It only became reachable when
+ * the Allocation lane grew a condition and its raw met-count started outranking lanes that were
+ * genuinely one number away — which is the flaw in counting met conditions without asking whether
+ * the unmet one is movable.
+ *
+ * Among the rest, more conditions already satisfied means closer, and a lane blocked only by an
+ * unknown fact ranks below one that failed a real test — "we could not tell" is a gap in evidence
+ * to go and close, not a threshold to tune.
+ */
 function closest(lanes: readonly LaneVerdict[]): LaneVerdict | null {
-  const candidates = lanes.filter((l) => !l.matched);
+  const candidates = lanes.filter(
+    (l) =>
+      !l.matched &&
+      !l.results.some((r) => r.condition.kind === 'eventType' && r.outcome === 'unmet'),
+  );
   if (candidates.length === 0) return null;
   return [...candidates].sort((a, b) => {
     const met = (l: LaneVerdict) => l.results.filter((r) => r.outcome === 'met').length;

@@ -35,6 +35,20 @@ export type Condition =
   | { kind: 'firstBuy'; is: boolean }
   | { kind: 'pairAgeHoursBelow'; hours: number }
   | { kind: 'capBand'; in: readonly CapBand[] }
+  /**
+   * A FLOOR on entry market cap, in USD.
+   *
+   * `capBand` alone is a ceiling wearing a band's clothes: `micro` is defined as everything up to
+   * $125,000, so `capBand: [micro, small]` accepts $0 through $1M and a token at its launch seed
+   * price passes as easily as an established one. The legacy engine had an explicit
+   * `ALERT_MIN_MARKETCAP` of $25,000 and a `SOLO_MIN/MAX` window of $25k–$125k; the v2 rebuild kept
+   * the ceiling and dropped the floor.
+   *
+   * [verified 2026-08-08, 275 archived calls] Below $25k: 20 calls, **zero** wins, +1.4% average
+   * peak. At or above: 255 calls, 96 wins, ~+82% average peak. The boundary was derived from our
+   * own archive and independently matches the number the legacy engine already used.
+   */
+  | { kind: 'capAtLeast'; usd: number }
   | { kind: 'crowdSizeAtLeast'; n: number }
   | { kind: 'crowdGpaAtLeast'; gpa: number }
   /**
@@ -137,16 +151,24 @@ export const DEFAULT_LANES: readonly Lane[] = [
     // The score floor is the other half. A matched allocation could carry a null
     // score, which downstream renders as "—" and silently suppresses the alert
     // tier entirely — a signal that fires and is never seen.
+    //
+    // THE CAP FLOOR IS LOAD-BEARING. Without it this lane spent its first day calling tokens at
+    // their ~$2,600 launch seed price: 13 of 15 calls entered between $2,601 and $2,662 across 12
+    // distinct tokens, and almost every one peaked at exactly +0.0% — nobody ever bought them. The
+    // two that did trade went −76.6% and −23.5%. A token at its launch cap has no market to be
+    // right about, and this lane's premise is that a seeded wallet knows something the market does
+    // not yet — which requires there to BE a market.
     id: 'allocation',
     emoji: '🎁',
     name: 'Allocation',
     sentence:
-      'ONE alpha/beta-seed wallet RECEIVES a token under 48h old at micro/small cap, scoring 60+',
+      'ONE alpha/beta-seed wallet RECEIVES a token over $25k and under 48h old, at micro/small cap, scoring 60+',
     conditions: [
       { kind: 'eventType', is: 'distribution' },
       { kind: 'seedTierIn', in: ['alpha', 'beta'] },
       { kind: 'cohortAtMost', n: 1 },
       { kind: 'pairAgeHoursBelow', hours: 48 },
+      { kind: 'capAtLeast', usd: 25_000 },
       { kind: 'capBand', in: ['micro', 'small'] },
       { kind: 'scoreAtLeast', score: 60 },
     ],
@@ -219,6 +241,16 @@ function check(condition: Condition, sheet: FactSheet, score: ScoreResult): Cond
         ? r('met', `pair ${Math.round(h)}h old`)
         : r('unmet', `pair ${Math.round(h)}h old, needed under ${condition.hours}h`);
     }
+    case 'capAtLeast': {
+      // Fails closed on an unknown cap, exactly as the gate does. "We could not price it" is not
+      // evidence that it clears the floor — and an unpriced token is precisely the brand-new coin
+      // this floor exists to keep out.
+      if (!isKnown(sheet.marketCap)) return r('unknown', 'market cap unknown');
+      const c = sheet.marketCap.value;
+      return c >= condition.usd
+        ? r('met', `$${Math.round(c).toLocaleString('en-US')} cap`)
+        : r('unmet', `$${Math.round(c).toLocaleString('en-US')} cap, needed at least $${condition.usd.toLocaleString('en-US')}`);
+    }
     case 'capBand': {
       if (!isKnown(sheet.capBand)) return r('unknown', 'market cap unknown');
       const b = sheet.capBand.value;
@@ -272,6 +304,8 @@ export function describeCondition(c: Condition): string {
       return c.is ? 'first-ever buy of this token' : 'not a first buy';
     case 'pairAgeHoursBelow':
       return `pair under ${c.hours}h old`;
+    case 'capAtLeast':
+      return `market cap at least $${c.usd.toLocaleString('en-US')}`;
     case 'capBand':
       return `${c.in.join(' or ')} market cap`;
     case 'crowdSizeAtLeast':

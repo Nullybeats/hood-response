@@ -268,3 +268,102 @@ describe('the premise behind skipping a quote', () => {
     }
   });
 });
+
+/**
+ * The cap FLOOR on the Allocation lane.
+ *
+ * Measured 2026-08-08 across 275 archived calls: below $25k, 20 calls produced ZERO winners at
+ * +1.4% average peak; at or above, 255 calls produced 96 winners at ~+82%. The lane's first day
+ * live demonstrated the failure directly — 13 of 15 calls entered between $2,601 and $2,662 (the
+ * launchpad's seed price) across 12 distinct tokens, nearly all peaking at exactly +0.0%, with the
+ * two that traded going −76.6% and −23.5%.
+ *
+ * `capBand: ['micro','small']` cannot express this: `micro` is everything up to $125,000, so the
+ * band has a ceiling and no floor at all.
+ */
+describe('the Allocation lane will not buy a token at its launch cap', () => {
+  const alloc = DEFAULT_LANES.find((l) => l.id === 'allocation')!;
+
+  /** A sheet that satisfies every OTHER allocation condition, so cap is the only variable. */
+  function allocationSheet(marketCap: number | null) {
+    const inputs: SheetInputs = {
+      marketCap,
+      pairAgeHours: 1,
+      pairAgeSource: 'test',
+      canSell: true,
+      outcomesByWallet: new Map(),
+      crowdWallets: [],
+      cohortSize: 1,
+      firstBuy: false,
+      rotatedFrom: null,
+      eventType: 'distribution',
+      seedTier: 'beta',
+      usdValueLate: null,
+    };
+    return buildFactSheet({ ...trade, venue: 'transfer_in' }, inputs, NOW);
+  }
+
+  function verdict(marketCap: number | null) {
+    const sheet = allocationSheet(marketCap);
+    return evaluateLanes(sheet, scoreSheet(sheet), [alloc])[0]!;
+  }
+
+  it('rejects the $2,626 launch-seed cap that produced the duds', () => {
+    const v = verdict(2_626);
+    expect(v.matched).toBe(false);
+    expect(v.reason).toContain('needed at least $25,000');
+  });
+
+  it('rejects $16,691 — the cap ZUMI was called at before it fell 76%', () => {
+    expect(verdict(16_691).matched).toBe(false);
+  });
+
+  it('accepts a cap inside the band that historically wins', () => {
+    const v = verdict(60_000);
+    expect(v.results.find((r) => r.condition.kind === 'capAtLeast')!.outcome).toBe('met');
+  });
+
+  /**
+   * Fails CLOSED, like the gate. An unpriceable token is exactly the brand-new coin the floor
+   * exists to exclude, so "we could not measure it" must never read as "it cleared the floor".
+   */
+  it('treats an unknown cap as unknown, never as passing', () => {
+    const v = verdict(null);
+    const c = v.results.find((r) => r.condition.kind === 'capAtLeast')!;
+    expect(c.outcome).toBe('unknown');
+    expect(v.matched).toBe(false);
+  });
+
+  it('still refuses a cap above the band ceiling, so the window is bounded at both ends', () => {
+    // $5M is over the micro/small ceiling — the floor must not have replaced the ceiling.
+    const v = verdict(5_000_000);
+    expect(v.matched).toBe(false);
+    expect(v.results.find((r) => r.condition.kind === 'capBand')!.outcome).toBe('unmet');
+  });
+});
+
+/**
+ * A near miss must be something a THRESHOLD could have changed.
+ *
+ * `closest()` ranks by how many conditions a lane already met, and that alone is not enough: the
+ * Allocation lane can accumulate met conditions on a verified BUY and still be unreachable,
+ * because its `eventType` requirement is a category, not a number. Surfaced when the cap floor was
+ * added — one more met condition was enough to make it outrank a lane that really was one number
+ * away, and the diary started reporting "verified-buy, lane wants distribution" as the tuning hint.
+ */
+describe('near-miss reporting points at a movable knob', () => {
+  it('never reports a lane that failed on event type', () => {
+    // A verified BUY: allocation can never match it, whatever its other facts say.
+    const { entry, lanes } = evaluate({ outcomesByWallet: new Map([[WALLET, outcomesFor(1.05)]]) });
+    const alloc = lanes.find((l) => l.laneId === 'allocation')!;
+    expect(alloc.matched).toBe(false);
+    expect(alloc.results.some((r) => r.condition.kind === 'eventType' && r.outcome === 'unmet')).toBe(true);
+    expect(entry.nearMiss?.laneId).not.toBe('allocation');
+  });
+
+  it('still reports a lane that missed on a number, with the shortfall', () => {
+    const { entry } = evaluate({ outcomesByWallet: new Map([[WALLET, outcomesFor(1.05)]]) });
+    expect(entry.nearMiss).not.toBeNull();
+    expect(entry.reason).toMatch(/needed/);
+  });
+});
