@@ -138,28 +138,34 @@ describe('lanes as the buy rule', () => {
    * A v2 match must never be judged by legacy rules — it has none of the fields
    * they read, so every one of them would silently pass.
    */
-  it('ignores primeOnly, kinds and conviction for a v2 signal', async () => {
+  it('buys a v2 match on lanes alone, with no legacy setting consulted', async () => {
     const log: string[] = [];
     const eng = await armed(log, ['allocation']);
-    // primeOnly would reject anything without `prime`; kinds would reject a
-    // missing kind. Neither may be consulted.
+    // These fields still exist in the persisted blob so a rollback keeps operator config, but
+    // nothing reads them any more. Setting them to values that WOULD have rejected this match is
+    // the assertion: it buys regardless.
     eng.updateSettings({ primeOnly: true, kinds: 'ENTRY', minConviction: 90 });
     await eng.onAlert(v2());
     expect(log).toEqual(['buy:0xtok:0.0005']);
   });
 
-  /** And the reverse: a legacy alert must not be judged by lane rules. */
-  it('still applies the legacy rules to a legacy alert', async () => {
+  /**
+   * And the reverse: a legacy alert is REFUSED, not re-judged.
+   *
+   * It cannot be allowed to fall through to the lane checks — it carries no `lanes` and no
+   * `score`, and `undefined < minScore` is false, so a rule that looks like it is filtering would
+   * pass it. Refusing by shape is the only version of this that fails closed.
+   */
+  it('refuses a legacy alert instead of judging it by lane rules', async () => {
     const log: string[] = [];
     const eng = await armed(log, ['allocation']);
-    eng.updateSettings({ primeOnly: false, kinds: 'ENTRY' });
     await eng.onAlert({
       id: 'legacy1', kind: 'BUY', token: '0xb', tokenSymbol: 'OLD', walletCount: 2, wallets: [],
       walletSummary: '2 alpha', walletLabels: [], marketCap: 50_000, priceLive: true, priceUsd: 1,
-      conviction: 75, firstSeen: Date.now(),
+      conviction: 75, prime: true, firstSeen: Date.now(),
     } as unknown as Swarm);
     expect(log).toHaveLength(0);
-    expect(await reasonOf(eng)).toContain('kind BUY not in buy list');
+    expect(await reasonOf(eng)).toContain('legacy signal');
   });
 
   /**
@@ -222,19 +228,17 @@ describe('never twice into the same coin', () => {
     expect(await reasonOf(eng)).toContain('already holding');
   });
 
-  /** And a legacy alert must not be able to open a second position in a coin a
-   *  v2 match already bought — the dual-stream case, where the two producers
-   *  are the ones most likely to disagree. */
-  it('blocks a legacy alert on a coin a v2 match is already holding', async () => {
+  /**
+   * Two matches on one coin, spelled differently by whatever produced them. The engine consumes a
+   * single stream now, so this is no longer a cross-producer case — but the guard is a string
+   * comparison on an address, and normalising it is what makes the rule structural rather than a
+   * convention that happens to hold.
+   */
+  it('blocks a second match on a coin already held, whatever the address casing', async () => {
     const log: string[] = [];
     const eng = await armed(log, ['allocation']);
-    eng.updateSettings({ primeOnly: false, kinds: 'ENTRY' });
     await eng.onAlert(v2({ token: '0xtok' }));
-    await eng.onAlert({
-      id: 'legacy-dup', kind: 'ENTRY', token: '0xTok', tokenSymbol: 'GEM', walletCount: 2, wallets: [],
-      walletSummary: '2 alpha', walletLabels: [], marketCap: 50_000, priceLive: true, priceUsd: 1,
-      conviction: 75, firstSeen: Date.now(),
-    } as unknown as Swarm);
+    await eng.onAlert(v2({ token: '0xTok' }));
     expect(log).toHaveLength(1);
     expect(await reasonOf(eng)).toContain('already holding');
   });

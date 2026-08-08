@@ -18,7 +18,20 @@
 
 export interface CatchUpAlert {
   id?: string;
-  swarm?: { token?: string; firstSeen?: number };
+  swarm?: { token?: string; firstSeen?: number; emittedAt?: number };
+}
+
+/**
+ * When the DECISION was made, which is what the replay window is about.
+ *
+ * A v2 match carries both: `firstSeen` is the block the event landed in, `emittedAt` is when the
+ * gate finished judging it — and those differ by up to ~3 minutes, because v2 retries for facts
+ * and settles an allocation for 90s to count the wave. Aging a v2 match from its block would put
+ * essentially every one of them outside a seconds-wide replay window, so a reconnect would
+ * silently replay nothing. Legacy alerts have only `firstSeen`, where the two are the same thing.
+ */
+function decidedAt(a: CatchUpAlert): number | undefined {
+  return a.swarm?.emittedAt ?? a.swarm?.firstSeen;
 }
 
 /**
@@ -37,7 +50,7 @@ export function selectCatchUp<T extends CatchUpAlert>(
     .filter((a) => {
       if (!a?.id || seen.has(a.id)) return false;
       if (!a.swarm?.token) return false;
-      const ts = a.swarm.firstSeen;
+      const ts = decidedAt(a);
       // No timestamp = we cannot prove it is recent. Fail closed: an un-datable alert is far more
       // likely to be old history than something from the last second and a half.
       if (typeof ts !== 'number' || ts <= 0) return false;
@@ -45,7 +58,7 @@ export function selectCatchUp<T extends CatchUpAlert>(
       // Negative age = the feed's clock runs ahead of ours; that is still "just happened", not stale.
       return age <= maxAgeMs;
     })
-    .sort((a, b) => (a.swarm!.firstSeen ?? 0) - (b.swarm!.firstSeen ?? 0));
+    .sort((a, b) => (decidedAt(a) ?? 0) - (decidedAt(b) ?? 0));
 }
 
 /** Remember `id`, evicting oldest first so the set cannot grow without bound. */

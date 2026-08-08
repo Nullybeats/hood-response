@@ -23,16 +23,18 @@ function stubExecutor(log: string[]) {
     async prepareExit() {},
   } as unknown as import('../sniper/executor.js').SwapExecutor;
 }
+/** A v2 match — the only shape the engine buys from. Note `emittedAt`: freshness is measured from
+ *  when the DECISION was made, not from the block, because v2 waits up to ~3 minutes for facts. */
 function swarm(over: Partial<Swarm> = {}): Swarm {
-  return { id: 's1', kind: 'ENTRY', token: '0xtok', tokenSymbol: 'GEM', walletCount: 3, wallets: [], walletSummary: '3', walletLabels: [], totalUsd: 3000, marketCap: 60000, newToken: false, dexUrl: 'x', priceLive: true, priceUsd: 1, conviction: 75, convictionBreakdown: { walletQuality: 0, walletCount: 0, totalCapital: 0, velocity: 0, liquidity: 0, marketCap: 0, historicalAccuracy: 0, buySellRatio: 0 }, windowSeconds: 10, firstSeen: Date.now(), lastSeen: Date.now(), ...over } as Swarm;
+  return { id: 's1', source: 'v2', lanes: ['allocation'], score: 75, eventType: 'distribution', cohortSize: 1, emittedAt: Date.now(), token: '0xtok', tokenSymbol: 'GEM', walletCount: 1, wallets: [], walletSummary: '1 wallet', walletLabels: [], totalUsd: 3000, marketCap: 60000, newToken: false, dexUrl: 'x', priceLive: true, priceUsd: 1, firstSeen: Date.now(), lastSeen: Date.now(), ...over } as unknown as Swarm;
 }
 
 describe('Wave 2 — freshness gate + timing', () => {
-  it('skips an alert older than the staleness cutoff', async () => {
+  it('skips a match whose DECISION is older than the staleness cutoff', async () => {
     const log: string[] = [];
     const eng = new SniperEngine(stubPrice(), stubExecutor(log), stubSafety());
-    eng.updateSettings({ enabled: true, primeOnly: false, maxRoundtripPct: 0 });
-    await eng.onAlert(swarm({ firstSeen: Date.now() - 60_000 })); // 60s old ≫ 15s default
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'], maxRoundtripPct: 0 });
+    await eng.onAlert(swarm({ emittedAt: Date.now() - 60_000 })); // decided 60s ago ≫ 15s default
     expect(log).toHaveLength(0);
     expect((await eng.snapshot()).decisions[0]!.reason).toContain('stale');
   });
@@ -40,8 +42,8 @@ describe('Wave 2 — freshness gate + timing', () => {
   it('a fresh alert buys and records a per-stage latency breakdown', async () => {
     const log: string[] = [];
     const eng = new SniperEngine(stubPrice(), stubExecutor(log), stubSafety());
-    eng.updateSettings({ enabled: true, primeOnly: false, maxRoundtripPct: 0 });
-    await eng.onAlert(swarm({ firstSeen: Date.now(), receivedAt: Date.now(), enrichMs: 42 }));
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'], maxRoundtripPct: 0 });
+    await eng.onAlert(swarm({ emittedAt: Date.now(), receivedAt: Date.now(), enrichMs: 42 }));
     expect(log).toEqual(['buy:0xtok']);
     const pos = (await eng.snapshot()).positions[0]!;
     expect(pos.gateTimingsMs).toBeDefined();

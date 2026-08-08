@@ -64,12 +64,13 @@ function stubState(durable: Partial<StoredSniperState> | null): SniperStateStore
 function swarm(over: Partial<Swarm> = {}): Swarm {
   return {
     id: 's-' + Math.random().toString(36).slice(2),
-    kind: 'ENTRY', token: '0xtok', tokenSymbol: 'GEM', walletCount: 3, wallets: [],
-    walletSummary: '3 alpha', walletLabels: [], totalUsd: 3000, marketCap: 60_000,
-    newToken: false, dexUrl: 'x', priceLive: true, priceUsd: 1, conviction: 75,
-    convictionBreakdown: { walletQuality: 0, walletCount: 0, totalCapital: 0, velocity: 0, liquidity: 0, marketCap: 0, historicalAccuracy: 0, buySellRatio: 0 },
-    windowSeconds: 10, firstSeen: Date.now(), lastSeen: Date.now(), ...over,
-  } as Swarm;
+    source: 'v2', lanes: ['allocation'], score: 75, eventType: 'distribution', cohortSize: 1,
+    emittedAt: Date.now(),
+    token: '0xtok', tokenSymbol: 'GEM', walletCount: 1, wallets: [],
+    walletSummary: '1 wallet', walletLabels: [], totalUsd: 3000, marketCap: 60_000,
+    newToken: false, dexUrl: 'x', priceLive: true, priceUsd: 1,
+    firstSeen: Date.now(), lastSeen: Date.now(), ...over,
+  } as unknown as Swarm;
 }
 
 describe('Wave 0 — settings migration', () => {
@@ -107,22 +108,27 @@ describe('Wave 0 — settings migration', () => {
 });
 
 describe('Wave 0 — defaults & sticky state', () => {
-  it('a BUY-kind alert is skipped by default (BUY not in ENTRY,SOLO)', async () => {
+  /**
+   * The default is to buy NOTHING. Lanes replaced the kinds list, and an empty lane set is the
+   * honest default: the operator has not yet said which evidence they want capital committed on.
+   * Enabling the engine is not the same act as choosing a rule.
+   */
+  it('buys nothing by default, however good the signal', async () => {
     const log: string[] = [];
     const eng = new SniperEngine(stubPrice({ '0xtok': 1 }), stubExecutor(log), stubSafety());
-    eng.updateSettings({ enabled: true, primeOnly: false });
-    await eng.onAlert(swarm({ kind: 'BUY' }));
+    eng.updateSettings({ enabled: true });
+    await eng.onAlert(swarm({ score: 100 }));
     expect(log).toHaveLength(0);
     const d = (await eng.snapshot()).decisions;
-    expect(d[0]!.reason).toContain('kind BUY not in buy list');
+    expect(d[0]!.reason).toContain('no v2 lane is enabled');
   });
 
-  it('ENTRY and SOLO alerts both buy by default', async () => {
+  it('buys once a lane is named, on every token that matches it', async () => {
     const log: string[] = [];
     const eng = new SniperEngine(stubPrice({ '0xa': 1, '0xb': 1 }), stubExecutor(log), stubSafety());
-    eng.updateSettings({ enabled: true, primeOnly: false });
-    await eng.onAlert(swarm({ token: '0xa', kind: 'ENTRY' }));
-    await eng.onAlert(swarm({ token: '0xb', kind: 'SOLO' }));
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'] });
+    await eng.onAlert(swarm({ token: '0xa' }));
+    await eng.onAlert(swarm({ token: '0xb' }));
     expect(log).toEqual(['buy:0xa:0.0005', 'buy:0xb:0.0005']);
   });
 

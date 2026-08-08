@@ -722,46 +722,41 @@ export class SniperEngine {
     if (this.settings.newCoinsOnly && !swarm.firstSignal) {
       return this.decide(swarm, 'skipped', 'new coins only: token already appeared in Signals');
     }
-    // Two streams, two rule sets, never mixed. A v2 match carries `lanes` and a
-    // `score`; it has no `kind` (an allocation is not a SOLO or a BUY) and no
-    // `conviction`. Applying the legacy gates to it would compare `undefined`
-    // against a threshold and let everything through.
-    if (isV2Signal(swarm)) {
-      const enabled = new Set(this.settings.enabledLanes.map((l) => l.trim().toLowerCase()));
-      if (enabled.size === 0) return this.decide(swarm, 'skipped', 'no v2 lane is enabled for buying');
-      const matched = (swarm.lanes ?? []).map((l) => l.toLowerCase());
-      if (!matched.some((l) => enabled.has(l))) {
-        return this.decide(swarm, 'skipped', `lanes ${matched.join('+') || 'none'} not enabled`);
-      }
-      // FAILS CLOSED. The legacy line compared `conviction < minConviction`, and
-      // `null < 0` is false in JS — an unscored signal would have sailed past it.
-      if (swarm.score == null) return this.decide(swarm, 'skipped', 'unscored — refusing to buy');
-      if (swarm.score < this.settings.minScore) {
-        return this.decide(swarm, 'skipped', `score ${swarm.score} below floor ${this.settings.minScore}`);
-      }
-    } else if (this.settings.primeOnly) {
-      // PRIME-only: the single backtested-good tier (PRIME_KINDS × conviction ≥ PRIME_MIN_CONVICTION).
-      // Collapses the buy set to just those — the broad kinds/conviction gates are intentionally bypassed.
-      if (!swarm.prime) return this.decide(swarm, 'skipped', 'not a PRIME alert');
-    } else {
-      const allowedKinds = new Set(this.settings.kinds.split(',').map((k) => k.trim().toUpperCase()).filter(Boolean));
-      if (!swarm.kind || !allowedKinds.has(swarm.kind))
-        return this.decide(swarm, 'skipped', `kind ${swarm.kind ?? 'none'} not in buy list`);
-      if (swarm.conviction < this.settings.minConviction || swarm.conviction > this.settings.maxConviction)
-        return this.decide(swarm, 'skipped', `conviction ${swarm.conviction} outside ${this.settings.minConviction}-${this.settings.maxConviction}`);
+    // LANES ARE THE ONLY BUY RULE. The legacy kind/conviction path was retired at the v2 cutover
+    // and is now a refusal rather than a branch.
+    //
+    // It has to be an explicit refusal, not an absent branch. Every legacy gate reads a field a
+    // v2 match does not have, and JS comparisons against `undefined` evaluate to false — so a
+    // rule that LOOKS like it is filtering (`conviction < minConviction`) passes everything. The
+    // inverse is just as bad: a legacy alert falling through to the lane checks would be judged
+    // on `lanes`/`score` it does not carry. Naming the refusal keeps a retired stream visible in
+    // the decision log instead of turning it into silence.
+    if (!isV2Signal(swarm)) {
+      return this.decide(swarm, 'skipped', 'legacy signal — v2 lanes are the only buy rule');
+    }
+    const enabled = new Set(this.settings.enabledLanes.map((l) => l.trim().toLowerCase()));
+    if (enabled.size === 0) return this.decide(swarm, 'skipped', 'no v2 lane is enabled for buying');
+    const matched = (swarm.lanes ?? []).map((l) => l.toLowerCase());
+    if (!matched.some((l) => enabled.has(l))) {
+      return this.decide(swarm, 'skipped', `lanes ${matched.join('+') || 'none'} not enabled`);
+    }
+    // FAILS CLOSED. The legacy line compared `conviction < minConviction`, and
+    // `null < 0` is false in JS — an unscored signal would have sailed past it.
+    if (swarm.score == null) return this.decide(swarm, 'skipped', 'unscored — refusing to buy');
+    if (swarm.score < this.settings.minScore) {
+      return this.decide(swarm, 'skipped', `score ${swarm.score} below floor ${this.settings.minScore}`);
     }
     // Freshness gate (before any network call): the alert's edge decays fast — on real trades every
     // >50%-peak winner filled in <2s, while a 38s-late fill bought the top (PIPEDOG). Skip an alert
     // already older than staleMaxSec by the time we see it. Lenient default while we still carry the
     // blocking enrich latency; tighten toward ~5s once Wave 2 gets fills sub-2s.
     //
-    // A v2 match is aged from `emittedAt`, NOT from the block. v2 retries a sheet
-    // for up to 180s while its facts land, and an allocation additionally settles
-    // ~90s so the wave can be counted — so block-age would exceed any sane
-    // threshold on essentially every match and silently skip all of them. What
-    // the gate actually protects against is a slow HOP, and emittedAt measures
-    // exactly that.
-    const agedFrom = isV2Signal(swarm) ? swarm.emittedAt : swarm.firstSeen;
+    // Aged from `emittedAt`, NOT from the block. v2 retries a sheet for up to 180s while its facts
+    // land, and an allocation additionally settles ~90s so the wave can be counted — so block-age
+    // would exceed any sane threshold on essentially every match and silently skip all of them.
+    // What the gate actually protects against is a slow HOP, and emittedAt measures exactly that.
+    // (Only v2 reaches here; the legacy `firstSeen` fallback went with the legacy buy path.)
+    const agedFrom = swarm.emittedAt;
     if (config.SNIPER_STALE_MAX_SEC > 0 && agedFrom) {
       const ageMs = Date.now() - agedFrom;
       if (ageMs > config.SNIPER_STALE_MAX_SEC * 1000) {

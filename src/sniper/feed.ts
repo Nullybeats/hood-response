@@ -138,23 +138,29 @@ export class FeedSubscriber {
     this.abort?.abort();
   }
 
-  /** Mark every token in the feed's recent history as already-seen so only a
-   *  genuinely first feed call reads as a new coin. Never fires a buy. */
+  /**
+   * Mark every token in the feed's recent history as already-seen so only a genuinely first feed
+   * call reads as a new coin. Never fires a buy.
+   *
+   * Seeded from `/api/v2/matches`, NOT the legacy `/api/alerts`. This ledger is what
+   * `newCoinsOnly` consults, so seeding it from the retired stream would mark every token the
+   * LEGACY engine ever alerted as not-new — and a v2 match on any of them would then be skipped
+   * forever, silently, by a rule the operator set for a different purpose.
+   */
   private async seedLedger(): Promise<void> {
     try {
-      const res = await fetch(`${this.baseUrl}/api/alerts?limit=1000`);
+      const res = await fetch(`${this.baseUrl}/api/v2/matches?limit=200`);
       if (!res.ok) return;
-      const body = (await res.json()) as Alert[] | { alerts?: Alert[] };
-      const alerts: Alert[] = Array.isArray(body) ? body : body.alerts ?? [];
+      const body = (await res.json()) as V2Match[] | { matches?: V2Match[] };
+      const matches: V2Match[] = Array.isArray(body) ? body : body.matches ?? [];
       let seeded = 0;
-      for (const a of alerts) {
-        const token = a?.swarm?.token;
-        if (token) {
-          this.registry.state.claimFirstSignal(token, a.id, a.swarm?.tokenSymbol);
+      for (const m of matches) {
+        if (m?.token) {
+          this.registry.state.claimFirstSignal(m.token, m.id, m.tokenSymbol);
           seeded++;
         }
       }
-      logger.info({ seeded }, 'sniper feed: pre-seeded first-signal ledger from feed history');
+      logger.info({ seeded }, 'sniper feed: pre-seeded first-signal ledger from v2 match history');
     } catch (err) {
       logger.warn({ err: String(err) }, 'sniper feed: ledger pre-seed failed (continuing)');
     }
@@ -168,19 +174,29 @@ export class FeedSubscriber {
    */
   private async catchUp(): Promise<void> {
     try {
-      const res = await fetch(`${this.baseUrl}/api/alerts?limit=50`);
+      const res = await fetch(`${this.baseUrl}/api/v2/matches?limit=50`);
       if (!res.ok) return;
-      const body = (await res.json()) as Alert[] | { alerts?: Alert[] };
-      const alerts: Alert[] = Array.isArray(body) ? body : body.alerts ?? [];
-      const missed = selectCatchUp(alerts, this.seen, Date.now(), CATCHUP_MAX_AGE_MS);
+      const body = (await res.json()) as V2Match[] | { matches?: V2Match[] };
+      const matches: V2Match[] = Array.isArray(body) ? body : body.matches ?? [];
+      // Adapt to the shape selectCatchUp reads. It filters on `swarm.token` and ages on
+      // `swarm.emittedAt ?? swarm.firstSeen`, and v2ToSignal populates all three — so the replay
+      // window is judged on when the decision was emitted, matching the sniper's own freshness
+      // gate. Handing it a differently-shaped object would typecheck and then quietly match
+      // nothing, forever.
+      const missed = selectCatchUp(
+        matches.map((m) => ({ id: m.id, swarm: v2ToSignal(m) })),
+        this.seen,
+        Date.now(),
+        CATCHUP_MAX_AGE_MS,
+      );
       if (missed.length === 0) return;
       logger.warn(
-        { count: missed.length, tokens: missed.map((a) => a.swarm?.tokenSymbol ?? a.swarm?.token) },
-        'sniper feed: replaying alerts missed during the reconnect gap',
+        { count: missed.length, tokens: missed.map((m) => m.swarm.tokenSymbol ?? m.swarm.token) },
+        'sniper feed: replaying v2 matches missed during the reconnect gap',
       );
-      for (const a of missed) {
-        if (a.id) remember(this.seen, this.seenOrder, a.id, SEEN_CAP);
-        if (a.swarm?.token) void this.handle(a.swarm);
+      for (const m of missed) {
+        if (m.id) remember(this.seen, this.seenOrder, m.id, SEEN_CAP);
+        if (m.swarm.token) void this.handle(m.swarm);
       }
     } catch (err) {
       logger.warn({ err: String(err) }, 'sniper feed: catch-up failed (continuing)');
@@ -255,37 +271,23 @@ export class FeedSubscriber {
       if (line.startsWith('event:')) event = line.slice(6).trim();
       else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
     }
-    // Two streams, kept distinct all the way down: `alert` is the legacy engine
-    // (kind + conviction), `v2-match` is the v2 brain (lanes + score). They are
-    // gated by different rules in the sniper, so conflating them here would
-    // apply legacy thresholds to a signal that has none.
+    // `v2-match` is the ONLY event that can move money. The legacy `alert` stream was retired at
+    // the v2 cutover: lanes are the buy rule now, a legacy alert carries none of the fields they
+    // read, and every legacy gate evaluates a missing number as passing (`undefined < 0` is
+    // false). Dropping it at the wire is what makes that unreachable rather than merely unused.
     if (dataLines.length === 0) return;
-    if (event !== 'alert' && event !== 'v2-match') return;
+    if (event !== 'v2-match') return;
 
-    if (event === 'v2-match') {
-      let match: V2Match;
-      try {
-        match = JSON.parse(dataLines.join('\n')) as V2Match;
-      } catch {
-        return;
-      }
-      if (!match?.token || !Array.isArray(match.lanes) || match.lanes.length === 0) return;
-      if (match.id) remember(this.seen, this.seenOrder, match.id, SEEN_CAP);
-      void this.handle(v2ToSignal(match));
-      return;
-    }
-
-    let alert: Alert;
+    let match: V2Match;
     try {
-      alert = JSON.parse(dataLines.join('\n')) as Alert;
+      match = JSON.parse(dataLines.join('\n')) as V2Match;
     } catch {
       return;
     }
-    const swarm = alert?.swarm;
-    if (!swarm?.token) return;
+    if (!match?.token || !Array.isArray(match.lanes) || match.lanes.length === 0) return;
     // Record before handling so a catch-up replay right after this can tell it was already seen.
-    if (alert.id) remember(this.seen, this.seenOrder, alert.id, SEEN_CAP);
-    void this.handle(swarm);
+    if (match.id) remember(this.seen, this.seenOrder, match.id, SEEN_CAP);
+    void this.handle(v2ToSignal(match));
   }
 
   /** Enrich with LOCAL live price (execution needs a live price + pair), preserving

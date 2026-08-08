@@ -79,17 +79,28 @@ function stubExecutor(
   } as unknown as SwapExecutor;
 }
 
+/**
+ * A v2 match, which is the ONLY shape the engine buys from since the cutover.
+ *
+ * These tests are mostly about what happens AFTER the buy decision — exits, gas accounting,
+ * cooldowns, depth. The signal is their vehicle, so it has to be a shape that can still get
+ * through the gate; a legacy alert is now refused before any of that runs.
+ */
 function swarm(over: Partial<Swarm> = {}): Swarm {
   return {
     id: 's-' + Math.random().toString(36).slice(2),
-    // ENTRY is in the default buy list (ENTRY,SOLO). The old default 'BUY' was
-    // dropped from the defaults (worst-performing kind), so a BUY swarm now skips.
-    kind: 'ENTRY',
+    source: 'v2',
+    lanes: ['allocation'],
+    laneReasons: ['distribution, beta-seed wallet, solo, pair 0h old, micro cap'],
+    score: 75,
+    eventType: 'distribution',
+    cohortSize: 1,
+    emittedAt: Date.now(),
     token: '0xtok',
     tokenSymbol: 'GEM',
-    walletCount: 3,
+    walletCount: 1,
     wallets: [],
-    walletSummary: '3 alpha',
+    walletSummary: '1 wallet',
     walletLabels: [],
     totalUsd: 3000,
     marketCap: 60_000,
@@ -97,16 +108,10 @@ function swarm(over: Partial<Swarm> = {}): Swarm {
     dexUrl: 'x',
     priceLive: true,
     priceUsd: 1,
-    conviction: 75,
-    convictionBreakdown: {
-      walletQuality: 0, walletCount: 0, totalCapital: 0, velocity: 0,
-      liquidity: 0, marketCap: 0, historicalAccuracy: 0, buySellRatio: 0,
-    },
-    windowSeconds: 10,
     firstSeen: Date.now(),
     lastSeen: Date.now(),
     ...over,
-  };
+  } as unknown as Swarm;
 }
 
 describe('SniperEngine', () => {
@@ -120,7 +125,7 @@ describe('SniperEngine', () => {
   it('buys a qualifying alert and enforces the min buy floor', async () => {
     const log: string[] = [];
     const eng = new SniperEngine(stubPrice({ '0xtok': 1 }), stubExecutor(log), stubSafety());
-    eng.updateSettings({ enabled: true, primeOnly: false, buyEth: 0.0001 }); // below the floor
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'], buyEth: 0.0001 }); // below the floor
     await eng.onAlert(swarm());
     expect(log).toEqual(['buy:0xtok:' + MIN_BUY_ETH]); // floored up to 0.0005
     const snap = await eng.snapshot();
@@ -138,7 +143,7 @@ describe('SniperEngine', () => {
       }),
       stubSafety(),
     );
-    thinEng.updateSettings({ enabled: true, primeOnly: false });
+    thinEng.updateSettings({ enabled: true, enabledLanes: ['allocation'] });
     await thinEng.onAlert(swarm());
     expect(thin).toHaveLength(0); // never reached executor.buy
     const td = (await thinEng.snapshot()).decisions;
@@ -147,7 +152,7 @@ describe('SniperEngine', () => {
     // Healthy pool (default stub = 10% round-trip): buys AND records telemetry.
     const ok: string[] = [];
     const okEng = new SniperEngine(stubPrice({ '0xtok': 1 }), stubExecutor(ok), stubSafety());
-    okEng.updateSettings({ enabled: true, primeOnly: false });
+    okEng.updateSettings({ enabled: true, enabledLanes: ['allocation'] });
     await okEng.onAlert(swarm());
     expect(ok).toEqual(['buy:0xtok:0.0005']);
     const pos = (await okEng.snapshot()).positions[0]!;
@@ -162,7 +167,7 @@ describe('SniperEngine', () => {
     const prices: Record<string, number> = { '0xtok': 1 };
     // stub sell returns ethReceived 0.002; make the buy cost 0.005 so the close books a LOSS.
     const eng = new SniperEngine(stubPrice(prices), stubExecutor(log), stubSafety());
-    eng.updateSettings({ enabled: true, primeOnly: false, buyEth: 0.005, lossCooldownMin: 90, trailingStopPct: 15 });
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'], buyEth: 0.005, lossCooldownMin: 90, trailingStopPct: 15 });
     await eng.onAlert(swarm({ token: '0xtok' }));
     expect(log).toContain('buy:0xtok:0.005'); // bought (0.005 in, stub sells for 0.002 → loss)
     prices['0xtok'] = 0.5; // −50% → trips the trailing stop, books a loss
@@ -186,51 +191,58 @@ describe('SniperEngine', () => {
       }),
       stubSafety(),
     );
-    eng.updateSettings({ enabled: true, primeOnly: false, maxRoundtripPct: 0 });
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'], maxRoundtripPct: 0 });
     await eng.onAlert(swarm());
     expect(log).toEqual(['buy:0xtok:0.0005']);
   });
 
-  it('skips alerts outside the conviction band, wrong kind, or already held', async () => {
+  it('skips a below-floor score, an unenabled lane, or a coin already held', async () => {
     const log: string[] = [];
     const eng = new SniperEngine(stubPrice({ '0xtok': 1, '0xb': 1 }), stubExecutor(log), stubSafety());
-    eng.updateSettings({ enabled: true, primeOnly: false, minConviction: 60, maxConviction: 100 });
-    await eng.onAlert(swarm({ token: '0xa', conviction: 50 })); // too low
-    await eng.onAlert(swarm({ token: '0xb', kind: 'SELL' })); // wrong kind
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'], minScore: 60 });
+    await eng.onAlert(swarm({ token: '0xa', score: 50 })); // below the floor
+    await eng.onAlert(swarm({ token: '0xb', lanes: ['proven-wallets'] })); // lane not enabled
     expect(log).toHaveLength(0);
-    // First buy of 0xtok works; a second alert for the same token is skipped.
+    // First buy of 0xtok works; a second match for the same token is skipped.
     await eng.onAlert(swarm({ token: '0xtok' }));
     await eng.onAlert(swarm({ token: '0xtok' }));
     expect(log).toEqual(['buy:0xtok:0.0005']);
   });
 
-  it('PRIME-only buys prime-flagged alerts and skips the rest, ignoring kind/conviction gates', async () => {
+  /**
+   * The legacy stream is retired, and it must be retired LOUDLY. A silent drop would be
+   * indistinguishable from a quiet market — the failure mode this whole engine keeps re-learning.
+   */
+  it('refuses a legacy alert outright, and says so', async () => {
     const log: string[] = [];
-    const eng = new SniperEngine(stubPrice({ '0xa': 1, '0xb': 1 }), stubExecutor(log), stubSafety());
-    eng.updateSettings({ enabled: true }); // primeOnly defaults ON
-    await eng.onAlert(swarm({ token: '0xa', conviction: 95 })); // high conviction but not prime → skipped
+    const eng = new SniperEngine(stubPrice({ '0xa': 1 }), stubExecutor(log), stubSafety());
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'] });
+    await eng.onAlert({
+      id: 'legacy-1', kind: 'ENTRY', token: '0xa', tokenSymbol: 'OLD', walletCount: 3, wallets: [],
+      walletSummary: '3 alpha', walletLabels: [], marketCap: 60_000, priceLive: true, priceUsd: 1,
+      conviction: 95, prime: true, firstSeen: Date.now(),
+    } as unknown as Swarm);
     expect(log).toHaveLength(0);
-    // prime alert buys even with a "wrong" kind + low conviction — prime bypasses those gates
-    await eng.onAlert(swarm({ token: '0xb', kind: 'SOLO', conviction: 40, prime: true }));
-    expect(log).toEqual(['buy:0xb:0.0005']);
+    const d = (await eng.snapshot()).decisions;
+    expect(d[0]!.reason).toContain('legacy signal');
   });
 
-  it('records a decision + reason for every alert', async () => {
+  it('records a decision + reason for every signal', async () => {
     const eng = new SniperEngine(stubPrice({ '0xtok': 1 }), stubExecutor([]), stubSafety());
     await eng.onAlert(swarm()); // disabled
-    eng.updateSettings({ enabled: true, primeOnly: false, minConviction: 60, maxConviction: 100 });
-    await eng.onAlert(swarm({ token: '0xa', conviction: 30 })); // below band
-    await eng.onAlert(swarm({ token: '0xtok', conviction: 75 })); // bought
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'], minScore: 60 });
+    await eng.onAlert(swarm({ token: '0xa', score: 30 })); // below floor
+    await eng.onAlert(swarm({ token: '0xtok', score: 75 })); // bought
     const d = (await eng.snapshot()).decisions;
     expect(d[0]!.action).toBe('bought'); // newest first
     expect(d.some((x) => x.reason === 'sniper is OFF')).toBe(true);
-    expect(d.some((x) => x.reason.includes('outside 60-100'))).toBe(true);
+    expect(d.some((x) => x.reason.includes('below floor 60'))).toBe(true);
   });
 
   it('manual sell-now closes an open position', async () => {
     const log: string[] = [];
     const eng = new SniperEngine(stubPrice({ '0xtok': 1 }), stubExecutor(log), stubSafety());
-    eng.updateSettings({ enabled: true, primeOnly: false });
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'] });
     await eng.onAlert(swarm());
     const id = (await eng.snapshot()).positions[0]!.id;
     await eng.sellNow(id);
@@ -244,7 +256,7 @@ describe('SniperEngine', () => {
     const log: string[] = [];
     const prices: Record<string, number> = { '0xtok': 1 };
     const eng = new SniperEngine(stubPrice(prices), stubExecutor(log), stubSafety());
-    eng.updateSettings({ enabled: true, primeOnly: false, takeProfitPct: 50 });
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'], takeProfitPct: 50 });
     await eng.onAlert(swarm());
 
     prices['0xtok'] = 2; // +100% → past the 50% take-profit
@@ -290,7 +302,7 @@ describe('SniperEngine', () => {
   it('refuses to auto-replace a REAL bought position on re-import (must Untrack first)', async () => {
     const prices: Record<string, number> = { '0xtok': 1 };
     const eng = new SniperEngine(stubPrice(prices, 2000), stubExecutor([]), stubSafety());
-    eng.updateSettings({ enabled: true, primeOnly: false });
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'] });
     await eng.onAlert(swarm()); // a genuine buy, buyTx = '0xbuy' (not 'imported')
 
     await expect(eng.importPosition('0xtok')).rejects.toThrow(/REAL bought position/);
@@ -351,7 +363,7 @@ describe('SniperEngine', () => {
       stubExecutor(log, { protocolFeeInfo: async () => ({ hook: '0xbags', feePctPerSwap: 2 }) }),
       stubSafety(0, 3), // 0% buy tax, 3% sell tax
     );
-    eng.updateSettings({ enabled: true, primeOnly: false });
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'] });
     await eng.onAlert(swarm());
 
     const snap = await eng.snapshot();
@@ -368,7 +380,7 @@ describe('SniperEngine', () => {
   it('rolls buy + sell gas into netPnlEth once a position is closed', async () => {
     const log: string[] = [];
     const eng = new SniperEngine(stubPrice({ '0xtok': 1 }), stubExecutor(log), stubSafety());
-    eng.updateSettings({ enabled: true, primeOnly: false });
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'] });
     await eng.onAlert(swarm());
     const id = (await eng.snapshot()).positions[0]!.id;
     await eng.sellNow(id);
@@ -383,7 +395,7 @@ describe('SniperEngine', () => {
   it('per-position take-profit overrides the global setting', async () => {
     const prices: Record<string, number> = { '0xtok': 1 };
     const eng = new SniperEngine(stubPrice(prices), stubExecutor([]), stubSafety());
-    eng.updateSettings({ enabled: true, primeOnly: false, takeProfitPct: 90 }); // global: far away
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'], takeProfitPct: 90 }); // global: far away
     await eng.onAlert(swarm());
     const id = (await eng.snapshot()).positions[0]!.id;
     eng.setPositionTakeProfit(id, 20); // this position: much tighter
@@ -400,7 +412,7 @@ describe('SniperEngine', () => {
   it('setting take-profit to null disables it for that position', async () => {
     const prices: Record<string, number> = { '0xtok': 1 };
     const eng = new SniperEngine(stubPrice(prices), stubExecutor([]), stubSafety());
-    eng.updateSettings({ enabled: true, primeOnly: false, takeProfitPct: 10 }); // global would fire
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'], takeProfitPct: 10 }); // global would fire
     await eng.onAlert(swarm());
     const id = (await eng.snapshot()).positions[0]!.id;
     eng.setPositionTakeProfit(id, null); // disable for this one
@@ -416,7 +428,7 @@ describe('SniperEngine', () => {
   it('honeypot gate: skips a buy when the safety check fails (cannot sell)', async () => {
     const log: string[] = [];
     const eng = new SniperEngine(stubPrice({ '0xtok': 1 }), stubExecutor(log), stubSafety(0, 0, false, ['honeypot']));
-    eng.updateSettings({ enabled: true, primeOnly: false });
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'] });
     await eng.onAlert(swarm());
     expect(log.some((l) => l.startsWith('buy'))).toBe(false); // never bought the honeypot
   });
@@ -424,7 +436,7 @@ describe('SniperEngine', () => {
   it('trailing stop: exits when price falls trailingStopPct below the peak', async () => {
     const prices: Record<string, number> = { '0xtok': 1 };
     const eng = new SniperEngine(stubPrice(prices), stubExecutor([]), stubSafety());
-    eng.updateSettings({ enabled: true, primeOnly: false, takeProfitPct: 0, trailingStopPct: 15 });
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'], takeProfitPct: 0, trailingStopPct: 15 });
     await eng.onAlert(swarm()); // entry @ 1
     prices['0xtok'] = 2; // runs to 2 → peak 2, no drawdown
     // @ts-expect-error exercise the private sampler
@@ -447,7 +459,7 @@ describe('SniperEngine', () => {
       stubSafety(),
     );
     // Trailing stop OFF so ONLY the rug guard can close this — isolates the new path.
-    eng.updateSettings({ enabled: true, primeOnly: false, takeProfitPct: 0, trailingStopPct: 0, rugGuard: true, rugDropPct: 50 });
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'], takeProfitPct: 0, trailingStopPct: 0, rugGuard: true, rugDropPct: 50 });
     await eng.onAlert(swarm()); // entry
     // First sample establishes the exit-value high-water (peak 0.001); display price stays healthy at 1.
     // @ts-expect-error exercise the private sampler
@@ -470,7 +482,7 @@ describe('SniperEngine', () => {
       stubExecutor([], { valueInEth: async () => ({ ...quote }) }),
       stubSafety(),
     );
-    eng.updateSettings({ enabled: true, primeOnly: false, takeProfitPct: 0, trailingStopPct: 0, rugGuard: true, rugDropPct: 50 });
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'], takeProfitPct: 0, trailingStopPct: 0, rugGuard: true, rugDropPct: 50 });
     await eng.onAlert(swarm());
     // @ts-expect-error exercise the private sampler
     await eng.sample();
@@ -483,7 +495,7 @@ describe('SniperEngine', () => {
   it('trailing stop doubles as stop-loss: a coin that never runs exits near −trailingStopPct', async () => {
     const prices: Record<string, number> = { '0xtok': 1 };
     const eng = new SniperEngine(stubPrice(prices), stubExecutor([]), stubSafety());
-    eng.updateSettings({ enabled: true, primeOnly: false, takeProfitPct: 0, trailingStopPct: 15 });
+    eng.updateSettings({ enabled: true, enabledLanes: ['allocation'], takeProfitPct: 0, trailingStopPct: 15 });
     await eng.onAlert(swarm()); // entry @ 1, peak = entry = 1
     prices['0xtok'] = 0.8; // −20% from entry, never made a new high
     // @ts-expect-error exercise the private sampler
