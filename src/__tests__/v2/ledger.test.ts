@@ -1,0 +1,260 @@
+/**
+ * The outcome ledger's contract: it follows matched decisions honestly, it never
+ * invents a baseline, and its buckets say when the numbers are conservative.
+ *
+ * The failure this suite exists to prevent is a confident scoreboard built on
+ * adopted entry prices — a win rate that looks measured but is quietly comparing
+ * a token to itself an hour after the signal.
+ */
+import { describe, expect, it, vi } from 'vitest';
+
+import { OutcomeLedger, DEFAULT_LEDGER_OPTIONS, type LedgerEntryInput } from '../../v2/ledger.js';
+
+const NOW = 1_786_000_000_000;
+const TOKEN = '0xtoken0000000000000000000000000000000001';
+
+/** A price book we can move between samples. */
+function priceBook(initial: Record<string, number | null> = {}) {
+  const prices = new Map<string, number | null>(Object.entries(initial));
+  return {
+    set(token: string, p: number | null) {
+      prices.set(token.toLowerCase(), p);
+    },
+    provider: {
+      priceOf: (t: string) => prices.get(t.toLowerCase()) ?? null,
+      refreshNow: async () => undefined,
+    },
+  };
+}
+
+function input(over: Partial<LedgerEntryInput> = {}): LedgerEntryInput {
+  return {
+    txHash: '0xtx1',
+    token: TOKEN,
+    tokenSymbol: 'WOOF',
+    lanes: ['allocation'],
+    eventType: 'distribution',
+    wallet: '0xwallet1',
+    score: 68,
+    seedTier: 'alpha',
+    capBand: 'micro',
+    marketCap: 100_000,
+    pairAgeHours: 1.2,
+    firedAt: NOW,
+    ...over,
+  };
+}
+
+/** Drive one sampling pass at a chosen wall-clock time. */
+async function sampleAt(ledger: OutcomeLedger, at: number): Promise<void> {
+  vi.setSystemTime(at);
+  await (ledger as unknown as { sample: () => Promise<void> }).sample();
+}
+
+function make(book = priceBook({ [TOKEN]: 1 })) {
+  return new OutcomeLedger(book.provider, { ...DEFAULT_LEDGER_OPTIONS, storePath: '' });
+}
+
+describe('OutcomeLedger', () => {
+  it('stamps the entry price at match time and tracks the peak', async () => {
+    vi.useFakeTimers();
+    const book = priceBook({ [TOKEN]: 1 });
+    const ledger = make(book);
+    ledger.open(input(), NOW);
+
+    book.set(TOKEN, 3); // +200%
+    await sampleAt(ledger, NOW + 120_000);
+    book.set(TOKEN, 2); // fell back; the PEAK must survive
+    await sampleAt(ledger, NOW + 600_000);
+
+    const r = ledger.list()[0]!;
+    expect(r.entryPrice).toBe(1);
+    expect(r.entryDelayMs).toBe(0);
+    expect(r.maxGainPct).toBe(200);
+    expect(r.lastGainPct).toBe(100);
+    vi.useRealTimers();
+  });
+
+  /**
+   * The reason this ledger exists rather than reusing the performance tracker:
+   * that one drops any call it cannot price, which here would discard ~97% of
+   * allocations — market cap resolves for 3% of them.
+   */
+  it('keeps a match that has no price yet, and adopts the first quote as a LATE entry', async () => {
+    vi.useFakeTimers();
+    const book = priceBook({ [TOKEN]: null });
+    const ledger = make(book);
+    ledger.open(input(), NOW);
+
+    let r = ledger.list()[0]!;
+    expect(r.entryPrice).toBeNull();
+    expect(r.entryDelayMs).toBeNull();
+
+    book.set(TOKEN, 5);
+    await sampleAt(ledger, NOW + 300_000);
+
+    r = ledger.list()[0]!;
+    expect(r.entryPrice).toBe(5);
+    // Flagged, not hidden: this baseline is 5 minutes late and understates the move.
+    expect(r.entryDelayMs).toBe(300_000);
+    expect(r.maxGainPct).toBe(0);
+    vi.useRealTimers();
+  });
+
+  /** Negative control: without the adoption branch the record would stay unpriced forever. */
+  it('never back-dates an adopted entry as if it were known at match time', async () => {
+    vi.useFakeTimers();
+    const book = priceBook({ [TOKEN]: null });
+    const ledger = make(book);
+    ledger.open(input(), NOW);
+    book.set(TOKEN, 5);
+    await sampleAt(ledger, NOW + 300_000);
+    const r = ledger.list()[0]!;
+    expect(r.entryDelayMs).toBeGreaterThan(0);
+    // A late entry must never claim a gain it did not observe.
+    expect(r.maxGainPct).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it('closes a match that never becomes quotable, with the reason kept', async () => {
+    vi.useFakeTimers();
+    const book = priceBook({ [TOKEN]: null });
+    const ledger = new OutcomeLedger(book.provider, {
+      ...DEFAULT_LEDGER_OPTIONS,
+      storePath: '',
+      priceGraceHours: 1,
+    });
+    ledger.open(input(), NOW);
+    await sampleAt(ledger, NOW + 2 * 3_600_000);
+    const r = ledger.list()[0]!;
+    expect(r.closed).toBe(true);
+    expect(r.closedReason).toBe('no-price');
+    vi.useRealTimers();
+  });
+
+  /** A retried trade re-matches; counting it twice would inflate every bucket. */
+  it('is idempotent per trade, merging lanes matched on a later evaluation', () => {
+    const ledger = make();
+    ledger.open(input(), NOW);
+    ledger.open(input({ lanes: ['earliest-entry'] }), NOW + 5_000);
+    expect(ledger.size).toBe(1);
+    expect(ledger.list()[0]!.lanes.sort()).toEqual(['allocation', 'earliest-entry']);
+  });
+
+  /**
+   * A record opens on the FIRST event, when a wave of one and a wave of forty
+   * look identical — so the cohort is told to it as the wave arrives.
+   */
+  it('grows the cohort as a wave arrives and never shrinks it', () => {
+    const ledger = make();
+    ledger.open(input(), NOW);
+    expect(ledger.list()[0]!.cohortSize).toBe(1);
+    ledger.noteCohort(TOKEN, 12);
+    expect(ledger.list()[0]!.cohortSize).toBe(12);
+    ledger.noteCohort(TOKEN, 3); // window emptied; the wave still happened
+    expect(ledger.list()[0]!.cohortSize).toBe(12);
+  });
+
+  describe('summary', () => {
+    it('buckets solo against wave — the 47e1 claim, testable on our own data', async () => {
+      vi.useFakeTimers();
+      const book = priceBook({ [TOKEN]: 1, '0xtok2': 1 });
+      const ledger = make(book);
+      ledger.open(input({ txHash: '0xsolo' }), NOW);
+      ledger.open(input({ txHash: '0xwave', token: '0xtok2' }), NOW);
+      ledger.noteCohort('0xtok2', 8);
+
+      book.set(TOKEN, 4); // solo runs +300%
+      book.set('0xtok2', 1.1); // wave goes nowhere
+      await sampleAt(ledger, NOW + 120_000);
+
+      const s = ledger.summary();
+      const solo = s.byCohort.find((b) => b.label.startsWith('solo'))!;
+      const wave = s.byCohort.find((b) => b.label.startsWith('wave'))!;
+      expect(solo.count).toBe(1);
+      expect(solo.winRatePct).toBe(100);
+      expect(wave.count).toBe(1);
+      expect(wave.winRatePct).toBe(0);
+      vi.useRealTimers();
+    });
+
+    it('excludes unpriced records from the averages and counts them separately', () => {
+      const book = priceBook({ [TOKEN]: null });
+      const ledger = make(book);
+      ledger.open(input(), NOW);
+      const alloc = ledger.summary().byLane.find((b) => b.label === 'allocation')!;
+      expect(alloc.count).toBe(1);
+      expect(alloc.unpriced).toBe(1);
+      // Never 0% "win rate" off a record that was never measured.
+      expect(alloc.winRatePct).toBe(0);
+      expect(alloc.avgMaxGainPct).toBe(0);
+    });
+
+    it('reports how much of a bucket rests on late entries', async () => {
+      vi.useFakeTimers();
+      const book = priceBook({ [TOKEN]: null });
+      const ledger = make(book);
+      ledger.open(input(), NOW);
+      book.set(TOKEN, 2);
+      await sampleAt(ledger, NOW + 600_000);
+      const alloc = ledger.summary().byLane.find((b) => b.label === 'allocation')!;
+      expect(alloc.lateEntryPct).toBe(100);
+      vi.useRealTimers();
+    });
+
+    it('splits by seed tier, so alpha vs beta stops being an argument', async () => {
+      vi.useFakeTimers();
+      const book = priceBook({ [TOKEN]: 1, '0xtok2': 1 });
+      const ledger = make(book);
+      ledger.open(input({ txHash: '0xa', seedTier: 'alpha' }), NOW);
+      ledger.open(input({ txHash: '0xb', token: '0xtok2', seedTier: 'beta' }), NOW);
+      book.set(TOKEN, 5);
+      await sampleAt(ledger, NOW + 120_000);
+      const s = ledger.summary();
+      expect(s.bySeedTier.find((b) => b.label === 'alpha')!.bestMaxGainPct).toBe(400);
+      expect(s.bySeedTier.find((b) => b.label === 'beta')!.bestMaxGainPct).toBe(0);
+      vi.useRealTimers();
+    });
+  });
+
+  /** The rate-limit guard: a wave of allocations of one coin must cost one quote. */
+  it('dedupes quotes by token and caps refreshes per tick', async () => {
+    vi.useFakeTimers();
+    let refreshes = 0;
+    const prices = new Map<string, number>();
+    const ledger = new OutcomeLedger(
+      {
+        priceOf: (t) => prices.get(t.toLowerCase()) ?? 1,
+        refreshNow: async (t) => {
+          refreshes++;
+          prices.set(t.toLowerCase(), 1);
+        },
+      },
+      { ...DEFAULT_LEDGER_OPTIONS, storePath: '', maxRefreshPerTick: 3 },
+    );
+    // 10 allocations of ONE token, plus 10 distinct tokens.
+    for (let i = 0; i < 10; i++) ledger.open(input({ txHash: `0xsame${i}` }), NOW);
+    for (let i = 0; i < 10; i++) {
+      ledger.open(input({ txHash: `0xdiff${i}`, token: `0xtok${i}` }), NOW);
+    }
+    await sampleAt(ledger, NOW + 60_000);
+    expect(refreshes).toBeLessThanOrEqual(3);
+    vi.useRealTimers();
+  });
+
+  it('does not sample a record more often than its age tier allows', async () => {
+    vi.useFakeTimers();
+    let refreshes = 0;
+    const ledger = new OutcomeLedger(
+      { priceOf: () => 1, refreshNow: async () => void refreshes++ },
+      { ...DEFAULT_LEDGER_OPTIONS, storePath: '' },
+    );
+    ledger.open(input(), NOW);
+    await sampleAt(ledger, NOW + 1_000);
+    const after = refreshes;
+    // A fresh record samples every 60s; a tick 10s later must not re-quote it.
+    await sampleAt(ledger, NOW + 11_000);
+    expect(refreshes).toBe(after);
+    vi.useRealTimers();
+  });
+});

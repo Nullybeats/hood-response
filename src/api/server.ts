@@ -231,6 +231,27 @@ export async function buildServer(
     return { enabled: true, decisions: entries };
   });
 
+  // The scoreboard: what actually happened after each lane matched.
+  //
+  // Until this existed the diary could say "Allocation matched MANDATE" and
+  // nothing more, so every tightening question (alpha vs beta, 3h vs 48h, solo vs
+  // wave) was opinion. Buckets carry `unpriced` and `lateEntryPct` alongside the
+  // win rate on purpose: a bucket whose entries were all priced late is
+  // systematically understating the move, and hiding that would make the
+  // scoreboard the same kind of confident-and-wrong number the audit found.
+  app.get('/api/v2/outcomes', async (req) => {
+    const ledger = v2?.outcomes;
+    if (!ledger) return { enabled: false, reason: 'v2 ledger not enabled' };
+    const q = req.query as { limit?: string };
+    const limit = Math.min(Number(q.limit) || 200, 1_000);
+    return {
+      enabled: true,
+      summary: ledger.summary(),
+      // No wallet addresses, matching the rule the other aggregate endpoints follow.
+      records: ledger.list(limit).map(({ wallet: _w, ...rest }) => rest),
+    };
+  });
+
   // ── Metric diagnostics ──────────────────────────────────────────────────────
   // Every number the dashboards show, WITH its freshness and a plain verdict.
   // Exists because "block – / rpc –ms / swaps 0" after a restart was

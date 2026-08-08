@@ -24,7 +24,9 @@ import {
 import { SafetyChecker } from './chain/safety.js';
 import { FirstBuyRegistry } from './v2/facts/firstBuy.js';
 import { WalletOutcomes } from './v2/facts/outcomes.js';
-import { V2Shadow } from './v2/runtime.js';
+import { journal } from './v2/journal.js';
+import { OutcomeLedger, ledgerOptionsFromConfig } from './v2/ledger.js';
+import { DEFAULT_V2_RUNTIME_OPTIONS, V2Shadow } from './v2/runtime.js';
 import { PerformanceTracker, type TrackedCall } from './engine/performance.js';
 import { SniperRegistry } from './sniper/registry.js';
 import { FeedSubscriber, SNIPER_FEED_URL } from './sniper/feed.js';
@@ -292,6 +294,23 @@ async function main(): Promise<void> {
   const warmQuote = (token: string): void => {
     void price.refreshOnChainNow(token.toLowerCase()).catch(() => null);
   };
+  // Follows matched decisions to an outcome. Quotes go through the on-chain path
+  // for the same reason the shadow's warmQuote does: these are brand-new pairs,
+  // and the indexer is the slow, rate-limited way to learn about them.
+  const v2Ledger = config.V2_LEDGER_ENABLED
+    ? new OutcomeLedger(
+        {
+          priceOf: (token) => price.priceOf(token),
+          refreshNow: (token) => price.refreshOnChainNow(token),
+        },
+        ledgerOptionsFromConfig(),
+      )
+    : undefined;
+  if (v2Ledger) {
+    await v2Ledger.load();
+    v2Ledger.start();
+  }
+
   const v2Shadow = new V2Shadow({
     marketCap: (token) => {
       const t = store.tokensByAddress.get(token.toLowerCase());
@@ -350,7 +369,11 @@ async function main(): Promise<void> {
       const s = walletOutcomes.stats();
       return { wallets: s.wallets, calls: s.calls };
     },
-  });
+  },
+  DEFAULT_V2_RUNTIME_OPTIONS,
+  journal,
+  v2Ledger,
+  );
   v2Shadow.start();
 
   const enrichSwarm = async (swarm: Swarm): Promise<void> => {

@@ -161,6 +161,67 @@ describe('V2Shadow', () => {
     });
   });
 
+  /**
+   * The wiring that turns a match into a measurement. Without it the diary can
+   * say a lane matched and nothing more — which is how seventeen matches an hour
+   * stayed unrankable against 47e1's record.
+   */
+  describe('outcome ledger wiring', () => {
+    function ledgerSpy() {
+      const opened: { txHash: string; lanes: string[]; seedTier: unknown; capBand: unknown }[] = [];
+      const cohorts: { token: string; size: number }[] = [];
+      return {
+        opened,
+        cohorts,
+        ledger: {
+          open: (i: { txHash: string; lanes: string[]; seedTier: unknown; capBand: unknown }) => opened.push(i),
+          noteCohort: (token: string, size: number) => cohorts.push({ token, size }),
+        } as unknown as ConstructorParameters<typeof V2Shadow>[3],
+      };
+    }
+
+    const shadowWith = (p: V2Providers, l: ReturnType<typeof ledgerSpy>) => {
+      const s = new V2Shadow(p, { crowdWindowMs: 300_000, retryIntervalMs: 10_000, lanes: DEFAULT_LANES }, undefined, l.ledger);
+      Object.defineProperty(s, 'enabled', { get: () => true });
+      return s;
+    };
+
+    it('opens a record for a matched allocation, carrying the facts the buckets need', () => {
+      const spy = ledgerSpy();
+      shadow = shadowWith(providers({ seedTier: () => 'alpha' }), spy);
+      shadow.onSwap(swap({ verifiedTrade: false, distribution: true }));
+      expect(spy.opened).toHaveLength(1);
+      expect(spy.opened[0]!.lanes).toContain('allocation');
+      expect(spy.opened[0]!.seedTier).toBe('alpha');
+      expect(spy.opened[0]!.capBand).toBe('micro');
+    });
+
+    it('does not follow a decision that no lane matched', () => {
+      const spy = ledgerSpy();
+      // Unseeded wallet ⇒ the Allocation lane cannot match.
+      shadow = shadowWith(providers({ seedTier: () => null }), spy);
+      shadow.onSwap(swap({ verifiedTrade: false, distribution: true }));
+      expect(spy.opened).toHaveLength(0);
+    });
+
+    /**
+     * The cooldown collapses an airdrop wave into one sheet — but the wave is
+     * exactly what the solo-vs-wave bucket measures, so the cohort must still be
+     * counted for the events it swallows.
+     */
+    it('counts the whole wave even though the cooldown collapses it to one sheet', () => {
+      const spy = ledgerSpy();
+      shadow = shadowWith(providers({ seedTier: () => 'alpha' }), spy);
+      for (let i = 0; i < 6; i++) {
+        shadow.onSwap(swap({ verifiedTrade: false, distribution: true, wallet: '0xw' + i, txHash: '0xd' + i }));
+      }
+      expect(shadow.diary.size).toBe(1);
+      expect(spy.opened).toHaveLength(1);
+      // Every one of the six was counted toward the cohort.
+      expect(Math.max(...spy.cohorts.map((c) => c.size))).toBe(6);
+    });
+  });
+
   it('records a verdict for every accepted trade', () => {
     shadow = makeShadow();
     for (let i = 0; i < 5; i++) shadow.onSwap(swap());

@@ -36,6 +36,11 @@ export default defineConfig({
       // A test writing into the live one would permanently mark real pairs as
       // already-seen, silently suppressing future ENTRY-class alerts.
       V2_FIRST_BUY_PATH: '',
+      // The outcome ledger is the measurement record the lane tuning will rest
+      // on. A test writing synthetic matches into it would not just add noise —
+      // it would move the win rates the tightening decisions are read from.
+      V2_LEDGER_PATH: '',
+      V2_LEDGER_ENABLED: '',
     },
     server: {
       deps: {

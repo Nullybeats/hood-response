@@ -27,6 +27,7 @@ import { buildFactSheet, type FactSheet, type SheetInputs } from './facts/sheet.
 import { gate, type GateVerdict } from './gate.js';
 import { journal, type Journal } from './journal.js';
 import { DEFAULT_LANES, evaluateLanes, type Lane } from './lanes.js';
+import type { OutcomeLedger } from './ledger.js';
 import { scoreSheet } from './score.js';
 
 /**
@@ -114,10 +115,24 @@ export class V2Shadow {
     unverified: null,
   };
 
+  /**
+   * Distinct watched wallets that touched each token inside the window, whether
+   * by buying or by being allocated.
+   *
+   * Kept separate from `crowd` on purpose: `crowd` feeds the crowdSize/crowdGpa
+   * FACTS, which describe wallets that chose to buy. Folding allocation
+   * recipients into that would restate "forty wallets were airdropped" as "forty
+   * wallets bought" — the exact 47e1 lie this rebuild exists to stop telling.
+   * This map is for the ledger's solo-vs-wave measurement only.
+   */
+  private readonly cohort = new Map<string, CrowdMark[]>();
+
   constructor(
     private readonly providers: V2Providers,
     private readonly opts: V2RuntimeOptions = DEFAULT_V2_RUNTIME_OPTIONS,
     private readonly jrnl: Journal = journal,
+    /** Follows matched decisions to an outcome. Absent ⇒ decisions are recorded but never scored. */
+    private readonly ledger?: OutcomeLedger,
   ) {}
 
   get enabled(): boolean {
@@ -197,6 +212,12 @@ export class V2Shadow {
       // same minute. One sheet per token per crowd window is the measurement;
       // 122 identical sheets are a bill (each would warm quotes and safety).
       const key = swap.token.toLowerCase();
+      // Counted BEFORE the cooldown returns: the whole point of the wave measure
+      // is the events the cooldown collapses. A record opened on the first
+      // allocation cannot know whether it is one of one or one of forty, so the
+      // ledger is told as the rest arrive.
+      const cohort = this.markCohort(swap);
+      this.ledger?.noteCohort(key, cohort);
       const last = this.distSeenAt.get(key) ?? 0;
       if (Date.now() - last < this.opts.crowdWindowMs) {
         this.intake.distributionsCooled++;
@@ -231,6 +252,7 @@ export class V2Shadow {
     this.intakeLastAt.verifiedBuy = Date.now();
     this.seen++;
     this.markCrowd(swap);
+    this.ledger?.noteCohort(swap.token, this.markCohort(swap));
     this.jrnl.write('trade', swap);
     this.evaluate({ trade: swap, firstSeenAt: Date.now(), attempts: 0 }, Date.now());
   }
@@ -256,6 +278,11 @@ export class V2Shadow {
     this.jrnl.write('trade', swap);
     this.jrnl.write('verdict', entry);
     this.diary.record(entry);
+  }
+
+  /** The outcome ledger, for the scoreboard endpoint. Undefined when disabled. */
+  get outcomes(): OutcomeLedger | undefined {
+    return this.ledger;
   }
 
   /** Newest-first decisions, for the dashboard. */
@@ -298,6 +325,12 @@ export class V2Shadow {
       // grade cannot match — so a lane firing nothing is explained here rather
       // than mistaken for a quiet market.
       grades: this.providers.outcomeStats?.() ?? null,
+      // Headline only; the full scoreboard is /api/v2/outcomes. `priced` vs
+      // `total` is the number to watch: a ledger full of unpriced records is
+      // measuring nothing, however many matches it holds.
+      ledger: this.ledger
+        ? (({ total, open, priced }) => ({ total, open, priced }))(this.ledger.summary())
+        : null,
     };
   }
 
@@ -336,6 +369,25 @@ export class V2Shadow {
     this.diary.record(entry);
 
     if (entry.outcome === 'matched') {
+      // Follow it. Without this the diary can say a lane matched and nothing
+      // more, which is how seventeen matches an hour stayed unrankable.
+      this.ledger?.open(
+        {
+          txHash: sheet.txHash,
+          token: sheet.token,
+          tokenSymbol: sheet.tokenSymbol,
+          lanes: entry.matchedLanes,
+          eventType: sheet.eventType,
+          wallet: sheet.wallet,
+          score: score.score,
+          seedTier: sheet.walletSeedTier.value ?? null,
+          capBand: sheet.capBand.value ?? null,
+          marketCap: sheet.marketCap.value ?? null,
+          pairAgeHours: sheet.pairAgeHours.value ?? null,
+          firedAt: sheet.at,
+        },
+        now,
+      );
       logger.info(
         { token: sheet.tokenSymbol, score: score.score, lanes: entry.matchedLanes },
         'v2 shadow: WOULD HAVE ALERTED (nothing emitted)',
@@ -414,6 +466,23 @@ export class V2Shadow {
       const oldest = this.crowd.keys().next().value;
       if (oldest) this.crowd.delete(oldest);
     }
+  }
+
+  /**
+   * Record this wallet against the token and return how many DISTINCT watched
+   * wallets have touched it inside the window — the solo-vs-wave number.
+   */
+  private markCohort(swap: SwapEvent): number {
+    const key = swap.token.toLowerCase();
+    const now = Date.now();
+    const marks = (this.cohort.get(key) ?? []).filter((m) => now - m.at <= this.opts.crowdWindowMs);
+    marks.push({ wallet: swap.wallet.toLowerCase(), at: now });
+    this.cohort.set(key, marks);
+    if (this.cohort.size > 2_000) {
+      const oldest = this.cohort.keys().next().value;
+      if (oldest) this.cohort.delete(oldest);
+    }
+    return new Set(marks.map((m) => m.wallet)).size;
   }
 
   /** Distinct watched wallets that bought this token inside the window, including this one. */

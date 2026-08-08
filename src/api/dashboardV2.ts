@@ -138,6 +138,12 @@ export const DASHBOARD_V2_HTML = `<!doctype html>
     </div>
 
     <div class="card wide">
+      <h2>Scoreboard — what happened after each match</h2>
+      <div class="sub" style="margin:0 0 8px">Peak return since the signal fired, bucketed. <b>unpriced</b> = never quotable, excluded from the averages. <b>late</b> = the baseline is a price from AFTER the signal, so those rows understate the move. Win = peak ≥ 50%, the same bar 47e1's record uses.</div>
+      <div id="scoreboard"><div class="reason">loading…</div></div>
+    </div>
+
+    <div class="card wide">
       <h2>Diagnostics — every metric, with its age</h2>
       <div class="sub" style="margin:0 0 8px">A value without freshness cannot tell "just booted" from "broken". Ages update live; ⚠ means stale, ⏳ means never this boot.</div>
       <div id="diag"></div>
@@ -157,11 +163,12 @@ const ago = (t) => {
 };
 
 async function load() {
-  const [status, decisions, lanes, diag] = await Promise.all([
+  const [status, decisions, lanes, diag, outcomes] = await Promise.all([
     fetch('/api/v2/status').then((r) => r.json()).catch(() => ({})),
     fetch('/api/v2/decisions?limit=120' + (outcome ? '&outcome=' + outcome : '')).then((r) => r.json()).catch(() => ({ decisions: [] })),
     fetch('/api/v2/lanes').then((r) => r.json()).catch(() => ({ lanes: [] })),
     fetch('/api/debug/metrics').then((r) => r.json()).catch(() => null),
+    fetch('/api/v2/outcomes?limit=1').then((r) => r.json()).catch(() => ({ enabled: false })),
   ]);
 
   $('offbanner').innerHTML = status.enabled
@@ -207,6 +214,36 @@ async function load() {
         '<div style="margin-bottom:8px"><b>' + esc(fact) + '</b> — ' + v.measuredPct + '% measured' +
         ' <span class="reason">(' + v.measured + ' ✅ / ' + v.unknown + ' ⏳ / ' + v.failed + ' ❌)</span>' +
         '<div class="bar"><i style="width:' + v.measuredPct + '%"></i></div></div>').join('');
+
+  // The scoreboard. A bucket with nothing priced shows its counts and says so,
+  // rather than rendering a 0% win rate that reads as "these all failed".
+  if (!outcomes || outcomes.enabled === false) {
+    $('scoreboard').innerHTML = '<div class="reason">Ledger is OFF. Set <code>V2_LEDGER_ENABLED=true</code> to start following matches to an outcome.</div>';
+  } else {
+    const s = outcomes.summary || {};
+    const groups = [
+      ['by lane', s.byLane], ['by seed tier', s.bySeedTier], ['by cap at entry', s.byCapBand],
+      ['by pair age', s.byPairAge], ['solo vs wave', s.byCohort], ['by event type', s.byEventType],
+    ];
+    const head = '<div class="reason" style="margin-bottom:8px">' +
+      (s.total ?? 0) + ' matches followed · ' + (s.priced ?? 0) + ' priced · ' + (s.open ?? 0) + ' still open · tracked ' + (s.trackHours ?? 24) + 'h</div>';
+    const table = (rows) => (rows || []).filter((b) => b.count > 0).map((b) =>
+      '<div class="row">' +
+        '<span class="sym" style="min-width:120px">' + esc(b.label) + '</span>' +
+        '<span class="score">' + b.count + '</span>' +
+        '<span class="reason">' +
+          (b.count === b.unpriced
+            ? 'none priced yet — nothing measured'
+            : 'win ' + b.winRatePct + '% · avg peak ' + b.avgMaxGainPct + '% · best ' + b.bestMaxGainPct + '%' +
+              (b.unpriced ? ' · ' + b.unpriced + ' unpriced' : '') +
+              (b.lateEntryPct ? ' · ' + b.lateEntryPct + '% late entry' : '')) +
+        '</span>' +
+      '</div>').join('');
+    $('scoreboard').innerHTML = head + groups.map(([name, rows]) => {
+      const body = table(rows);
+      return body ? '<div style="margin-bottom:10px"><b>' + esc(name) + '</b>' + body + '</div>' : '';
+    }).join('') || head + '<div class="reason">No matches followed yet.</div>';
+  }
 
   const nm = status.nearMissesByLane || [];
   $('nearmiss').innerHTML = nm.length === 0
