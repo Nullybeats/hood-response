@@ -164,13 +164,20 @@ async function load() {
     ['skipped', c.skipped, ''],
     ['waiting', c.waiting, ''],
     ['blocked', c.blocked, ''],
-    ['seen', status.seen, ''],
+    ['buys seen', status.seen, ''],
+    ['sells ignored', (status.intake || {}).verifiedSells, ''],
     ['pending', status.pending, ''],
   ].map(([k, n, cls]) => '<div class="tile ' + cls + '"><div class="n">' + (n ?? 0) + '</div><div class="k">' + k + '</div></div>').join('');
 
+  const ix = status.intake || {};
   const rows = (decisions.decisions || []);
+  const emptyMsg = ix.total
+    ? 'No decisions yet — but the pipeline IS receiving traffic: ' + ix.total + ' swaps seen, ' +
+      ix.verifiedSells + ' verified SELLS (this brain reasons about buying, so those are ignored by design), ' +
+      ix.unverified + ' unverified, ' + ix.verifiedBuys + ' verified buys. A stretch of selling produces no decisions and is not a fault.'
+    : 'No swaps have reached the pipeline yet. Only strictly-verified trades enter, and roughly 1.5% of watched-wallet activity qualifies.';
   $('decisions').innerHTML = rows.length === 0
-    ? '<div class="reason">No decisions recorded yet. With the gate still in shadow, only strictly-verified swaps reach this pipeline — and roughly 1.5% of watched-wallet activity qualifies.</div>'
+    ? '<div class="reason">' + esc(emptyMsg) + '</div>'
     : rows.map((d) =>
         '<div class="row">' +
           '<span class="badge b-' + esc(d.outcome) + '">' + esc(d.outcome) + '</span>' +

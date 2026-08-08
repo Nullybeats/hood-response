@@ -91,6 +91,8 @@ export class V2Shadow {
   private evaluated = 0;
   /** Per-fact tallies, so "which enrichment is actually landing" is answerable. */
   private coverage = new Map<string, { measured: number; unknown: number; failed: number }>();
+  /** What arrived versus what this pipeline acts on. See onSwap. */
+  private readonly intake = { total: 0, unverified: 0, verifiedSells: 0, verifiedBuys: 0 };
 
   constructor(
     private readonly providers: V2Providers,
@@ -158,8 +160,22 @@ export class V2Shadow {
    */
   onSwap(swap: SwapEvent): void {
     if (!this.enabled) return;
-    if (swap.verifiedTrade !== true) return;
-    if (swap.direction !== 'BUY') return;
+    // Counted, not merely dropped. A pipeline that silently discards its input
+    // is indistinguishable from a broken one — which is the exact failure the
+    // diary exists to prevent, and it applied to intake too: watched wallets
+    // spent an evening selling, every sell was correctly verified and correctly
+    // ignored, and the dashboard showed a blank page with no way to tell that
+    // from an outage.
+    this.intake.total++;
+    if (swap.verifiedTrade !== true) {
+      this.intake.unverified++;
+      return;
+    }
+    if (swap.direction !== 'BUY') {
+      this.intake.verifiedSells++;
+      return;
+    }
+    this.intake.verifiedBuys++;
     this.seen++;
     this.markCrowd(swap);
     this.jrnl.write('trade', swap);
@@ -179,6 +195,10 @@ export class V2Shadow {
       journalStopped: this.jrnl.stoppedBecause,
       seen: this.seen,
       evaluated: this.evaluated,
+      // Why the decision list may legitimately be empty: this brain reasons
+      // about buying, so a stretch of verified SELLS produces no decisions and
+      // is not a fault.
+      intake: { ...this.intake },
       pending: this.pending.length,
       diarySize: this.diary.size,
       outcomes: summary.counts,
