@@ -183,3 +183,59 @@ describe('lanes as the buy rule', () => {
     expect(d.kind).toBe('allocation');
   });
 });
+
+/**
+ * One position per coin.
+ *
+ * The ledger shows the same token signalling repeatedly inside an hour (DERP
+ * fired five times in one 60-minute window). Without these guards that is five
+ * positions in one coin, five entry fees, and a concentration nobody chose.
+ *
+ * `holdsOpen` is the rule; the in-flight lock closes the race where two signals
+ * both clear it before either has recorded a position. Both are string
+ * comparisons on an address, which is why the casing test below exists: every
+ * producer emits lowercase TODAY, so a convention is doing the work of an
+ * invariant, and the engine now consumes two independent producers.
+ */
+describe('never twice into the same coin', () => {
+  it('refuses a second buy while the first position is open', async () => {
+    const log: string[] = [];
+    const eng = await armed(log, ['allocation']);
+    await eng.onAlert(v2());
+    await eng.onAlert(v2());                    // same token, new signal
+    expect(log).toEqual(['buy:0xtok:0.0005']);  // exactly one
+    expect(await reasonOf(eng)).toContain('already holding');
+  });
+
+  /**
+   * The failure this prevents is silent: a checksummed address is what
+   * `getAddress()` and most explorers return, and `'0xTOK' !== '0xtok'` makes
+   * every per-token guard miss at once. The result is a second position, not an
+   * error.
+   */
+  it('treats the same address as the same coin whatever its casing', async () => {
+    const log: string[] = [];
+    const eng = await armed(log, ['allocation']);
+    await eng.onAlert(v2({ token: '0xtok' }));
+    await eng.onAlert(v2({ token: '0xTOK' }));  // the other producer's spelling
+    expect(log).toHaveLength(1);
+    expect(await reasonOf(eng)).toContain('already holding');
+  });
+
+  /** And a legacy alert must not be able to open a second position in a coin a
+   *  v2 match already bought — the dual-stream case, where the two producers
+   *  are the ones most likely to disagree. */
+  it('blocks a legacy alert on a coin a v2 match is already holding', async () => {
+    const log: string[] = [];
+    const eng = await armed(log, ['allocation']);
+    eng.updateSettings({ primeOnly: false, kinds: 'ENTRY' });
+    await eng.onAlert(v2({ token: '0xtok' }));
+    await eng.onAlert({
+      id: 'legacy-dup', kind: 'ENTRY', token: '0xTok', tokenSymbol: 'GEM', walletCount: 2, wallets: [],
+      walletSummary: '2 alpha', walletLabels: [], marketCap: 50_000, priceLive: true, priceUsd: 1,
+      conviction: 75, firstSeen: Date.now(),
+    } as unknown as Swarm);
+    expect(log).toHaveLength(1);
+    expect(await reasonOf(eng)).toContain('already holding');
+  });
+});

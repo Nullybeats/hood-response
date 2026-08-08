@@ -282,12 +282,33 @@ export class SniperEngine {
     rugDropPct: config.SNIPER_RUG_DROP_PCT,
   };
 
+  /**
+   * The one key every per-token guard must agree on.
+   *
+   * `holdsOpen`, the in-flight lock and the loss cooldown are all string
+   * comparisons on a token address, and all three are what stop the sniper
+   * buying the same coin twice. Today every producer happens to emit lowercase,
+   * so they work — but that is a convention, not a guarantee. One path emitting
+   * a checksummed address (`0xAbC…` — what `getAddress()` returns, and what most
+   * explorers and RPC responses carry) would defeat all three at once, silently,
+   * and the failure mode is two positions in the same coin rather than an error.
+   *
+   * The engine now consumes TWO independent producers — legacy alerts and v2
+   * matches — which doubles the number of places that convention has to hold.
+   * Normalising here makes it structural instead.
+   */
+  private static key(token: string): string {
+    return token.toLowerCase();
+  }
+
   /** token → timestamp we last stopped out at a loss. Drives the re-buy cooldown. In-memory
-   *  (resets on restart, which is fine — a fresh process starts with a clean slate). */
+   *  (resets on restart, which is fine — a fresh process starts with a clean slate).
+   *  Keyed by SniperEngine.key. */
   private readonly recentLosses = new Map<string, number>();
 
   /** Tokens with a buy currently being evaluated/executed — a per-token lock that stops two
-   *  simultaneous alerts for the same token from both passing holdsOpen and double-buying. */
+   *  simultaneous alerts for the same token from both passing holdsOpen and double-buying.
+   *  Keyed by SniperEngine.key. */
   private readonly buying = new Set<string>();
   /** Pons-only buy ledger for its independent 24h cap. */
   private ponsBuys: { at: number; eth: number }[] = [];
@@ -473,8 +494,14 @@ export class SniperEngine {
     return this.buys.filter((b) => b.at >= cut).reduce((s, b) => s + b.eth, 0);
   }
 
+  /** Do we already hold this coin? The guard that stops a second position in a
+   *  token we are still in — compared on the normalised key, since a position
+   *  may have been stored by a different producer than the one signalling now. */
   private holdsOpen(token: string): boolean {
-    for (const p of this.positions.values()) if ((p.status === 'open' || p.status === 'close_pending') && p.token === token) return true;
+    const key = SniperEngine.key(token);
+    for (const p of this.positions.values()) {
+      if ((p.status === 'open' || p.status === 'close_pending') && SniperEngine.key(p.token) === key) return true;
+    }
     return false;
   }
 
@@ -745,15 +772,16 @@ export class SniperEngine {
     // portfolio position cap removed — concurrent positions are bounded only by wallet balance + gas reserve
     // Per-token in-flight lock: two alerts for the same token can both clear holdsOpen before either
     // records a position (the duplicate-WOOD race). Claim it for this evaluation; released in finally.
-    if (this.buying.has(swarm.token)) return this.decide(swarm, 'skipped', 'buy already in flight');
-    this.buying.add(swarm.token);
+    const buyKey = SniperEngine.key(swarm.token);
+    if (this.buying.has(buyKey)) return this.decide(swarm, 'skipped', 'buy already in flight');
+    this.buying.add(buyKey);
     try {
 
     // Recent-loss cooldown: a token that just stopped us out keeps re-signalling; re-buying it
     // into the same whipsaw is a money pump (see BURN: repeated −22%/−27% trailing-stop losses).
     const cool = this.settings.lossCooldownMin;
     if (cool > 0) {
-      const lostAt = this.recentLosses.get(swarm.token);
+      const lostAt = this.recentLosses.get(SniperEngine.key(swarm.token));
       if (lostAt && Date.now() - lostAt < cool * 60_000) {
         const mins = Math.ceil((cool * 60_000 - (Date.now() - lostAt)) / 60_000);
         return this.decide(swarm, 'skipped', `loss cooldown: stopped out recently, ${mins}m left`);
@@ -917,7 +945,7 @@ export class SniperEngine {
       logger.error({ token: swarm.tokenSymbol, err: String(err) }, 'sniper: buy failed');
     }
     } finally {
-      this.buying.delete(swarm.token); // release the per-token lock (runs on every early return too)
+      this.buying.delete(buyKey); // release the per-token lock (runs on every early return too)
     }
   }
 
@@ -1048,7 +1076,7 @@ export class SniperEngine {
     // realized loss when the COMBINED proceeds fall short of the stake.
     const totalOutEth = (p.exitValueEth ?? 0) + (p.recoupedEth ?? 0);
     if (p.exitValueEth != null && totalOutEth < p.ethIn) {
-      this.recentLosses.set(p.token, Date.now());
+      this.recentLosses.set(SniperEngine.key(p.token), Date.now());
       const equity = await this.accountEquityEth();
       if (equity != null) this.syncRiskDay(equity + p.exitValueEth);
       if (this.day) this.day.realizedLossEth += p.ethIn - totalOutEth + (p.buyGasEth ?? 0) + (p.sellGasEth ?? 0);
