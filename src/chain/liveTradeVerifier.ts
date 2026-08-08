@@ -260,8 +260,69 @@ export class LiveTradeVerifier {
   }
 }
 
+/**
+ * Running tally of what promoting the gate would actually change.
+ *
+ * The promotion contract requires a reviewed 24–48h window, but the only record
+ * of a mismatch was a log line — and `railway logs` returns a short tail, so the
+ * one number the decision depends on ("how many live signals would the strict
+ * verifier have suppressed?") was unanswerable in practice. Counting it here
+ * makes the review a reading rather than an archaeology exercise.
+ *
+ * In memory and cheap: it describes this process's observations, and the
+ * durable evidence remains the attribution ledger.
+ */
+interface ShadowTally {
+  /** Verdicts seen since boot. */
+  evaluated: number;
+  /** Passed the legacy receipt test — i.e. what the live path accepts today. */
+  legacyCandidate: number;
+  /** Proven trades under the strict contract. */
+  confirmed: number;
+  /**
+   * Legacy accepted, strict refused. THIS is what flipping the gate suppresses,
+   * and the number that has to be small and explainable before promoting.
+   */
+  wouldSuppress: number;
+  /** Strict confirmed something the legacy test rejected. Expected to be zero. */
+  wouldAdd: number;
+  /** Why the suppressed ones were refused, most common first. */
+  suppressedByCategory: Record<string, number>;
+  since: number;
+}
+
+const tally: ShadowTally = {
+  evaluated: 0,
+  legacyCandidate: 0,
+  confirmed: 0,
+  wouldSuppress: 0,
+  wouldAdd: 0,
+  suppressedByCategory: {},
+  since: Date.now(),
+};
+
+/** Snapshot for the attribution endpoint, so the gate review is a lookup. */
+export function liveTradeShadowTally(): ShadowTally & { wouldSuppressPct: number; hours: number } {
+  const pct = tally.legacyCandidate === 0 ? 0 : (tally.wouldSuppress / tally.legacyCandidate) * 100;
+  return {
+    ...tally,
+    suppressedByCategory: { ...tally.suppressedByCategory },
+    wouldSuppressPct: Math.round(pct * 10) / 10,
+    hours: Math.round(((Date.now() - tally.since) / 3_600_000) * 10) / 10,
+  };
+}
+
 export function logLiveTradeShadow(txHash: string, verdict: LiveTradeVerdict): void {
+  tally.evaluated++;
+  if (verdict.legacyCandidate) tally.legacyCandidate++;
+  if (verdict.confirmed) tally.confirmed++;
   if (verdict.legacyCandidate === verdict.confirmed) return;
+  if (verdict.legacyCandidate && !verdict.confirmed) {
+    tally.wouldSuppress++;
+    tally.suppressedByCategory[verdict.category] = (tally.suppressedByCategory[verdict.category] ?? 0) + 1;
+  } else {
+    tally.wouldAdd++;
+  }
   logger.warn(
     { tx: txHash, legacyCandidate: verdict.legacyCandidate, confirmedTrade: verdict.confirmed, category: verdict.category },
     'live trade shadow mismatch',

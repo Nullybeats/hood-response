@@ -13,6 +13,7 @@ import type { PerformanceTracker } from '../engine/performance.js';
 import type { SniperRegistry } from '../sniper/registry.js';
 import type { HyperSyncShadow } from '../chain/shadow.js';
 import type { AttributionShadow } from '../attrib/runtime.js';
+import { liveTradeShadowTally } from '../chain/liveTradeVerifier.js';
 import type { V2Shadow } from '../v2/runtime.js';
 import { DEFAULT_LANES, describeCondition } from '../v2/lanes.js';
 import { addressOfPrivateKey } from '../sniper/executor.js';
@@ -184,7 +185,14 @@ export async function buildServer(
   // and genuinely quiet wallets without deanonymising the watched set.
   app.get('/api/attrib', async () => {
     if (!attribution) return { enabled: false, reason: 'attribution shadow not constructed' };
-    return { status: attribution.status(), report: attribution.report() };
+    return {
+      status: attribution.status(),
+      report: attribution.report(),
+      // What promoting LIVE_VERIFIED_TRADE_GATE would actually change, counted
+      // rather than inferred from a log tail. `wouldSuppress` is the number the
+      // promotion decision turns on.
+      liveGateShadow: liveTradeShadowTally(),
+    };
   });
 
   // ── v2 shadow: decisions, lanes, coverage ───────────────────────────────────
