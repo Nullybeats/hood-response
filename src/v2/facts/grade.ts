@@ -59,15 +59,27 @@ const HIT_THRESHOLD = 1.3;
 /**
  * Grade thresholds, expressed on a 0–100 quality index.
  *
- * [config] — a starting point to be tuned against the journal, not a proven
- * optimum. They are stated here as data so tuning is a visible edit rather than
- * a scattering of magic numbers through the scorer.
+ * TUNED AGAINST THE JOURNAL 2026-08-08, which is what the previous note said to do. Measured over
+ * the 108-call archive, the index of every wallet with a gradeable sample ran 16 to 66 — so the
+ * old A cutoff of 75 was unreachable by ANY wallet, however good. The best performers on the
+ * benchmark feed (+847% and +425% calls) graded B.
+ *
+ * A band nothing can reach is not a high standard, it is a broken scale — the same defect as the
+ * alert tier that bucketed at "conviction 80+" when no v2 score had ever exceeded 68. Grades are
+ * a RANKING, and a ranking whose top rung is empty conveys nothing.
+ *
+ * These are set from the observed distribution so A means "top of what wallets actually achieve"
+ * rather than an arbitrary number: A at 60 admits the three best (66 / 61 / 60), F stays for the
+ * genuinely poor (the live allocation record puts two wallets at index 4 and 6).
+ *
+ * [config] — still a starting point. Re-tune when the live allocation record is deep enough to
+ * have its own distribution, since these are calibrated largely on the imported buy record.
  */
 export const GRADE_CUTOFFS: readonly { min: number; grade: Exclude<Grade, 'U'> }[] = [
-  { min: 75, grade: 'A' },
-  { min: 55, grade: 'B' },
-  { min: 35, grade: 'C' },
-  { min: 15, grade: 'D' },
+  { min: 60, grade: 'A' },
+  { min: 48, grade: 'B' },
+  { min: 36, grade: 'C' },
+  { min: 18, grade: 'D' },
   { min: 0, grade: 'F' },
 ] as const;
 

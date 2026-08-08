@@ -15,6 +15,8 @@ import { describe, expect, it } from 'vitest';
 import { gradeWallet } from '../../v2/facts/grade.js';
 import { toOutcome, WalletOutcomes } from '../../v2/facts/outcomes.js';
 import type { LedgerRecord, OutcomeLedger } from '../../v2/ledger.js';
+import { PRIOR_OUTCOMES } from '../../v2/facts/priorOutcomes.js';
+import { MAX_OUTCOMES } from '../../v2/facts/grade.js';
 
 const NOW = Date.now();
 const DAY = 86_400_000;
@@ -207,5 +209,67 @@ describe('WalletOutcomes', () => {
     const s = wo.stats();
     expect(s.calls).toBe(2);
     expect(s.wallets).toBe(1);
+  });
+});
+
+/**
+ * The imported prior call record.
+ *
+ * A wallet grades U until it has 5 measured outcomes, and the v2 ledger only began recording
+ * hours ago — so wallets with a long, genuinely good record read as unproven and were
+ * indistinguishable from a wallet we had never seen. The prior is their real outcomes, imported so
+ * a grade starts from what a wallet has actually done.
+ *
+ * It is a PRIOR, not an override, and these tests are what hold that line.
+ */
+describe('prior outcomes are a starting point, not a floor', () => {
+  const wid = Object.keys(PRIOR_OUTCOMES)[0]!;
+  const prior = PRIOR_OUTCOMES[wid]!;
+
+  it('lets a wallet with only a prior record grade at all', () => {
+    const wo = new WalletOutcomes(ledger([]));
+    const card = wo.reportCard(Date.now());
+    const row = card.find((r) => r.walletId === wid);
+    expect(row).toBeDefined();
+    expect(row!.sample).toBeGreaterThan(0);
+  });
+
+  /**
+   * The displacement rule. `gradeWallet` keeps the most recent MAX_OUTCOMES, so once a wallet has
+   * that many LIVE outcomes the prior contributes nothing — which is what makes this safe to seed
+   * from a different basis (legacy buys) than the one we now measure (allocations).
+   */
+  it('is displaced entirely once the wallet has enough live outcomes', () => {
+    const now = Date.now();
+    const live: Outcome[] = Array.from({ length: MAX_OUTCOMES }, (_, i) => ({
+      at: now - i * 60_000, // all far newer than the imported record
+      peakMultiple: 1.0,
+    }));
+    const merged = gradeWallet([...live], now, 'allocations');
+    // The prior is uniformly stronger than these flat live outcomes; if it leaked in, the index
+    // could not be 0.
+    expect(merged.sample).toBe(MAX_OUTCOMES);
+    expect(merged.index).toBe(0);
+    expect(prior.some(([, peak]) => peak > 30)).toBe(true); // the prior really is stronger
+  });
+
+  /**
+   * An imported outcome carries its REAL timestamp, so the staleness rule still applies to it. A
+   * wallet cannot be seeded with an old record and coast on it: go quiet for 30 days and it drifts
+   * back to U regardless of how good the prior was.
+   */
+  it('goes stale on its real age — a prior cannot be coasted on', () => {
+    const now = Date.now();
+    const excellent = Array.from({ length: 6 }, (_, i) => ({
+      at: now - (40 + i) * 86_400_000, // well past STALE_DAYS
+      peakMultiple: 3,
+    }));
+    const g = gradeWallet(excellent, now, 'allocations');
+    expect(g.grade).toBe('U');
+    expect(g.reason).toContain('stale');
+
+    // The identical record, recent, grades on its merits.
+    const recent = excellent.map((o, i) => ({ ...o, at: now - i * 3_600_000 }));
+    expect(gradeWallet(recent, now, 'allocations').grade).not.toBe('U');
   });
 });

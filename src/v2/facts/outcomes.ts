@@ -40,6 +40,7 @@
  */
 
 import { walletId } from '../../walletId.js';
+import { PRIOR_OUTCOMES } from './priorOutcomes.js';
 import type { LedgerRecord, OutcomeLedger } from '../ledger.js';
 import { gradeWallet, type Outcome } from './grade.js';
 import type { Grade } from './types.js';
@@ -80,7 +81,7 @@ export class WalletOutcomes {
    */
   for(address: string): readonly Outcome[] {
     this.maybeRebuild();
-    return this.byWallet.get(address.toLowerCase()) ?? [];
+    return withPriors(this.byWallet.get(address.toLowerCase()) ?? [], walletId(address));
   }
 
   /** For the status endpoint: how much of the record is actually usable. */
@@ -109,11 +110,22 @@ export class WalletOutcomes {
   }[] {
     this.maybeRebuild();
     const noun = this.basis === 'distribution' ? 'allocations' : 'buys';
-    return [...this.byWallet.entries()]
-      .map(([address, outcomes]) => {
-        const g = gradeWallet(outcomes, now, noun);
-        return { walletId: walletId(address), grade: g.grade, index: g.index, sample: g.sample, reason: g.reason };
-      })
+    const seen = new Set<string>();
+    const rows = [...this.byWallet.entries()].map(([address, outcomes]) => {
+      const wid = walletId(address);
+      seen.add(wid);
+      const g = gradeWallet(withPriors(outcomes, wid), now, noun);
+      return { walletId: wid, grade: g.grade, index: g.index, sample: g.sample, reason: g.reason };
+    });
+    // Wallets we have ONLY a prior record for. They never appear in the ledger scan — the ledger is
+    // keyed by address and a walletId cannot be reversed — but they are exactly the wallets this
+    // surface exists to explain, so they are graded from the prior alone.
+    for (const wid of Object.keys(PRIOR_OUTCOMES)) {
+      if (seen.has(wid)) continue;
+      const g = gradeWallet(withPriors([], wid), now, noun);
+      rows.push({ walletId: wid, grade: g.grade, index: g.index, sample: g.sample, reason: g.reason });
+    }
+    return rows
       .sort((a, b) => (b.index ?? -1) - (a.index ?? -1) || b.sample - a.sample)
       .slice(0, limit);
   }
@@ -176,4 +188,22 @@ export function toOutcome(record: LedgerRecord): Outcome | null {
     // is the failure that actually costs the account — so it is graded as one.
     ruggedAfter: record.lastGainPct <= -90,
   };
+}
+
+/**
+ * Merge a wallet's live outcomes with its imported prior record.
+ *
+ * Order matters and is handled by the grader, not here: `gradeWallet` sorts by recency and keeps
+ * the most recent 20, so once a wallet has 20 live outcomes the prior is displaced completely. The
+ * prior is a starting point that live measurement overwrites, never a floor under it.
+ */
+function withPriors(live: readonly Outcome[], wid: string): readonly Outcome[] {
+  const prior = PRIOR_OUTCOMES[wid];
+  if (!prior?.length) return live;
+  const seeded: Outcome[] = prior.map(([at, peakPct, rugged]) => ({
+    at,
+    peakMultiple: 1 + peakPct / 100,
+    ruggedAfter: rugged === 1,
+  }));
+  return [...live, ...seeded].sort((a, b) => b.at - a.at);
 }
