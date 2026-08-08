@@ -243,3 +243,74 @@ describe('never twice into the same coin', () => {
     expect(await reasonOf(eng)).toContain('already holding');
   });
 });
+
+/**
+ * The wallet-grade filter.
+ *
+ * Grades are earned from allocation outcomes and are deliberately NOT a lane condition — the lane
+ * has to keep firing while the record accrues, or the grades it would need could never be
+ * measured. This is the operator's own filter on top, so acting on a grade is a choice rather
+ * than something the rules do silently.
+ *
+ * Measured 2026-08-08, the first hour grades existed: `beta · #4 HMM` — the wallet behind 15 of 16
+ * matched signals — graded F at a 5% hit rate over 20 allocations. So the control has something
+ * real to act on immediately.
+ */
+describe('the wallet-grade filter', () => {
+  async function armedWithGrades(log: string[], grades: string[]) {
+    const eng = await armed(log, ['allocation']);
+    eng.updateSettings({ allowedWalletGrades: grades });
+    return eng;
+  }
+
+  it('allows every grade by default, so adding the control changes nothing', async () => {
+    const log: string[] = [];
+    const eng = await armed(log, ['allocation']);
+    await eng.onAlert(v2({ walletGrade: 'F' }));
+    expect(log).toEqual(['buy:0xtok:0.0005']);
+  });
+
+  it('skips a grade the operator excluded, and names it', async () => {
+    const log: string[] = [];
+    const eng = await armedWithGrades(log, ['A', 'B', 'C', 'D', 'U']);
+    await eng.onAlert(v2({ walletGrade: 'F' }));
+    expect(log).toHaveLength(0);
+    expect(await reasonOf(eng)).toContain('wallet grade F');
+  });
+
+  it('buys a grade that is on the list', async () => {
+    const log: string[] = [];
+    const eng = await armedWithGrades(log, ['A', 'B']);
+    await eng.onAlert(v2({ walletGrade: 'B' }));
+    expect(log).toEqual(['buy:0xtok:0.0005']);
+  });
+
+  /**
+   * `U` means "fewer than 5 measured outcomes", not "bad". Excluding it is a real position — buy
+   * only proven wallets — but it must be deliberate, because every wallet reads U until it has a
+   * record, and a default that excluded U would have silently bought nothing for weeks.
+   */
+  it('treats an ABSENT grade as U, never as passing', async () => {
+    const log: string[] = [];
+    const eng = await armedWithGrades(log, ['A', 'B', 'C', 'D', 'F']); // U withheld
+    await eng.onAlert(v2({ walletGrade: undefined }));
+    expect(log).toHaveLength(0);
+    expect(await reasonOf(eng)).toContain('wallet grade U');
+  });
+
+  it('buys nothing when every grade is excluded', async () => {
+    const log: string[] = [];
+    const eng = await armedWithGrades(log, []);
+    await eng.onAlert(v2({ walletGrade: 'A' }));
+    expect(log).toHaveLength(0);
+    expect(await reasonOf(eng)).toContain('no wallet grade is enabled');
+  });
+
+  /** The lane itself must stay grade-blind, so grading can keep accruing in the background. */
+  it('does not make the lane itself require a grade', async () => {
+    const log: string[] = [];
+    const eng = await armed(log, ['allocation']);
+    await eng.onAlert(v2({ walletGrade: 'U' }));
+    expect(log).toEqual(['buy:0xtok:0.0005']);
+  });
+});

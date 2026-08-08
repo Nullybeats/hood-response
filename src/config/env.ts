@@ -610,6 +610,10 @@ const schema = z.object({
   SNIPER_LANES: z.string().default(''),
   // Minimum v2 score to buy. A null score always fails closed regardless.
   SNIPER_MIN_SCORE: num(60),
+  // Wallet grades the sniper may buy from. ALL of them by default, including U — adding this
+  // filter must not silently change what an armed sniper does, and every wallet reads U until it
+  // has 5 measured allocation outcomes. Narrowing it is an explicit operator choice.
+  SNIPER_WALLET_GRADES: z.string().default('A,B,C,D,F,U'),
   V2_LEDGER_PATH: z.string().default('/data/v2-outcomes.json'),
   // 24h matches the window a launch resolves in on this chain, and matches the
   // legacy tracker so the two records compare like for like.
@@ -716,6 +720,10 @@ export const config = {
   // silently match nothing, which is the failure the lane enum exists to stop.
   sniperLanes: env.SNIPER_LANES.split(',')
     .map((s) => s.trim().toLowerCase())
+    .filter(Boolean),
+  // Grades ARE upper-case by definition (A–F, U), which is the mirror of the lane rule above.
+  sniperWalletGrades: env.SNIPER_WALLET_GRADES.split(',')
+    .map((s) => s.trim().toUpperCase())
     .filter(Boolean),
   // Only a configured, syntactically valid address can be trusted as a native
   // settlement entry point. Keep these lower-cased because receipt addresses

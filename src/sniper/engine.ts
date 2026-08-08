@@ -170,6 +170,20 @@ export interface SniperSettings {
    * through, because `null < 0` is false in JS.
    */
   minScore: number;
+  /**
+   * Wallet grades the sniper will buy from.
+   *
+   * Grades are EARNED from allocation outcomes and are deliberately NOT a lane condition — the
+   * lane must keep firing while the record accrues, or the grades it would need can never be
+   * measured. This is the operator's own filter on top, so acting on a grade is a choice rather
+   * than something the rules do silently.
+   *
+   * `U` is in the default set and is not a bad grade — it means "fewer than 5 outcomes", i.e. we
+   * have not measured this wallet yet. Excluding it is a real position to take (only buy proven
+   * wallets), but it must be taken deliberately, because every wallet reads U until it has a
+   * record. An EMPTY list buys nothing, matching the enabledLanes rule: fail closed.
+   */
+  allowedWalletGrades: string[];
   /** Depth gate: skip a buy when the round-trip loss at our size exceeds this %. 0 = off. */
   maxRoundtripPct: number;
   /** After a token stops us out at a loss, don't re-buy it for this many minutes — stops the
@@ -273,6 +287,7 @@ export class SniperEngine {
     // Empty by default: v2 buys nothing until an operator names a lane.
     enabledLanes: [...config.sniperLanes],
     minScore: config.SNIPER_MIN_SCORE,
+    allowedWalletGrades: [...config.sniperWalletGrades],
     maxRoundtripPct: config.SNIPER_MAX_ROUNDTRIP_PCT,
     lossCooldownMin: config.SNIPER_LOSS_COOLDOWN_MIN,
     newCoinsOnly: config.SNIPER_NEW_COINS_ONLY,
@@ -745,6 +760,14 @@ export class SniperEngine {
     if (swarm.score == null) return this.decide(swarm, 'skipped', 'unscored — refusing to buy');
     if (swarm.score < this.settings.minScore) {
       return this.decide(swarm, 'skipped', `score ${swarm.score} below floor ${this.settings.minScore}`);
+    }
+    // Wallet grade. A match that carries no grade at all is treated as `U` — unmeasured, which is
+    // what an absent grade means — rather than being waved through on a missing field.
+    const allowed = new Set(this.settings.allowedWalletGrades.map((g) => g.trim().toUpperCase()));
+    if (allowed.size === 0) return this.decide(swarm, 'skipped', 'no wallet grade is enabled for buying');
+    const grade = (swarm.walletGrade ?? 'U').toUpperCase();
+    if (!allowed.has(grade)) {
+      return this.decide(swarm, 'skipped', `wallet grade ${grade} not in the buy list`);
     }
     // Freshness gate (before any network call): the alert's edge decays fast — on real trades every
     // >50%-peak winner filled in <2s, while a 38s-late fill bought the top (PIPEDOG). Skip an alert
@@ -1594,6 +1617,7 @@ export class SniperEngine {
     if (this.settingsSchemaVersion < 3) {
       this.settings.enabledLanes = [];
       this.settings.minScore = config.SNIPER_MIN_SCORE;
+      this.settings.allowedWalletGrades = [...config.sniperWalletGrades];
       const wasOn = this.mode === 'live';
       this.mode = 'off';
       logger.warn(
@@ -1644,6 +1668,13 @@ export class SniperEngine {
       ];
     }
     if (typeof patch.minScore === 'number') this.settings.minScore = clamp(patch.minScore, 0, 100);
+    if (Array.isArray(patch.allowedWalletGrades)) {
+      // Empty is a legitimate instruction, same as enabledLanes: it means "buy from no grade",
+      // which fails closed rather than being read as "no preference, allow everything".
+      this.settings.allowedWalletGrades = [
+        ...new Set(patch.allowedWalletGrades.map((g) => String(g).trim().toUpperCase()).filter(Boolean)),
+      ];
+    }
     logger.info({ settings: this.settings }, 'sniper: settings updated');
     void this.persist();
     return this.settings;

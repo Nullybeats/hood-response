@@ -104,6 +104,9 @@ const sniperSettingsBody = z.object({
   // ids come from DEFAULT_LANES so the two can never drift.
   enabledLanes: z.array(z.enum(LANE_IDS as [string, ...string[]])).optional(),
   minScore: z.number().min(0).max(100).optional(),
+  // An ENUM for the same reason lanes are one: a typo'd grade would be stored happily and match
+  // nothing forever, and a sniper that silently buys nothing looks exactly like a quiet market.
+  allowedWalletGrades: z.array(z.enum(['A', 'B', 'C', 'D', 'F', 'U'])).optional(),
 });
 const sniperModeBody = z.object({ mode: z.enum(['off', 'live']) });
 // Per-position exit overrides. A positive number sets the override; null/0 clears it (→ global).
