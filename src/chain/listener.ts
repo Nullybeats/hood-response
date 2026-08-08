@@ -335,11 +335,32 @@ export class LiveChainListener implements ChainListener {
       return;
     }
 
-    // Latency probe reply.
+    // Latency probe reply. The probe asks for the head, so use the answer for
+    // BOTH numbers rather than timing the round trip and discarding the block.
+    //
+    // Without this, `lastBlock` advanced only when a watched wallet happened to
+    // act — so a quiet hour froze the head on the dashboard while the chain ran
+    // on, and the feed read as stalled. Measured against the untouched instance:
+    // 1,000 blocks (~100s) behind, purely as a display artifact. `newHeads` would
+    // also fix it, but this chain produces a block every 0.1s and subscribing
+    // would bill ~860k notifications a day for a number we need every 15s.
     if (msg.id && this.pendingLatency.has(msg.id)) {
       const sent = this.pendingLatency.get(msg.id)!;
       this.pendingLatency.delete(msg.id);
-      this.store.updateMetrics({ rpcLatencyMs: Date.now() - sent });
+      const patch: { rpcLatencyMs: number; lastBlock?: number } = { rpcLatencyMs: Date.now() - sent };
+      if (typeof msg.result === 'string') {
+        try {
+          const head = Number(BigInt(msg.result));
+          // Never move the head backwards: a late probe reply must not undo a
+          // newer block already stamped by a processed log.
+          if (Number.isFinite(head) && head > this.store.metrics.lastBlock) patch.lastBlock = head;
+        } catch {
+          // BigInt throws on anything non-numeric, and this runs inside the
+          // socket's message handler — a malformed reply must cost us one
+          // telemetry sample, not the connection.
+        }
+      }
+      this.store.updateMetrics(patch);
       return;
     }
 

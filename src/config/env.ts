@@ -91,8 +91,12 @@ const schema = z.object({
   // block is only useful for dashboard telemetry. Keep the expensive stream
   // off by default on fast L2s.
   CHAIN_WS_INCLUDE_HEADS: bool(false),
-  // An optional websocket round-trip metric. Zero avoids continuous probe
-  // requests; enable only while investigating latency.
+  // Websocket round-trip probe. It asks for the head, so it supplies BOTH the
+  // latency metric and a liveness-independent `lastBlock` — without it the head
+  // only advances when a watched wallet acts, and a quiet hour is indistinguishable
+  // from a stalled feed (measured: 1,000 blocks behind, purely as display).
+  // One request per interval, versus ~10/second for a newHeads subscription on
+  // this chain, which is why the head comes from here rather than from a stream.
   CHAIN_WS_LATENCY_PROBE_MS: num(0),
   CHAIN_ID: z.string().default('4663'),
   CHAIN_MODE: z.enum(['live', 'simulator', 'auto']).default('auto'),
