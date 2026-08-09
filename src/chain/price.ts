@@ -153,11 +153,41 @@ const LIVE_STALE_MS = 30 * 60_000;
 const ETH_USD_REF_TTL_MS = 5 * 60_000;
 /** Refresh the ETH/USD reference on its own clock, at 5x margin against its TTL. See start(). */
 const ETH_USD_KEEPALIVE_MS = 60_000;
+/**
+ * Absolute floor for a token's USD price. Below this it is a SCALING BUG, not a cheap coin.
+ *
+ * [verified 2026-08-09] three ledger records carried `entryPrice` ≈ **5.65e-36**, and one reported a
+ * `maxGainPct` of **7.14e+35** — enough to destroy every mean it appeared in. The tell was that the
+ * value was near-IDENTICAL across unrelated tokens, so it was a decimals/`sqrtPriceX96` scaling
+ * artefact rather than a reading. Nothing caught it: the only guard was `priceUsd <= 0`, and 5.65e-36
+ * is finite and positive. The disagreement guard could not help either — it needs an indexer price to
+ * compare against, and these were adopted precisely when the indexer was unreachable.
+ *
+ * Sized from real data, not taste. The smallest genuine price observed on this chain is **4.27e-24**
+ * (a real, if absurd, high-supply token), and the artefact sits at 5.65e-36 — twelve orders of
+ * magnitude apart. 1e-30 sits ~6 orders from each, so it rejects the artefact without ever refusing
+ * an observed real price. Sanity-check by supply: even at a quintillion tokens outstanding, 1e-30
+ * implies a market cap of $1e-12. That is not a market.
+ *
+ * Rejecting means the token stays UNKNOWN, which is the honest answer and what every consumer already
+ * handles — never a substituted number. See CLAUDE.md rule 7.
+ */
+const PRICE_USD_MIN = 1e-30;
 /** Plausibility band for an ETH/USD rate. Wide on purpose: this exists to reject a
  *  catastrophically wrong rate (the observed failures were $1.00 and $0.0089), not to
  *  second-guess the market. Widen it before ETH ever threatens either end. */
 const ETH_USD_MIN = 50;
 const ETH_USD_MAX = 100_000;
+
+/**
+ * Is this a price at all?
+ *
+ * Guards the ONE thing `priceUsd <= 0` misses: a positive, finite number that is nevertheless the
+ * output of a scaling bug. See PRICE_USD_MIN.
+ */
+function plausiblePriceUsd(priceUsd: number): boolean {
+  return Number.isFinite(priceUsd) && priceUsd >= PRICE_USD_MIN;
+}
 
 /** Evict oldest-inserted entries until the map is under `max`. */
 function capMap<T>(map: Map<string, T>, max: number): void {
@@ -575,6 +605,7 @@ export class PriceOracle {
     poolFallbackFromNoPair: 0,
     poolFallbackFromError: 0,
     poolSkippedSpeculative: 0,
+    priceImplausible: 0,
   };
   /** One log line per penalty window, not per refused request. */
   private dexPenaltyLogged = false;
@@ -600,6 +631,7 @@ export class PriceOracle {
       poolFallbackFromNoPair: this.debugCounters.poolFallbackFromNoPair,
       poolFallbackFromError: this.debugCounters.poolFallbackFromError,
       poolSkippedSpeculative: this.debugCounters.poolSkippedSpeculative,
+      priceImplausible: this.debugCounters.priceImplausible,
       // Read from the constants, not restated. This said `1` for as long as MAX_PER_TICK was 1, so
       // the number that would have exposed the starvation was itself a literal nobody had to update.
       sweepPerTick: MAX_PER_TICK,
@@ -931,7 +963,13 @@ export class PriceOracle {
    */
   private applyPair(address: string, best: DexPair): boolean {
     const priceUsd = Number(best.priceUsd);
-    if (!Number.isFinite(priceUsd) || priceUsd <= 0) return false;
+    if (!plausiblePriceUsd(priceUsd)) {
+      if (Number.isFinite(priceUsd) && priceUsd > 0) {
+        this.debugCounters.priceImplausible += 1;
+        logger.warn({ token: address, priceUsd, floor: PRICE_USD_MIN }, 'price oracle: indexer price below the plausibility floor — treating as unknown');
+      }
+      return false;
+    }
     const priceNative = Number(best.priceNative);
     const marketCap = best.marketCap ?? best.fdv ?? null;
     this.recordAth(address, marketCap);
@@ -1176,7 +1214,18 @@ export class PriceOracle {
     const pool = await this.pools.priceEthOf(address).catch(() => null);
     if (!pool) return;
     const priceUsd = pool.priceEth * ethUsd;
-    if (!Number.isFinite(priceUsd) || priceUsd <= 0) return;
+    if (!plausiblePriceUsd(priceUsd)) {
+      // A scaling artefact, not a cheap coin. Record it as unknown and COUNT it — a silent reject
+      // here would look identical to "this pool has no price", which is how the last one survived.
+      if (Number.isFinite(priceUsd) && priceUsd > 0) {
+        this.debugCounters.priceImplausible += 1;
+        logger.warn(
+          { token: address, venue: pool.venue, priceUsd, priceEth: pool.priceEth, ethUsd, floor: PRICE_USD_MIN },
+          'price oracle: pool read below the plausibility floor — treating as unknown',
+        );
+      }
+      return;
+    }
     // DISAGREEMENT GUARD. When the indexer already has a live price for this token and the pool read
     // is wildly different, one of the two is wrong and we cannot tell which — so the indexer wins
     // (it prices the deepest pair; a cold pool discovery can land on a shallow one) and the

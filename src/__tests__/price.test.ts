@@ -615,6 +615,50 @@ describe('PriceOracle DexScreener rate-limit discipline', () => {
     expect(pool.mock.calls.length).toBeGreaterThan(0);
   }, 30_000);
 
+  it('refuses a scaling artefact as a price, but accepts a genuinely tiny one', async () => {
+    // REAL NUMBERS from the ledger, 2026-08-09. Three records carried entryPrice ~5.65e-36 and one
+    // reported maxGainPct 7.14e+35, which destroyed every mean it appeared in. The tell was that the
+    // value was near-IDENTICAL across unrelated tokens — a decimals/sqrtPriceX96 scaling artefact,
+    // not a reading. The only guard was `priceUsd <= 0`, and 5.65e-36 is finite and positive.
+    //
+    // The floor must sit between the artefact and the smallest price genuinely observed on this chain
+    // (4.27e-24, a real high-supply token), so this test pins BOTH sides. Tightening the floor past
+    // the real value would start discarding true prices, which is the failure this must not trade for.
+    const ARTEFACT_ETH = 5.65e-36 / 3_000;
+    const REAL_TINY_ETH = 4.27e-24 / 3_000;
+
+    for (const [label, priceEth, shouldPrice] of [
+      ['scaling artefact', ARTEFACT_ETH, false],
+      ['real tiny price', REAL_TINY_ETH, true],
+    ] as [string, number, boolean][]) {
+      const oracle = new PriceOracle([]);
+      // Indexer has nothing, so the pool read is unchecked — exactly the condition that let this
+      // through: the disagreement guard needs an indexer price to compare against.
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true, status: 200, headers: { get: () => null }, json: async () => ({ pairs: [] }),
+      }));
+      vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(3_000);
+      vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue({
+        priceEth, venue: 'v4', liquidity: 1n,
+        poolAddress: '0x0000000000000000000000000000000000000001', pairCreatedAt: 1_700_000_000_000,
+      });
+
+      await oracle.refreshNow(R, { live: true });
+
+      const px = oracle.priceOf(R);
+      if (shouldPrice) {
+        expect(px, label).toBeGreaterThan(0);
+      } else {
+        // Unknown, never a substituted number — CLAUDE.md rule 7.
+        expect(px ?? 0, label).toBe(0);
+        expect((oracle.debug() as { priceImplausible: number }).priceImplausible, label)
+          .toBeGreaterThan(0);
+      }
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('does not start a second sweep while one is still in flight', async () => {
     const oracle = new PriceOracle([]);
     let release: (v: unknown) => void = () => undefined;
