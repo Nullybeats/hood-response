@@ -164,7 +164,7 @@ export const DASHBOARD_V2_HTML = `<!doctype html>
       </div>
 
       <div class="card">
-        <h2 title="Every signal followed to an outcome, one row each. This tracks exactly three things: ENTRY, PEAK and NOW. It does NOT model an exit — when a position actually closes is decided by your own trailing stop / take-profit config, which is per-operator and can change mid-position. Peak is the honest measure of a call because it does not depend on when you happened to look. CONTROL rows matched no lane and were never called; they are here so the lane can be proven wrong.">call record — entry, peak, now</h2>
+        <h2 title="Every signal followed to an outcome, one row each — CALLED and CONTROL together, which is why this is not titled 'call record'. A CONTROL row matched no lane and was never called; it is tracked so the lanes can be proven wrong, because 'the rules pick winners' is unfalsifiable without the ones they turned down. This tracks exactly three things: ENTRY, PEAK and NOW. It does NOT model an exit — when a position actually closes is decided by your own trailing stop / take-profit config, which is per-operator and can change mid-position. Peak is the honest measure because it does not depend on when you happened to look.">signal record — called AND control</h2>
         <div class="tabs" id="calltabs">
           <button class="tab" data-c="matched" aria-selected="true">called</button>
           <button class="tab" data-c="control">control</button>
@@ -328,10 +328,22 @@ async function load() {
     const wins = priced.filter((r) => (r.maxGainPct ?? 0) >= 50).length;
     const avg = priced.length ? priced.reduce((a, r) => a + (r.maxGainPct ?? 0), 0) / priced.length : 0;
     const best = priced.length ? Math.max(...priced.map((r) => r.maxGainPct ?? 0)) : 0;
+    // SAY WHAT IS BEING COUNTED. The all/best tabs mix called rows with control rows, so a
+    // bare "5 signals · win 0%" under a heading with the word "call" in it reads as "we made 5
+    // calls and every one lost" — which was false in exactly the direction that matters, since 0
+    // of those 5 were called. The split is stated before the averages, not after them.
+    const nCalled = pick.filter((r) => r.matched).length;
+    const nControl = pick.length - nCalled;
+    const mix = calls === 'matched' ? nCalled + ' CALLED'
+      : calls === 'control' ? nControl + ' control (never called)'
+      : nCalled + ' called + ' + nControl + ' control';
     $('callhead').innerHTML = pick.length === 0 ? '' :
-      pick.length + ' signals · ' + priced.length + ' priced · win ' +
+      mix + ' · ' + priced.length + ' priced · win ' +
       (priced.length ? Math.round((100 * wins) / priced.length) : 0) + '% · avg peak ' +
-      pct(avg) + ' · best ' + pct(best) + ' · win = peak ≥ +50%';
+      pct(avg) + ' · best ' + pct(best) + ' · win = peak ≥ +50%' +
+      (calls !== 'matched' && nCalled === 0 && nControl > 0
+        ? ' — <b>nothing has been called yet; these are rejects</b>'
+        : '');
 
     const emptyCalls = calls === 'matched'
       ? 'No lane has matched yet. Rows appear here the moment one does — the control tab shows what the lanes are turning down in the meantime.'
