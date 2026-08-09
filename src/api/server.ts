@@ -254,18 +254,26 @@ export async function buildServer(
   app.get('/api/v2/outcomes', async (req) => {
     const ledger = v2?.outcomes;
     if (!ledger) return { enabled: false, reason: 'v2 ledger not enabled' };
-    const q = req.query as { limit?: string };
+    const q = req.query as { limit?: string; offset?: string };
     const limit = Math.min(Number(q.limit) || 200, 1_000);
+    // PAGED. The cap alone was a silent truncation: `records` stopped at 1,000 newest-first while
+    // `summary` covered every record, so any client-side analysis quietly disagreed with the summary
+    // it was printed next to and had no way to notice. [2026-08-09] that produced per-grade counts of
+    // A=8/B=5 against a summary of A=11/B=25, and a conclusion drawn from the difference.
+    const offset = Math.max(Number(q.offset) || 0, 0);
+    const total = ledger.size;
     return {
       enabled: true,
       summary: ledger.summary(),
+      /** Where this page sits, so a caller can tell a page from the whole set. */
+      page: { offset, limit, total, returned: Math.max(0, Math.min(limit, total - offset)) },
       // No wallet addresses, matching the rule the other aggregate endpoints
       // follow. `cohortWallets` holds MEMBERS, not just a count — stripping only
       // `wallet` published every one of them in the clear. Cohort membership is
       // still worth exposing (it is how a repeated seeder becomes visible), so
       // it is mapped to the same opaque handle the emit path uses rather than
       // dropped.
-      records: ledger.list(limit).map(({ wallet: _w, cohortWallets, ...rest }) => ({
+      records: ledger.list(limit, offset).map(({ wallet: _w, cohortWallets, ...rest }) => ({
         ...rest,
         cohortWalletIds: (cohortWallets ?? []).map((a) => walletId(a)),
       })),

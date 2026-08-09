@@ -35,7 +35,7 @@ import { logger } from '../logger.js';
 import type { WalletTier } from '../types.js';
 import { V2_RULES_EPOCH_MS } from './epoch.js';
 import type { CapBand } from './facts/sheet.js';
-import type { Grade } from './facts/types.js';
+import type { Provenance, Grade } from './facts/types.js';
 
 /** What the ledger needs to value a token. Injected, like every other v2 provider. */
 export interface LedgerPrice {
@@ -95,6 +95,22 @@ export interface LedgerRecord {
   capBand: CapBand | null;
   entryMarketCap: number | null;
   pairAgeHours: number | null;
+  /**
+   * Could this coin be SOLD, as known WHEN THE RECORD OPENED — frozen, like
+   * `walletGradeAtFire` and for the same reason.
+   *
+   * A gain you cannot exit is not a gain. Without this the ledger scored peak PRICE and called it
+   * performance, so an unsellable coin whose price mooned precisely BECAUSE nobody could sell counted
+   * as a win. [verified 2026-08-09] MEW fired unscreened, peaked +756%, sits at -95%, and was recorded
+   * as a win.
+   *
+   * Provenance is kept separately because the distinction is the whole point (see facts/types.ts):
+   * `measured false` is "we checked, you are trapped", `unknown` is "nobody checked". They must never
+   * collapse into one another — domain.md rule 1: unknown is neither safe nor unsafe, and a coin is
+   * never penalised for what merely could not be verified.
+   */
+  canSellAtFire: boolean | null;
+  canSellProvenanceAtFire: Provenance;
 
   /** Block time of the trade — the moment the signal fired. */
   firedAt: number;
@@ -141,10 +157,40 @@ export interface LedgerBucket {
   count: number;
   /** Records that never got a price — counted, and excluded from the averages. */
   unpriced: number;
+  /**
+   * Distinct tokens behind `count`. Published because it is the difference between a result and an
+   * artefact: [verified 2026-08-09] 16 F-grade "wins" were 11 coins, one of them counted SIX times.
+   */
+  distinctTokens: number;
   avgMaxGainPct: number;
   medianMaxGainPct: number;
   bestMaxGainPct: number;
-  winRatePct: number;
+  /**
+   * Peak-based win rate over records whose sellability was MEASURED TRUE.
+   *
+   * Three exclusions, each deliberate. Unpriced records have no gain to judge. `measured false` is
+   * excluded because a gain you cannot exit is not a gain. `unknown` is excluded because domain.md
+   * rule 1 forbids penalising a coin for what merely could not be verified — so it is neither a win
+   * nor a loss, and `unverified` below is how you see how much was set aside.
+   */
+  winRatePct: number | null;
+  /** How many records `winRatePct` is computed over. A rate without its n is not a claim. */
+  winRateBasis: number;
+  /** Same rule, one vote per TOKEN, so a coin fired six times cannot carry a bucket. */
+  winRateByTokenPct: number | null;
+  winRateByTokenBasis: number;
+  /**
+   * Win rate on the CURRENT gain rather than the peak — the peak is not something you exited at.
+   * Still not true realizable PnL: domain.md's exit-now rule subtracts round-trip cost, which the
+   * ledger cannot price for a coin it never bought. So this is an upper bound too, just a much
+   * tighter one than the peak.
+   */
+  winRateRealizedPct: number | null;
+  medianLastGainPct: number;
+  /** Checked, and CANNOT be sold. Excluded from every rate above. */
+  unsellable: number;
+  /** Nobody established sellability. Excluded from the rates, never counted against the coin. */
+  unverified: number;
   /** Share whose entry price had to be adopted late; high = the numbers are conservative. */
   lateEntryPct: number;
 }
@@ -210,35 +256,89 @@ function sampleIntervalMs(ageMs: number): number {
   return 60 * 60_000;
 }
 
+/** Sellability, as this record froze it. See LedgerRecord.canSellAtFire. */
+function sellability(r: LedgerRecord): 'sellable' | 'unsellable' | 'unverified' {
+  if (r.canSellProvenanceAtFire !== 'measured') return 'unverified';
+  return r.canSellAtFire === true ? 'sellable' : 'unsellable';
+}
+
+/**
+ * A rate, or NULL when there is nothing to compute it over.
+ *
+ * Not zero. Zero means "none of them won"; null means "none of them could be judged", and this
+ * codebase has already paid for confusing the two — `safety.ok` returned true when GoPlus had no
+ * data, so an unchecked token rendered as "Safe" (facts/types.ts). A 0% win rate under a count of
+ * 900 reads as damning evidence when the truth may be that nothing was screened.
+ */
+function pct(n: number, d: number): number | null {
+  return d === 0 ? null : Math.round((n / d) * 1000) / 10;
+}
+
+function median(sorted: number[]): number {
+  if (!sorted.length) return 0;
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
+}
+
+/**
+ * One row of the scoreboard.
+ *
+ * The averages describe every priced record, because they are descriptive. The WIN RATES are
+ * deliberately narrower — see LedgerBucket.winRatePct for which records they exclude and why. Keeping
+ * both in one row is the point: a big `count` next to a small `winRateBasis` is exactly the shape of
+ * "we barely screen anything", and that should be visible rather than hidden behind one number.
+ */
 function bucket(label: string, records: LedgerRecord[], winPct: number): LedgerBucket {
   const priced = records.filter((r) => r.entryPrice != null && r.maxPrice != null);
-  const unpriced = records.length - priced.length;
-  if (priced.length === 0) {
-    return {
-      label,
-      count: records.length,
-      unpriced,
-      avgMaxGainPct: 0,
-      medianMaxGainPct: 0,
-      bestMaxGainPct: 0,
-      winRatePct: 0,
-      lateEntryPct: 0,
-    };
-  }
-  const gains = priced.map((r) => r.maxGainPct).sort((a, b) => a - b);
-  const mid = Math.floor(gains.length / 2);
-  const median = gains.length % 2 ? gains[mid]! : (gains[mid - 1]! + gains[mid]!) / 2;
-  const wins = priced.filter((r) => r.maxGainPct >= winPct).length;
-  const late = priced.filter((r) => (r.entryDelayMs ?? 0) > 60_000).length;
-  return {
+  const distinctTokens = new Set(records.map((r) => r.token)).size;
+  const unsellable = records.filter((r) => sellability(r) === 'unsellable').length;
+  const unverified = records.filter((r) => sellability(r) === 'unverified').length;
+  const base: LedgerBucket = {
     label,
     count: records.length,
-    unpriced,
-    avgMaxGainPct: Math.round((gains.reduce((s, g) => s + g, 0) / gains.length) * 10) / 10,
-    medianMaxGainPct: Math.round(median * 10) / 10,
+    unpriced: records.length - priced.length,
+    distinctTokens,
+    avgMaxGainPct: 0,
+    medianMaxGainPct: 0,
+    bestMaxGainPct: 0,
+    winRatePct: null,
+    winRateBasis: 0,
+    winRateByTokenPct: null,
+    winRateByTokenBasis: 0,
+    winRateRealizedPct: null,
+    medianLastGainPct: 0,
+    unsellable,
+    unverified,
+    lateEntryPct: 0,
+  };
+  if (priced.length === 0) return base;
+
+  const gains = priced.map((r) => r.maxGainPct).sort((a, b) => a - b);
+  const lastGains = priced.map((r) => r.lastGainPct ?? 0).sort((a, b) => a - b);
+  const late = priced.filter((r) => (r.entryDelayMs ?? 0) > 60_000).length;
+
+  // Only coins proven sellable can carry a win rate.
+  const judgeable = priced.filter((r) => sellability(r) === 'sellable');
+  // One vote per token, keeping its best peak — so six fires on one coin are one data point.
+  const bestPerToken = new Map<string, LedgerRecord>();
+  for (const r of judgeable) {
+    const prev = bestPerToken.get(r.token);
+    if (!prev || r.maxGainPct > prev.maxGainPct) bestPerToken.set(r.token, r);
+  }
+  const byToken = [...bestPerToken.values()];
+
+  return {
+    ...base,
+    avgMaxGainPct: Math.round((gains.reduce((sum, g) => sum + g, 0) / gains.length) * 10) / 10,
+    medianMaxGainPct: Math.round(median(gains) * 10) / 10,
     bestMaxGainPct: gains[gains.length - 1]!,
-    winRatePct: Math.round((wins / priced.length) * 1000) / 10,
-    lateEntryPct: Math.round((late / priced.length) * 1000) / 10,
+    winRatePct: pct(judgeable.filter((r) => r.maxGainPct >= winPct).length, judgeable.length),
+    winRateBasis: judgeable.length,
+    winRateByTokenPct: pct(byToken.filter((r) => r.maxGainPct >= winPct).length, byToken.length),
+    winRateByTokenBasis: byToken.length,
+    winRateRealizedPct: pct(judgeable.filter((r) => (r.lastGainPct ?? 0) >= winPct).length, judgeable.length),
+    medianLastGainPct: Math.round(median(lastGains) * 10) / 10,
+    lateEntryPct: pct(late, priced.length) ?? 0,
   };
 }
 
@@ -274,6 +374,8 @@ export interface LedgerEntryInput {
   marketCap: number | null;
   pairAgeHours: number | null;
   firedAt: number;
+  /** Sellability as the fact sheet knew it at fire. Pass `sheet.canSell` straight through. */
+  canSell?: { value: boolean | null; provenance: Provenance };
 }
 
 /**
@@ -331,6 +433,10 @@ export class OutcomeLedger {
       wallet: input.wallet.toLowerCase(),
       cohortWallets: (input.cohortWallets ?? [input.wallet]).map((w) => w.toLowerCase()),
       walletGradeAtFire: input.walletGradeAtFire ?? 'U',
+      // Absent input means nobody told us, which is 'unknown' — never a cheerful default. The Fact
+      // invariant holds here too: a value exists only when the provenance is 'measured'.
+      canSellAtFire: input.canSell?.provenance === 'measured' ? (input.canSell.value ?? null) : null,
+      canSellProvenanceAtFire: input.canSell?.provenance ?? 'unknown',
       score: input.score,
       seedTier: input.seedTier,
       capBand: input.capBand,
@@ -516,9 +622,12 @@ export class OutcomeLedger {
     return removed;
   }
 
-  /** Newest first. */
-  list(limit = 200): LedgerRecord[] {
-    return [...this.records.values()].sort((a, b) => b.firedAt - a.firedAt).slice(0, limit);
+  /** Newest first, paged. `offset` exists so a caller can read the WHOLE set rather than
+   *  unknowingly analysing the newest page of it. */
+  list(limit = 200, offset = 0): LedgerRecord[] {
+    return [...this.records.values()]
+      .sort((a, b) => b.firedAt - a.firedAt)
+      .slice(offset, offset + limit);
   }
 
   get size(): number {
@@ -615,6 +724,13 @@ export class OutcomeLedger {
         if (r.matched === undefined) r.matched = (r.lanes?.length ?? 0) > 0;
         if (!r.cohortWallets) r.cohortWallets = r.wallet ? [r.wallet] : [];
         if (!r.walletGradeAtFire) r.walletGradeAtFire = 'U';
+        // Predates sellability tracking. 'unknown' is the only honest backfill: we genuinely do not
+        // know whether these were sellable, and inventing `true` would quietly readmit them to the
+        // win rate this field exists to protect.
+        if (!r.canSellProvenanceAtFire) {
+          r.canSellProvenanceAtFire = 'unknown';
+          r.canSellAtFire = null;
+        }
         // Added after these were written. Seed from the entry cap rather than null so a restored row
         // shows a number until its next sample replaces it with a measured one.
         if (r.lastMarketCap === undefined) r.lastMarketCap = r.entryMarketCap;

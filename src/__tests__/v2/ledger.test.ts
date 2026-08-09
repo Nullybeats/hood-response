@@ -53,6 +53,11 @@ function input(over: Partial<LedgerEntryInput> = {}): LedgerEntryInput {
     marketCap: 100_000,
     pairAgeHours: 1.2,
     firedAt: NOW,
+    // Sellability is MEASURED TRUE by default in these fixtures so the win-rate assertions below have
+    // something to judge. That is a choice about fixtures, not a default in the code: `open()` treats
+    // an absent canSell as 'unknown' and excludes it, which `ledgerSellability.test.ts` pins. Tests
+    // about sellability itself belong there; these are about bucketing.
+    canSell: { value: true, provenance: 'measured' },
     ...over,
   };
 }
@@ -208,8 +213,13 @@ describe('OutcomeLedger', () => {
       const alloc = ledger.summary().byLane.find((b) => b.label === 'allocation')!;
       expect(alloc.count).toBe(1);
       expect(alloc.unpriced).toBe(1);
-      // Never 0% "win rate" off a record that was never measured.
-      expect(alloc.winRatePct).toBe(0);
+      // Never 0% "win rate" off a record that was never measured — and now the type can SAY so.
+      // This assertion used to read `toBe(0)` directly under that comment, contradicting it: the
+      // intent was always "unknown", but a bare `number` could only spell it as zero. Zero means
+      // "none of them won"; null means "none could be judged", and reporting the first when you mean
+      // the second is the `safety.ok === true on no data` mistake (facts/types.ts) in another costume.
+      expect(alloc.winRatePct).toBeNull();
+      expect(alloc.winRateBasis).toBe(0);
       expect(alloc.avgMaxGainPct).toBe(0);
     });
 

@@ -548,6 +548,11 @@ export class V2Shadow {
           marketCap: sheet.marketCap.value ?? null,
           pairAgeHours: sheet.pairAgeHours.value ?? null,
           firedAt: sheet.at,
+          // Frozen at fire, provenance and all. The gate already refuses a MEASURED false
+          // (gate.ts), but unknown is allowed through on purpose — canSell resolves on ~1% of
+          // trades and blocking on it killed 14% of decisions. That trade-off is fine for firing
+          // and fatal for SCORING, so the ledger has to remember which it was.
+          canSell: { value: sheet.canSell.value, provenance: sheet.canSell.provenance },
         },
         now,
       );
