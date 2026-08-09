@@ -1488,7 +1488,7 @@ export class SniperEngine {
     ]);
     // Force a fresh price fetch — this token may never have been priced before
     // (bought directly via the sniper, bypassing normal discovery).
-    await this.price.refreshNow(token).catch(() => undefined);
+    await this.price.refreshNow(token, { live: true }).catch(() => undefined);
     const px = this.price.priceOf(token) ?? 0;
     if (px <= 0) {
       throw new Error('no live price available for this token yet — try again in a few seconds');
@@ -1547,7 +1547,7 @@ export class SniperEngine {
         this.lookupTax(token),
         this.lookupProtocolFee(token),
       ]);
-    await this.price.refreshNow(token).catch(() => undefined);
+    await this.price.refreshNow(token, { live: true }).catch(() => undefined);
     const currentPx = this.price.priceOf(token) ?? 0;
     const ethUsd = this.price.ethUsdPrice();
     let entryPriceUsd = 0;

@@ -488,6 +488,30 @@ describe('PriceOracle DexScreener rate-limit discipline', () => {
     expect(pool.mock.calls.length).toBe(before);
   });
 
+  it('only a LIVE caller buys a metered read while the indexer is shut', async () => {
+    const oracle = new PriceOracle([]);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(limited('60')));
+    vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(3_000);
+    const pool = vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue(null);
+
+    await oracle.refreshNow(U); // shuts the window
+    const base = pool.mock.calls.length;
+
+    // Bulk/display callers — the outcome ledger sampling ~100 records a tick, snapshot() fanning out
+    // over every open position, the performance tracker. [measured 2026-08-09] giving each of these a
+    // pool read took metered RPC from ~148/min to ~449/min within two minutes of deploy.
+    await oracle.refreshNow(R);
+    await oracle.refreshNow(S);
+    await oracle.refreshNow(T2);
+    expect(pool.mock.calls.length).toBe(base);
+    // ...but they must not read as 'unavailable' either. Queued, so the sweep picks them up.
+    expect(oracle.quoteState(R)).toBe('pricing');
+
+    // A decision in flight does get one.
+    await oracle.refreshNow(R, { live: true });
+    expect(pool.mock.calls.length).toBe(base + 1);
+  });
+
   it('does not start a second sweep while one is still in flight', async () => {
     const oracle = new PriceOracle([]);
     let release: (v: unknown) => void = () => undefined;

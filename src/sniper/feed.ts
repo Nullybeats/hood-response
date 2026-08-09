@@ -297,7 +297,7 @@ export class FeedSubscriber {
     const receivedAt = Date.now();
     swarm.receivedAt = receivedAt;
     try {
-      await this.price.refreshNow(swarm.token);
+      await this.price.refreshNow(swarm.token, { live: true });
       swarm.priceLive = this.price.isLive(swarm.token);
       swarm.priceSource = this.price.sourceOf(swarm.token);
       // priceOf() is null when no real source has a price — never overwrite the

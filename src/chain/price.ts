@@ -508,13 +508,22 @@ export class PriceOracle {
    * real one, not the synthetic placeholder (important for just-discovered
    * tokens the background refresher hasn't reached yet).
    */
-  async refreshNow(tokenAddress: string): Promise<void> {
+  /**
+   * @param opts.live Someone is making a DECISION on this token right now (an operator importing a
+   *   position, a signal being evaluated), so it may spend a metered pool read when the indexer is
+   *   rate-limited. Default false: bulk and display callers — the outcome ledger sampling a hundred
+   *   records, `snapshot()` fanning out over every open position, the performance tracker — must not
+   *   each buy an on-chain read simply because the indexer said no. On the feed's egress IP the
+   *   indexer says no essentially always, so that default is the difference between a bounded cost
+   *   and a metered read per token per tick.
+   */
+  async refreshNow(tokenAddress: string, opts?: { live?: boolean }): Promise<void> {
     if (!this.liveEnabled) return;
     const key = tokenAddress.toLowerCase();
     if (this.fresh(key)) return;
     const existing = this.inflight.get(key);
     if (existing) return existing;
-    const work = this.fetchOne(key).finally(() => this.inflight.delete(key));
+    const work = this.fetchOne(key, opts?.live === true).finally(() => this.inflight.delete(key));
     this.inflight.set(key, work);
     await work;
   }
@@ -920,15 +929,25 @@ export class PriceOracle {
     return true;
   }
 
-  private async fetchOne(address: string): Promise<void> {
+  private async fetchOne(address: string, live = false): Promise<void> {
     const chain = config.DEXSCREENER_CHAIN.toLowerCase();
-    // The window is shut and sending into it would extend it. Price this token from the chain, which
-    // has no shared quota — the answer a caller of refreshNow() actually needs — rather than spending
-    // the next reopening on one token and re-locking the lane for every other consumer.
+    // The window is shut and sending into it would extend it. Do not queue onto the wire.
+    //
+    // Whether that earns a chain read depends on who is asking. A live decision gets one — the pool
+    // has no shared quota and answers in ~150ms. A bulk or display caller does NOT: it leaves the
+    // token queued (so it reads 'pricing', not 'unavailable') and the sweep's one-priority-token-
+    // per-tick chain read picks it up. [measured 2026-08-09] returning a pool read to every caller
+    // here took metered RPC from ~148/min to ~449/min within two minutes of deploy, because the
+    // ledger samples ~100 records a tick and snapshot() fans out over every open position — each of
+    // them landing on a shut indexer and cashing it in for ~12 on-chain calls.
     if (this.dexRateLimited()) {
       this.debugCounters.dexSkippedRateLimited += 1;
-      this.debugCounters.poolFallbackFromThrottle += 1;
-      await this.fetchFromPool(address).catch(() => undefined);
+      if (live) {
+        this.debugCounters.poolFallbackFromThrottle += 1;
+        await this.fetchFromPool(address).catch(() => undefined);
+      } else if (!this.fresh(address)) {
+        this.queue.add(address);
+      }
       return;
     }
     try {
