@@ -9,12 +9,41 @@
  *
  * A lane instead states its requirements over the fact sheet:
  *
- *   Earliest-entry:  A/B wallet, first-ever buy, pair under 48h, score >= 80
- *   Proven-wallets:  A wallet, any cap
- *   Crowd-confirm:   2+ watched wallets, crowd GPA >= 3.0 (B average)
+ *   Solo buy:       one watched wallet buys, $25k-$125k cap
+ *   Fresh entry:    an alpha/beta wallet's first-ever buy of a pair under 48h
+ *   Crowd confirm:  2+ watched wallets buying
+ *   Allocation:     one alpha/beta wallet RECEIVES a token (v2's own addition)
  *
  * Because a sheet is a single object rather than a race between candidates, any
  * number of lanes may match the same trade. Nothing competes.
+ *
+ * ## Lanes describe SHAPE. They do not judge quality.
+ *
+ * The first three mirror the legacy engine's three rules deliberately, because that engine's record
+ * is the only evidence either of us has. The v2 rebuild re-derived them from scratch instead and
+ * invented three gates the original never had — a wallet GRADE requirement, a SCORE floor, and a
+ * pair-freshness rule applied to everything. Each one looked prudent and each one was wrong:
+ *
+ *  - **Grade was circular.** A grade needs five recorded outcomes; outcomes come from the ledger;
+ *    the ledger follows decisions; two lanes needed a grade to decide. A wallet nobody had graded
+ *    was invisible forever, so the system could never bootstrap. [verified 2026-08-08] Replaying a
+ *    real +357% call: `skipped, score 82 — wallet ungraded`. Same trade, grade supplied, nothing
+ *    else changed: matched.
+ *  - **Score floors were invented.** The legacy engine ran `ALERT_MIN_CONVICTION: 0` — its score was
+ *    a LABEL that rode along on the alert, never a gate. v2 turned it into 80/70/60. [verified] a
+ *    real +18.5% call died on `score 79, needed 80`, one point under a number nobody calibrated.
+ *  - **Grade was then counted twice more.** It is the `who` dial at weight 0.40 (renormalised as
+ *    high as 0.62 when other dials drop out) AND the sniper's `allowedWalletGrades` filter. A lane
+ *    that gated on grade and then applied a score floor was testing the same fact twice and calling
+ *    the second test independent.
+ *
+ * So quality lives in the SCORE, which travels on the match and drops dials it cannot measure rather
+ * than zeroing them; and appetite lives in the OPERATOR's settings (`enabledLanes`, `minScore`,
+ * `allowedWalletGrades`), where a person chooses. A grade is a win-rate label, not a permission.
+ *
+ * The one deliberate exception is the `$25k` market-cap FLOOR, which is kept on every lane. It is
+ * the single threshold here with direct evidence behind it, it came from the legacy engine, and it
+ * is what actually stops the launchpad-seed spam — see `capAtLeast` below.
  *
  * Conditions are DATA, not predicates, for three reasons: they serialise into the
  * diary so a verdict records the exact rule that produced it; they render as
@@ -31,6 +60,17 @@ import type { ScoreResult } from './score.js';
 export type Condition =
   | { kind: 'eventType'; is: SheetEventType }
   | { kind: 'seedTierIn'; in: readonly WalletTier[] }
+  /**
+   * DELIBERATELY UNUSED BY `DEFAULT_LANES`. Read the header before adding it back.
+   *
+   * A grade is earned from five recorded outcomes, outcomes are recorded from decisions, and a
+   * decision gated on a grade cannot happen — so this condition makes a lane unable to start. It is
+   * kept as vocabulary because an operator lane built later, on a wallet set that is ALREADY
+   * graded, is a legitimate use. It is not legitimate on a lane that has to bootstrap.
+   *
+   * To select on grade, use the sniper's `allowedWalletGrades` instead: same effect, but a person
+   * chose it and can see it, and the lane keeps firing so the record still accrues.
+   */
   | { kind: 'walletGrade'; in: readonly Grade[] }
   | { kind: 'firstBuy'; is: boolean }
   | { kind: 'pairAgeHoursBelow'; hours: number }
@@ -50,6 +90,8 @@ export type Condition =
    */
   | { kind: 'capAtLeast'; usd: number }
   | { kind: 'crowdSizeAtLeast'; n: number }
+  /** DELIBERATELY UNUSED BY `DEFAULT_LANES`, and circular for the same reason as `walletGrade`:
+   *  a crowd average needs graded wallets before it can be computed at all. */
   | { kind: 'crowdGpaAtLeast'; gpa: number }
   /**
    * A ceiling on how many watched wallets touched the token in the window.
@@ -100,38 +142,67 @@ export interface LaneVerdict {
  */
 export const DEFAULT_LANES: readonly Lane[] = [
   {
-    id: 'earliest-entry',
-    emoji: '🌱',
-    name: 'Earliest entry',
-    sentence: "an A or B wallet's first-ever buy of a pair under 48h old, scoring 80+",
-    conditions: [
-      { kind: 'eventType', is: 'verified-buy' },
-      { kind: 'walletGrade', in: ['A', 'B'] },
-      { kind: 'firstBuy', is: true },
-      { kind: 'pairAgeHoursBelow', hours: 48 },
-      { kind: 'scoreAtLeast', score: 80 },
-    ],
-  },
-  {
-    id: 'proven-wallets',
+    // The legacy engine's `solo-lowcap` rule, restated over facts. It is the workhorse: 60 of its
+    // last 100 alerts and, in the all-time archive, 158 calls at a 43% win rate and +83% average
+    // peak. 83% of its buy alerts are a single wallet, and under the previous v2 lanes a solo buy
+    // from an ungraded wallet matched NOTHING — the best-evidenced shape in the system had no home.
+    //
+    // The band IS the legacy `SOLO_MIN/MAX_MARKETCAP` window of $25k-$125k, expressed with the two
+    // conditions that already exist: `micro` is defined as everything up to $125,000, so the band
+    // plus the floor is exactly that window. No new condition kind is needed.
+    //
+    // NOTE what is absent, and that it is absent on purpose: no grade, no score floor, no
+    // freshness. This lane depends only on `eventType`, `cohortSize` and `marketCap` — the first
+    // two are always `measured` and the third is a gate requirement, so it is the one lane that
+    // CANNOT be killed by an unknown fact. That property is deliberate; keep it when tuning.
+    id: 'solo-buy',
     emoji: '🎯',
-    name: 'Proven wallets',
-    sentence: 'any buy by an A-grade wallet, scoring 70+',
+    name: 'Solo buy',
+    sentence: 'ONE watched wallet BUYS a coin between $25k and $125k market cap',
     conditions: [
       { kind: 'eventType', is: 'verified-buy' },
-      { kind: 'walletGrade', in: ['A'] },
-      { kind: 'scoreAtLeast', score: 70 },
+      { kind: 'cohortAtMost', n: 1 },
+      { kind: 'capAtLeast', usd: 25_000 },
+      { kind: 'capBand', in: ['micro'] },
     ],
   },
   {
+    // The legacy `fresh-pair-entry` rule: 46 archived calls at a 48% win rate and +113% average
+    // peak — the best RATE of the three shapes, on a third of solo's volume.
+    //
+    // Freshness belongs HERE and nowhere else. The v2 rebuild applied a 48h pair limit to every buy
+    // lane, which is not what the original did and does not match its record: its solo winners had
+    // a median pair age of ~98 hours. Seed tier rather than grade, matching the original's
+    // `FRESH_ENTRY_TIERS: alpha,beta` — a holder-rank from the catalog, not an earned judgement,
+    // so it cannot go circular.
+    id: 'fresh-entry',
+    emoji: '🌱',
+    name: 'Fresh entry',
+    sentence: "an alpha/beta wallet's first-ever buy of a pair under 48h old, over $25k",
+    conditions: [
+      { kind: 'eventType', is: 'verified-buy' },
+      { kind: 'firstBuy', is: true },
+      { kind: 'seedTierIn', in: ['alpha', 'beta'] },
+      { kind: 'pairAgeHoursBelow', hours: 48 },
+      { kind: 'capAtLeast', usd: 25_000 },
+    ],
+  },
+  {
+    // The legacy `swarm` rule. Kept for completeness and labelled honestly: it is the WEAKEST of
+    // the three shapes in the archive — 12 calls, 17% win rate, against solo's 43% and entry's 48%.
+    // A small sample, so it is measured rather than dropped, but nobody should read a crowd as
+    // stronger evidence than a solo buy here.
+    //
+    // The crowd-GPA requirement is gone with the other grade gates: it needed graded wallets to
+    // compute an average, so it was circular in exactly the same way and would starve for as long.
     id: 'crowd-confirm',
     emoji: '👥',
     name: 'Crowd confirm',
-    sentence: 'two or more watched wallets buying, averaging a B grade or better',
+    sentence: 'two or more watched wallets BUYING the same coin over $25k',
     conditions: [
       { kind: 'eventType', is: 'verified-buy' },
       { kind: 'crowdSizeAtLeast', n: 2 },
-      { kind: 'crowdGpaAtLeast', gpa: 3.0 },
+      { kind: 'capAtLeast', usd: 25_000 },
     ],
   },
   {

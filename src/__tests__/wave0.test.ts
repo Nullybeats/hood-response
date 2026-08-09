@@ -133,9 +133,10 @@ describe('Wave 0 — defaults & sticky state', () => {
   });
 
   it('mode survives a simulated restart (durable live → engine boots live)', async () => {
-    // Schema 3 = already migrated, so this tests persistence itself rather than
-    // the one-time migration below.
-    const state = stubState({ mode: 'live', settingsSchemaVersion: 3, settings: {} as unknown });
+    // Schema 4 = already migrated, so this tests persistence itself rather than
+    // the one-time migration below. Bump this alongside SETTINGS_SCHEMA_VERSION: if it lags, this
+    // test silently stops testing persistence and starts re-testing the migration instead.
+    const state = stubState({ mode: 'live', settingsSchemaVersion: 4, settings: {} as unknown });
     const eng = new SniperEngine(stubPrice({ '0xtok': 1 }), stubExecutor([]), stubSafety(), { owner: 'op@x.com', state });
     await eng.load();
     expect(eng.executionMode).toBe('live');
@@ -150,6 +151,26 @@ describe('Wave 0 — defaults & sticky state', () => {
    * act — which is why this test is the exception to the rule above, not a
    * contradiction of it.
    */
+  /**
+   * The v4 migration: the lane CATALOGUE changed, not just the vocabulary.
+   *
+   * A stored `enabledLanes: ['earliest-entry']` names a rule that no longer exists, and both silent
+   * readings are wrong — drop it and the sniper buys nothing forever while still reading as armed;
+   * map it to the lane that replaced it and the operator is armed on a looser rule (no grade
+   * requirement, no score floor) they never agreed to. So it clears and disarms.
+   */
+  it('clears a RETIRED lane id on the v4 migration rather than guessing what it meant', async () => {
+    const state = stubState({
+      mode: 'live',
+      settingsSchemaVersion: 3,
+      settings: { enabledLanes: ['earliest-entry', 'proven-wallets'] } as unknown,
+    });
+    const eng = new SniperEngine(stubPrice({ '0xtok': 1 }), stubExecutor([]), stubSafety(), { owner: 'op@x.com', state });
+    await eng.load();
+    expect(eng.executionMode).toBe('off');
+    expect((await eng.snapshot()).settings.enabledLanes).toEqual([]);
+  });
+
   it('the lane migration disarms an armed sniper exactly once', async () => {
     const state = stubState({ mode: 'live', settingsSchemaVersion: 2, settings: {} as unknown });
     const eng = new SniperEngine(stubPrice({ '0xtok': 1 }), stubExecutor([]), stubSafety(), { owner: 'op@x.com', state });

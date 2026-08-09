@@ -41,6 +41,9 @@ function inputs(over: Partial<SheetInputs> = {}): SheetInputs {
     crowdWallets: [],
     firstBuy: true,
     rotatedFrom: null,
+    // A holder-rank from the seed catalog, NOT an earned grade — which is why fresh-entry may
+    // require it without going circular: it is known before the wallet has ever traded.
+    seedTier: 'alpha',
     ...over,
   };
 }
@@ -58,9 +61,26 @@ function evaluate(over: Partial<SheetInputs> = {}, t: VerifiedTrade = trade) {
 }
 
 describe('lanes', () => {
-  it('matches the earliest-entry lane on a strong fresh first buy', () => {
+  it('matches solo-buy on one watched wallet buying inside the cap band', () => {
     const { entry } = evaluate();
-    expect(entry.matchedLanes).toContain('earliest-entry');
+    expect(entry.matchedLanes).toContain('solo-buy');
+    expect(entry.outcome).toBe('matched');
+  });
+
+  /**
+   * THE BOOTSTRAP TEST — the whole reason the lanes were rewritten.
+   *
+   * A grade needs five recorded outcomes, outcomes come from decisions, and the old buy lanes
+   * needed a grade to decide. So a wallet nobody had graded could never produce the record that
+   * would grade it. Replaying a real +357% call reproduced it exactly: `skipped, score 82 — wallet
+   * ungraded`. An unknown wallet must be able to make a call, or the system cannot start.
+   *
+   * NEGATIVE CONTROL: re-add `{ kind: 'walletGrade', in: ['A','B'] }` to solo-buy and this fails.
+   */
+  it('matches solo-buy for a wallet with NO track record at all', () => {
+    const { entry, lanes } = evaluate({ outcomesByWallet: new Map() });
+    const solo = lanes.find((l) => l.laneId === 'solo-buy')!;
+    expect(solo.matched).toBe(true);
     expect(entry.outcome).toBe('matched');
   });
 
@@ -70,46 +90,82 @@ describe('lanes', () => {
    * sheet and both may match.
    */
   it('lets several lanes match the same trade without competing', () => {
-    const { lanes } = evaluate({
-      crowdWallets: [WALLET, PEER],
-      outcomesByWallet: new Map([
-        [WALLET, outcomesFor(3)],
-        [PEER, outcomesFor(3)],
-      ]),
-    });
+    const { lanes } = evaluate({ crowdWallets: [WALLET, PEER] });
     const matched = lanes.filter((l) => l.matched).map((l) => l.laneId);
-    expect(matched).toContain('earliest-entry');
+    expect(matched).toContain('fresh-entry');
     expect(matched).toContain('crowd-confirm');
     expect(matched.length).toBeGreaterThan(1);
   });
 
   /** The tuning signal: a skip must say how far off it was. */
   it('reports a near-miss with the exact shortfall', () => {
-    // A weak wallet drags the score below the earliest-entry threshold.
-    const { entry } = evaluate({ outcomesByWallet: new Map([[WALLET, outcomesFor(1.05)]]) });
+    // Under the cap floor: the one quality bar the lanes still enforce.
+    const { entry } = evaluate({ marketCap: 9_000 });
     expect(entry.outcome).toBe('skipped');
     expect(entry.nearMiss).not.toBeNull();
-    expect(entry.reason).toMatch(/needed/);
+    expect(entry.reason).toMatch(/needed at least/);
   });
 
   it('separates "could not tell" from "did not qualify"', () => {
-    const ungraded = evaluate({ outcomesByWallet: new Map() });
-    const entryLane = ungraded.lanes.find((l) => l.laneId === 'earliest-entry')!;
-    expect(entryLane.matched).toBe(false);
-    expect(entryLane.blockedByUnknown).toBe(true);
-    expect(entryLane.reason).toMatch(/ungraded/);
+    // fresh-entry still reads pair age, so an unknown one is "could not tell".
+    const unknownAge = evaluate({ pairAgeHours: null, pairAgeSource: null });
+    const freshLane = unknownAge.lanes.find((l) => l.laneId === 'fresh-entry')!;
+    expect(freshLane.matched).toBe(false);
+    expect(freshLane.blockedByUnknown).toBe(true);
+    expect(freshLane.reason).toMatch(/pair age unknown/);
 
     const tooOld = evaluate({ pairAgeHours: 500 });
-    const oldLane = tooOld.lanes.find((l) => l.laneId === 'earliest-entry')!;
+    const oldLane = tooOld.lanes.find((l) => l.laneId === 'fresh-entry')!;
     expect(oldLane.blockedByUnknown).toBe(false);
     expect(oldLane.reason).toMatch(/needed under 48h/);
   });
 
-  it('does not match crowd-confirm on a crowd of ungraded wallets', () => {
+  /**
+   * Grade circularity, the crowd version: the old lane averaged the crowd's grades, so a crowd of
+   * unknowns could not be averaged and the lane starved for exactly as long as the solo ones did.
+   */
+  it('matches crowd-confirm on a crowd of ungraded wallets', () => {
     const { lanes } = evaluate({ crowdWallets: [WALLET, PEER], outcomesByWallet: new Map() });
     const crowd = lanes.find((l) => l.laneId === 'crowd-confirm')!;
-    expect(crowd.matched).toBe(false);
-    expect(crowd.blockedByUnknown).toBe(true);
+    expect(crowd.matched).toBe(true);
+  });
+
+  /**
+   * The one bar that survived, and the reason it did: it is the only threshold here with direct
+   * evidence. Sub-$25k calls were the launch-seed spam — 20 archived calls, zero wins.
+   */
+  it('refuses every buy lane below the $25k cap floor, however good it looks', () => {
+    const { lanes, entry } = evaluate({ marketCap: 2_600, crowdWallets: [WALLET, PEER] });
+    for (const id of ['solo-buy', 'fresh-entry', 'crowd-confirm']) {
+      expect(lanes.find((l) => l.laneId === id)!.matched).toBe(false);
+    }
+    expect(entry.outcome).toBe('skipped');
+  });
+
+  /** The band's ceiling is the legacy SOLO_MAX of $125k, expressed as the `micro` band. */
+  it('keeps solo-buy inside the $25k-$125k band at both ends', () => {
+    expect(evaluate({ marketCap: 30_000 }).lanes.find((l) => l.laneId === 'solo-buy')!.matched).toBe(true);
+    expect(evaluate({ marketCap: 900_000 }).lanes.find((l) => l.laneId === 'solo-buy')!.matched).toBe(false);
+  });
+
+  /**
+   * Freshness belongs to ONE lane. Applying it to every buy lane is what the rebuild did, and it
+   * does not match the record: the legacy solo winners had a median pair age of ~98 hours.
+   */
+  it('still matches solo-buy on an old pair, where only fresh-entry should care', () => {
+    const { lanes } = evaluate({ pairAgeHours: 500 });
+    expect(lanes.find((l) => l.laneId === 'solo-buy')!.matched).toBe(true);
+    expect(lanes.find((l) => l.laneId === 'fresh-entry')!.matched).toBe(false);
+  });
+
+  /** No lane may gate on a grade — that is the circularity, and it must not come back quietly. */
+  it('has no grade or crowd-GPA condition on any default lane', () => {
+    for (const lane of DEFAULT_LANES) {
+      for (const c of lane.conditions) {
+        expect(c.kind).not.toBe('walletGrade');
+        expect(c.kind).not.toBe('crowdGpaAtLeast');
+      }
+    }
   });
 
   it('renders every condition in English, from the same data it evaluates', () => {
@@ -138,11 +194,11 @@ describe('diary', () => {
   it('records exactly one verdict for every trade, whatever the outcome', () => {
     const cases: Partial<SheetInputs>[] = [
       {}, // matches
-      { outcomesByWallet: new Map([[WALLET, outcomesFor(1.05)]]) }, // skipped
+      { marketCap: 9_000 }, // skipped — under the cap floor, the one bar the lanes still enforce
       { canSell: null }, // waiting
       { canSell: false }, // blocked
-      { outcomesByWallet: new Map() }, // ungraded
-      { pairAgeHours: 900 }, // too old
+      { outcomesByWallet: new Map() }, // ungraded — now MATCHES, and must (the bootstrap)
+      { pairAgeHours: 900 }, // old pair — solo-buy does not care, so this matches too
     ];
 
     const diary = new Diary();
@@ -175,7 +231,7 @@ describe('diary', () => {
     const diary = new Diary();
     for (let i = 0; i < 5; i++) {
       diary.record(
-        evaluate({ outcomesByWallet: new Map([[WALLET, outcomesFor(1.05)]]) }, { ...trade, txHash: '0xn' + i }).entry,
+        evaluate({ marketCap: 9_000 }, { ...trade, txHash: '0xn' + i }).entry,
       );
     }
     const board = diary.summary().nearMissesByLane;
@@ -354,7 +410,7 @@ describe('the Allocation lane will not buy a token at its launch cap', () => {
 describe('near-miss reporting points at a movable knob', () => {
   it('never reports a lane that failed on event type', () => {
     // A verified BUY: allocation can never match it, whatever its other facts say.
-    const { entry, lanes } = evaluate({ outcomesByWallet: new Map([[WALLET, outcomesFor(1.05)]]) });
+    const { entry, lanes } = evaluate({ marketCap: 9_000 });
     const alloc = lanes.find((l) => l.laneId === 'allocation')!;
     expect(alloc.matched).toBe(false);
     expect(alloc.results.some((r) => r.condition.kind === 'eventType' && r.outcome === 'unmet')).toBe(true);
@@ -362,7 +418,7 @@ describe('near-miss reporting points at a movable knob', () => {
   });
 
   it('still reports a lane that missed on a number, with the shortfall', () => {
-    const { entry } = evaluate({ outcomesByWallet: new Map([[WALLET, outcomesFor(1.05)]]) });
+    const { entry } = evaluate({ marketCap: 9_000 });
     expect(entry.nearMiss).not.toBeNull();
     expect(entry.reason).toMatch(/needed/);
   });

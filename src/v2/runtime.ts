@@ -419,7 +419,14 @@ export class V2Shadow {
       : gate(sheet, p.attempts, elapsed);
 
     if (verdict.decision === 'retry') {
-      p.attempts++;
+      // Settling is NOT a gate attempt, and counting it as one starved the gate of its whole budget.
+      // The two windows share this queue but measure different things: `attempts` is "how many times
+      // have we asked whether the facts have landed", and during settling we have not asked once.
+      // [verified 2026-08-08] With a 90s settle and a 3s retry interval an allocation burned ~30
+      // attempts before `gate()` ran at all, hit `maxAttempts: 30` on its FIRST real call, and was
+      // dropped as "still unresolved after 31 attempts" with its 180s budget untouched. That was 30
+      // of 209 live decisions — facts thrown away that had not yet been given a chance to resolve.
+      if (!settling) p.attempts++;
       // Journal the wait too: a sheet that never resolves is itself a finding
       // about enrichment, not an absence to be inferred later.
       this.pending.push(p);

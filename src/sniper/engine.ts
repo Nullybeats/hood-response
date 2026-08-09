@@ -21,7 +21,7 @@ const SAMPLE_MS = 60_000;
  *  default change must be forced onto existing operators (whose durable settings
  *  otherwise shadow the new env defaults). The migration in load() runs once per
  *  bump. v2 (2026-08): kinds → ENTRY,SOLO · conviction ungated · roundtrip cap 5. */
-const SETTINGS_SCHEMA_VERSION = 3;
+const SETTINGS_SCHEMA_VERSION = 4;
 
 export interface Position {
   id: string;
@@ -1623,6 +1623,25 @@ export class SniperEngine {
       logger.warn(
         { owner: this.owner, wasArmed: wasOn },
         'sniper: settings migration v3 — lanes now gate v2 signals; DISARMED, re-arm explicitly',
+      );
+    }
+    // v4: the lane CATALOGUE changed, not just the vocabulary. `earliest-entry` and
+    // `proven-wallets` no longer exist; `solo-buy` and `fresh-entry` replace them, and the buy
+    // lanes no longer require a wallet grade or a score floor.
+    //
+    // DISARMS again, and the reason is the same one v3 gives but sharper. A stored
+    // `enabledLanes: ['earliest-entry']` has two possible silent readings and BOTH are wrong: drop
+    // it and the operator's sniper quietly buys nothing forever, or map it onto `solo-buy` and they
+    // are now armed on a rule that fires far more often than the one they chose, with the grade
+    // requirement they were relying on removed. Neither is a decision this code gets to make, so
+    // the lanes are cleared and the operator picks again with the new sentences in front of them.
+    if (this.settingsSchemaVersion < 4) {
+      this.settings.enabledLanes = [];
+      const wasOn = this.mode === 'live';
+      this.mode = 'off';
+      logger.warn(
+        { owner: this.owner, wasArmed: wasOn },
+        'sniper: settings migration v4 — lane catalogue replaced (solo-buy/fresh-entry); DISARMED, re-arm explicitly',
       );
     }
     this.settingsSchemaVersion = SETTINGS_SCHEMA_VERSION;

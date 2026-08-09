@@ -27,6 +27,7 @@ import { LiveTradeVerifier } from "../dist/chain/liveTradeVerifier.js";
 import { V2Shadow } from "../dist/v2/runtime.js";
 import { Journal } from "../dist/v2/journal.js";
 import { config } from "../dist/config/env.js";
+import { SEED_WALLETS } from "../dist/data/seed.js";
 
 const TX = process.argv[2];
 const WALLET = process.argv[3].toLowerCase();
@@ -67,6 +68,10 @@ const matches=[];
 const shadow=new V2Shadow({
   marketCap:()=>cap, pairAge:()=>ageH==null?null:{hours:ageH,source:"dexscreener-sim"},
   canSell:()=>canSell,
+  // The real holder-rank from the seed catalog. Without this every run reported "wallet not in the
+  // seed holder catalog" and fresh-entry looked broken when production would have known the tier —
+  // a simulator that under-reports is worse than none, because it is believed.
+  seedTier:(w)=> SEED_WALLETS.find(x=>x.address.toLowerCase()===w.toLowerCase())?.tier ?? null,
   // CONTROL: a hypothetical wallet with a real grade. Everything else on this run is real chain
   // data. Toggled by argv[5] so the difference between the two runs is exactly one input.
   outcomes:()=> process.argv[5]==="graded" ? [5.2,3.1,1.95,2.8,1.15,3.6,1.08,2.5].map((m,i)=>({
