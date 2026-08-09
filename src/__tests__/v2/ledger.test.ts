@@ -6,7 +6,7 @@
  * adopted entry prices — a win rate that looks measured but is quietly comparing
  * a token to itself an hour after the signal.
  */
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -297,6 +297,33 @@ describe('OutcomeLedger', () => {
       const r = ledger.list()[0]!;
       expect(r.cohortWallets).toEqual(['0xw1']);
       expect(r.walletGradeAtFire).toBe('U');
+    });
+
+    /**
+     * A record must reach disk without waiting for the next 60s sample tick.
+     *
+     * [verified 2026-08-09] A `fresh-entry` match on BLINK was written to the diary at 03:50:43 and
+     * a deploy restarted the process at 03:50:54. The diary survived — the journal is written
+     * synchronously — and the ledger record did not, because `persist()` only ran at the end of
+     * `sample()`. So the call appeared in the decision log and was absent from the signal record
+     * that exists to follow it to an outcome, and the two disagreed about whether it happened.
+     */
+    it('writes a newly opened record without waiting for a sample tick', async () => {
+      vi.useFakeTimers();
+      const dir = await mkdtemp(join(tmpdir(), 'v2-persist-'));
+      const path = join(dir, 'outcomes.json');
+      const ledger = new OutcomeLedger(priceBook({ [TOKEN]: 1 }).provider, { ...TEST_OPTIONS, storePath: path });
+      ledger.open(input(), NOW);
+
+      // The debounce, and nothing else — no sample() call anywhere in this test.
+      await vi.advanceTimersByTimeAsync(2_500);
+      vi.useRealTimers();
+      // Fake timers flush microtasks, not thread-pool file I/O, so the write is still in flight here.
+      await new Promise((r) => setTimeout(r, 100));
+
+      const written = JSON.parse(await readFile(path, 'utf8')) as { id: string }[];
+      expect(written).toHaveLength(1);
+      expect(written[0]!.id).toBe('0xtx1');
     });
 
     /**

@@ -757,6 +757,12 @@ async function main(): Promise<void> {
     sniper.stop();
     telegramCommands.stop();
     await performance.flush().catch(() => undefined);
+    // The v2 ledger was never flushed here, so a record opened since its last 60s sample tick died
+    // with the process. That is how a matched call reached the decisions diary — written
+    // synchronously to the journal — and never reached the signal record that follows it to an
+    // outcome, leaving the two disagreeing about whether the call happened.
+    v2Shadow.stop();
+    await v2Ledger?.flush().catch(() => undefined);
     await sniper.flushAll().catch(() => undefined);
     await app.close().catch(() => undefined);
     await detachPersistence();

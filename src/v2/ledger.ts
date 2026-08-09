@@ -341,6 +341,8 @@ export class OutcomeLedger {
       closed: false,
       closedReason: null,
     });
+    // A new record is the one thing worth writing promptly — see schedulePersist.
+    this.schedulePersist();
     this.evict();
   }
 
@@ -607,6 +609,32 @@ export class OutcomeLedger {
     } finally {
       this.persisting = false;
     }
+  }
+
+  /**
+   * Write soon, after a record is opened — not only on the next sample tick.
+   *
+   * `persist()` used to run only at the end of `sample()`, once every 60s, so a record opened
+   * between ticks existed in memory alone. [verified 2026-08-09] A `fresh-entry` match on BLINK was
+   * recorded in the diary at 03:50:43 and a deploy restarted the process at 03:50:54 — eleven
+   * seconds later. The diary survived, because the journal is written synchronously; the ledger
+   * record did not, so the call appeared in the decision log and was missing from the signal record
+   * that is supposed to be following it to an outcome. The two disagreed about whether the call
+   * happened at all.
+   *
+   * Debounced rather than immediate because `open()` can fire several times in a burst and each
+   * write serialises the whole record set. Two seconds is far below a deploy's window and far above
+   * a burst's. Note `persist()` DROPS a concurrent call rather than queueing it, which is why this
+   * schedules a later write instead of just calling it again.
+   */
+  private persistTimer: NodeJS.Timeout | null = null;
+  private schedulePersist(): void {
+    if (!this.opts.storePath || this.persistTimer) return;
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      void this.persist();
+    }, 2_000);
+    this.persistTimer.unref?.();
   }
 }
 
