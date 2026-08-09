@@ -902,6 +902,50 @@ export async function buildServer(
     return { sent: true, channels, deliveries };
   });
 
+  /**
+   * Send a sample V2 MATCH card, so the channel can be verified without waiting
+   * for a lane to fire — the v2 twin of /api/test-alert above.
+   *
+   * The sample is deliberately UNFLATTERING: an ungraded wallet and unverified
+   * sellability, which is the shape most real matches actually have. A test card
+   * that showed an A-grade screened-safe call would be verifying a layout nobody
+   * ever sees, and would hide the two warnings that matter most.
+   *
+   * `?lane=` picks which lane to render so all four can be eyeballed; anything
+   * unrecognised is passed through on purpose, since rendering an unknown lane AS
+   * unknown is itself behaviour worth being able to check.
+   */
+  app.post('/api/test-v2', async (req, reply) => {
+    const lane = ((req.query as { lane?: string }).lane ?? 'solo-buy').trim();
+    const now = Date.now();
+    const sample: V2Match = {
+      source: 'v2',
+      id: `test-${cryptoId()}`,
+      token: '0x000000000000000000000000000000000000dead',
+      tokenSymbol: 'TESTGEM',
+      firedAt: now - 42_000,
+      emittedAt: now,
+      eventType: lane === 'allocation' ? 'distribution' : 'verified-buy',
+      lanes: [lane],
+      laneReasons: ['sample card — no wallet did this, nothing was bought'],
+      score: 74,
+      marketCap: 68_000,
+      pairAgeHours: 3.2,
+      capBand: 'micro',
+      seedTier: 'alpha',
+      walletGrade: 'U',
+      cohortSize: 1,
+      sellabilityUnverified: true,
+      walletId: '0000000000000001',
+    };
+    const channels = configuredChannels();
+    if (channels.length === 0) {
+      return reply.code(400).send({ error: 'no notification channels configured' });
+    }
+    const deliveries = await dispatchV2(sample);
+    return { sent: true, channels, deliveries };
+  });
+
   // ── Leaderboards ──────────────────────────────────────────────────────────────
   app.get('/api/leaderboard/wallets', async () => {
     return [...store.walletStats.entries()]

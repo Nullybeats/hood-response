@@ -213,7 +213,7 @@ export interface V2Result {
   /** Gain at the last sample — what the call is worth NOW. */
   lastGainPct: number | null;
   closed: boolean;
-  closedReason?: string;
+  closedReason?: string | null;
 }
 
 /**
