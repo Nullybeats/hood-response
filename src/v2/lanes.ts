@@ -89,6 +89,26 @@ export type Condition =
    * own archive and independently matches the number the legacy engine already used.
    */
   | { kind: 'capAtLeast'; usd: number }
+  /**
+   * A FLOOR on pair age — the legacy `PAIR_MIN_AGE_MINUTES: 30` anti-snipe guard, which the v2
+   * rebuild dropped entirely. v2 had only a maximum age, so it would happily call a pair thirty
+   * seconds old: the window where a launch has no price history, no liquidity depth worth the name,
+   * and nothing to distinguish a real launch from a rug being loaded.
+   *
+   * PASSES ON UNKNOWN, exactly as the legacy gate does (`swarm.pairAgeHours != null` guards it).
+   * That is deliberate and it is the opposite of `capAtLeast`: a floor whose whole purpose is to
+   * exclude the youngest pairs must not also exclude every pair whose age we have not established,
+   * or a slow `pairCreatedAt` lookup silently becomes a second market-cap outage.
+   */
+  | { kind: 'pairAgeMinutesAtLeast'; minutes: number }
+  /**
+   * A FLOOR on the buy's USD size — the legacy `IGNORE_DUST_USD: 25` dust filter.
+   *
+   * Also PASSES ON UNKNOWN, and for the same reason the legacy check does (`usdValue != null`): on
+   * exactly the brand-new pairs this system hunts, `usdValue` is null at detection time, so failing
+   * closed here would reject the freshest coins — the ones the whole strategy is about.
+   */
+  | { kind: 'buyUsdAtLeast'; usd: number }
   | { kind: 'crowdSizeAtLeast'; n: number }
   /** DELIBERATELY UNUSED BY `DEFAULT_LANES`, and circular for the same reason as `walletGrade`:
    *  a crowd average needs graded wallets before it can be computed at all. */
@@ -158,12 +178,14 @@ export const DEFAULT_LANES: readonly Lane[] = [
     id: 'solo-buy',
     emoji: '🎯',
     name: 'Solo buy',
-    sentence: 'ONE watched wallet BUYS a coin between $25k and $125k market cap',
+    sentence: 'ONE watched wallet BUYS a coin between $25k and $125k market cap, pair 30m+ old',
     conditions: [
       { kind: 'eventType', is: 'verified-buy' },
       { kind: 'cohortAtMost', n: 1 },
       { kind: 'capAtLeast', usd: 25_000 },
       { kind: 'capBand', in: ['micro'] },
+      { kind: 'pairAgeMinutesAtLeast', minutes: 30 },
+      { kind: 'buyUsdAtLeast', usd: 25 },
     ],
   },
   {
@@ -184,7 +206,9 @@ export const DEFAULT_LANES: readonly Lane[] = [
       { kind: 'firstBuy', is: true },
       { kind: 'seedTierIn', in: ['alpha', 'beta'] },
       { kind: 'pairAgeHoursBelow', hours: 48 },
+      { kind: 'pairAgeMinutesAtLeast', minutes: 30 },
       { kind: 'capAtLeast', usd: 25_000 },
+      { kind: 'buyUsdAtLeast', usd: 25 },
     ],
   },
   {
@@ -203,6 +227,7 @@ export const DEFAULT_LANES: readonly Lane[] = [
       { kind: 'eventType', is: 'verified-buy' },
       { kind: 'crowdSizeAtLeast', n: 2 },
       { kind: 'capAtLeast', usd: 25_000 },
+      { kind: 'pairAgeMinutesAtLeast', minutes: 30 },
     ],
   },
   {
@@ -312,6 +337,23 @@ function check(condition: Condition, sheet: FactSheet, score: ScoreResult): Cond
         ? r('met', `pair ${Math.round(h)}h old`)
         : r('unmet', `pair ${Math.round(h)}h old, needed under ${condition.hours}h`);
     }
+    case 'pairAgeMinutesAtLeast': {
+      // Unknown PASSES — see the type. A floor that also excluded unpriced age would re-create the
+      // market-cap outage in a second fact.
+      if (!isKnown(sheet.pairAgeHours)) return r('met', 'pair age unknown — floor not applied');
+      const mins = sheet.pairAgeHours.value * 60;
+      return mins >= condition.minutes
+        ? r('met', `pair ${Math.round(mins)}m old`)
+        : r('unmet', `pair ${Math.round(mins)}m old, needed at least ${condition.minutes}m`);
+    }
+    case 'buyUsdAtLeast': {
+      // Unknown PASSES — a new pair has no price at detection time, which is not evidence of dust.
+      if (!isKnown(sheet.buyUsd)) return r('met', 'buy size unknown — dust floor not applied');
+      const usd = sheet.buyUsd.value;
+      return usd >= condition.usd
+        ? r('met', `$${Math.round(usd).toLocaleString('en-US')} buy`)
+        : r('unmet', `$${Math.round(usd).toLocaleString('en-US')} buy, needed at least $${condition.usd}`);
+    }
     case 'capAtLeast': {
       // Fails closed on an unknown cap, exactly as the gate does. "We could not price it" is not
       // evidence that it clears the floor — and an unpriced token is precisely the brand-new coin
@@ -377,6 +419,10 @@ export function describeCondition(c: Condition): string {
       return `pair under ${c.hours}h old`;
     case 'capAtLeast':
       return `market cap at least $${c.usd.toLocaleString('en-US')}`;
+    case 'pairAgeMinutesAtLeast':
+      return `pair at least ${c.minutes} minutes old`;
+    case 'buyUsdAtLeast':
+      return `buy worth at least $${c.usd}`;
     case 'capBand':
       return `${c.in.join(' or ')} market cap`;
     case 'crowdSizeAtLeast':

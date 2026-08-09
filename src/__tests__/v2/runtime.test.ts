@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { Journal } from '../../v2/journal.js';
-import { V2Shadow, type V2Providers } from '../../v2/runtime.js';
+import { V2Shadow, DEFAULT_V2_RUNTIME_OPTIONS, type V2Providers } from '../../v2/runtime.js';
 import { DEFAULT_LANES } from '../../v2/lanes.js';
 import type { SwapEvent } from '../../types.js';
 
@@ -81,7 +81,10 @@ function makeShadow(
   const s = new V2Shadow(
     p,
     {
-      crowdWindowMs: 300_000,
+      // Spread the real defaults, then override. Restating the fields meant a newly added option
+      // was simply ABSENT here — `buyThrottleMs` arrived undefined, every comparison against it was
+      // false, and the throttle silently did nothing in every test that claimed to exercise it.
+      ...DEFAULT_V2_RUNTIME_OPTIONS,
       retryIntervalMs: 10_000,
       distributionSettleMs: 0,
       lanes: DEFAULT_LANES,
@@ -334,7 +337,11 @@ describe('V2Shadow', () => {
 
   it('records a verdict for every accepted trade', () => {
     shadow = makeShadow();
-    for (let i = 0; i < 5; i++) shadow.onSwap(swap());
+    // DISTINCT tokens. Five buys of the SAME token by the same wallet are now collapsed to one call
+    // by the per-(wallet, token) throttle, which is correct and is its own test — but it would make
+    // this one assert the throttle instead of the invariant it exists for: that an accepted trade
+    // never disappears without a verdict.
+    for (let i = 0; i < 5; i++) shadow.onSwap(swap({ token: `0xtok${i}` }));
     expect(shadow.diary.size).toBe(5);
     const counts = shadow.diary.summary().counts;
     expect(counts.matched + counts.skipped + counts.waiting + counts.blocked).toBe(5);
@@ -348,6 +355,25 @@ describe('V2Shadow', () => {
     expect(entry.outcome).toBe('waiting');
     expect(entry.reason).toMatch(/waiting on marketCap/);
     expect(shadow.status().pending).toBe(1);
+  });
+
+  /**
+   * The legacy per-(wallet, token) throttle, restored. v2 deduped on txHash alone, so one wallet
+   * buying the same coin five times produced five calls — harmless while nothing fired, and a spam
+   * feed now that the lanes match the reference engine's rate.
+   *
+   * Keyed on wallet AND token: a DIFFERENT watched wallet buying the same coin is corroboration, and
+   * suppressing that would gut the crowd lane. Both halves are asserted, because a throttle that is
+   * too broad fails silently in the direction of missing signals.
+   */
+  it('collapses a wallet re-buying the same token, but not a different wallet', () => {
+    shadow = makeShadow(providers());
+    shadow.onSwap(swap({ txHash: '0xa' }));
+    shadow.onSwap(swap({ txHash: '0xb' }));                       // same wallet + token: throttled
+    expect(shadow.status().intake).toMatchObject({ verifiedBuys: 2, buysThrottled: 1 });
+
+    shadow.onSwap(swap({ txHash: '0xc', wallet: '0xdead00000000000000000000000000000000beef' }));
+    expect((shadow.status().intake as { buysThrottled: number }).buysThrottled).toBe(1);
   });
 
   it('blocks a token proven unsellable', () => {

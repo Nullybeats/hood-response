@@ -94,6 +94,8 @@ export interface V2RuntimeOptions {
    * not to the airdrop. A live buy path would need a much tighter number.
    */
   distributionSettleMs: number;
+  /** Per-(wallet, token) cooldown for verified buys — the legacy SOLO_THROTTLE_MS. */
+  buyThrottleMs: number;
   lanes: readonly Lane[];
 }
 
@@ -101,6 +103,7 @@ export const DEFAULT_V2_RUNTIME_OPTIONS: V2RuntimeOptions = {
   crowdWindowMs: 300_000,
   retryIntervalMs: 3_000,
   distributionSettleMs: 90_000,
+  buyThrottleMs: 60_000,
   lanes: DEFAULT_LANES,
 };
 
@@ -134,7 +137,11 @@ export class V2Shadow {
     distributions: 0,
     /** Same-token allocations collapsed by the cooldown — an airdrop wave counted once. */
     distributionsCooled: 0,
+    /** Repeat buys of one token by one wallet, collapsed by the throttle. */
+    buysThrottled: 0,
   };
+  /** Last verified buy per (wallet, token); the re-buy collapser. */
+  private readonly buyThrottle = new Map<string, number>();
   /** Last time a distribution sheet was built per token; the airdrop-wave collapser. */
   private readonly distSeenAt = new Map<string, number>();
   /** When each intake type last arrived — the freshness half of every counter. */
@@ -311,9 +318,34 @@ export class V2Shadow {
     }
     this.intake.verifiedBuys++;
     this.intakeLastAt.verifiedBuy = Date.now();
-    this.seen++;
+
+    // Per-(wallet, token) throttle — the legacy `SOLO_THROTTLE_MS` guard, which v2 never had.
+    //
+    // v2 dedupes on txHash alone, so a wallet buying the same coin five times in a minute produced
+    // five calls. That cost nothing while nothing was firing; it matters now that the lanes mirror
+    // the reference engine's rate. Keyed on wallet AND token exactly as the legacy rule is: a
+    // DIFFERENT watched wallet buying the same coin is corroboration and must still get through,
+    // which is the whole point of the crowd lane.
+    //
+    // Crowd/cohort marks are recorded BEFORE the throttle returns, deliberately — the second buy
+    // still happened and still counts toward "how many wallets touched this", even when it does not
+    // deserve its own call. Suppressing the evidence as well as the alert is how a wave gets
+    // miscounted as a solo.
     this.markCrowd(swap);
     this.ledger?.noteCohort(swap.token, this.markCohort(swap));
+    const throttleKey = `${swap.wallet.toLowerCase()}:${swap.token.toLowerCase()}`;
+    const lastBuy = this.buyThrottle.get(throttleKey) ?? 0;
+    if (Date.now() - lastBuy < this.opts.buyThrottleMs) {
+      this.intake.buysThrottled++;
+      return;
+    }
+    this.buyThrottle.set(throttleKey, Date.now());
+    if (this.buyThrottle.size > 5_000) {
+      const oldest = this.buyThrottle.keys().next().value;
+      if (oldest) this.buyThrottle.delete(oldest);
+    }
+
+    this.seen++;
     this.jrnl.write('trade', swap);
     this.evaluate({ trade: swap, firstSeenAt: Date.now(), attempts: 0 }, Date.now());
   }

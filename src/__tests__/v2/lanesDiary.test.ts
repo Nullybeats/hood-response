@@ -158,6 +158,33 @@ describe('lanes', () => {
     expect(lanes.find((l) => l.laneId === 'fresh-entry')!.matched).toBe(false);
   });
 
+  /**
+   * The legacy PAIR_MIN_AGE_MINUTES guard, restored — and its fail-OPEN half, which is the part
+   * that matters. A floor that also excluded every pair whose age we could not establish would be
+   * the market-cap outage again, in a second fact: silent, and indistinguishable from a quiet market.
+   *
+   * NEGATIVE CONTROL: make the unknown case return 'unknown' instead of 'met' and the second
+   * assertion fails.
+   */
+  it('rejects a pair younger than 30 minutes, but PASSES one whose age is unknown', () => {
+    const tooNew = evaluate({ pairAgeHours: 0.2 }); // 12 minutes
+    expect(tooNew.lanes.find((l) => l.laneId === 'solo-buy')!.matched).toBe(false);
+    expect(tooNew.entry.reason).toMatch(/needed at least 30m/);
+
+    const unknownAge = evaluate({ pairAgeHours: null, pairAgeSource: null });
+    expect(unknownAge.lanes.find((l) => l.laneId === 'solo-buy')!.matched).toBe(true);
+  });
+
+  /** The dust floor, same fail-open rule: a new pair has no price at detection, which is not dust. */
+  it('rejects a dust buy, but PASSES one whose size is unknown', () => {
+    const dust = evaluate({}, { ...trade, usdValue: 3 });
+    expect(dust.lanes.find((l) => l.laneId === 'solo-buy')!.matched).toBe(false);
+    expect(dust.entry.reason).toMatch(/needed at least \$25/);
+
+    const unpriced = evaluate({}, { ...trade, usdValue: null });
+    expect(unpriced.lanes.find((l) => l.laneId === 'solo-buy')!.matched).toBe(true);
+  });
+
   /** No lane may gate on a grade — that is the circularity, and it must not come back quietly. */
   it('has no grade or crowd-GPA condition on any default lane', () => {
     for (const lane of DEFAULT_LANES) {
