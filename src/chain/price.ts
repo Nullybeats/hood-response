@@ -573,6 +573,8 @@ export class PriceOracle {
     dexSkippedRateLimited: 0,
     poolFallbackFromThrottle: 0,
     poolFallbackFromNoPair: 0,
+    poolFallbackFromError: 0,
+    poolSkippedSpeculative: 0,
   };
   /** One log line per penalty window, not per refused request. */
   private dexPenaltyLogged = false;
@@ -596,6 +598,8 @@ export class PriceOracle {
       dexPenaltyMsRemaining: Math.max(0, this.dexPenaltyUntil - Date.now()),
       poolFallbackFromThrottle: this.debugCounters.poolFallbackFromThrottle,
       poolFallbackFromNoPair: this.debugCounters.poolFallbackFromNoPair,
+      poolFallbackFromError: this.debugCounters.poolFallbackFromError,
+      poolSkippedSpeculative: this.debugCounters.poolSkippedSpeculative,
       // Read from the constants, not restated. This said `1` for as long as MAX_PER_TICK was 1, so
       // the number that would have exposed the starvation was itself a literal nobody had to update.
       sweepPerTick: MAX_PER_TICK,
@@ -752,6 +756,10 @@ export class PriceOracle {
     // Priority first and in full-tick order: a token something is deciding on must never wait behind
     // the speculative backlog, which is exactly what the old flat slice allowed.
     const batch = [...this.priorityQueue, ...this.queue].slice(0, MAX_PER_TICK);
+    // Remember which of these somebody was actually deciding on. Once the token leaves the queue that
+    // distinction is gone, and it is exactly the distinction that decides whether it may spend
+    // metered RPC below.
+    const wasPriority = new Set(batch.filter((a) => this.priorityQueue.has(a)));
     for (const a of batch) {
       this.priorityQueue.delete(a);
       this.queue.delete(a);
@@ -778,10 +786,30 @@ export class PriceOracle {
         const misses = (this.dexMisses.get(addr) ?? 0) + 1;
         if (misses < DEX_MISS_RETRIES) {
           this.dexMisses.set(addr, misses);
-          this.priorityQueue.add(addr);
+          // Re-queue at the tier it came from. This used to always re-queue at PRIORITY, which meant
+          // a speculative token PROMOTED ITSELF simply by not being indexed — and then qualified for
+          // the metered pool read below. Since most of a 12k registry is legitimately not on
+          // DexScreener, "not indexed" was a self-service upgrade to live work.
+          if (wasPriority.has(addr)) this.priorityQueue.add(addr);
+          else this.queue.add(addr);
           continue;
         }
         this.dexMisses.delete(addr);
+        // The pool read is the right answer for a brand-new pair no indexer has seen — but ONLY when
+        // someone is waiting on this token.
+        //
+        // [measured 2026-08-09] with the indexer reachable again, `pool-price` was still 4,316 of
+        // 4,528 Alchemy calls (386/min). This line was why: the sweep grinds the whole registry, most
+        // of which DexScreener legitimately does not carry (dead coins, launches that never traded),
+        // and every one of those bought ~12 metered calls two ticks after it was enqueued. The queue
+        // bound fixed the queue; it did not fix what the queue then spent.
+        //
+        // A speculative token that no indexer carries is simply unpriced, and `quoteState` says so.
+        if (!wasPriority.has(addr)) {
+          this.debugCounters.poolSkippedSpeculative += 1;
+          continue;
+        }
+        this.debugCounters.poolFallbackFromNoPair += 1;
         await this.fetchFromPool(addr).catch(() => undefined);
       }
     }
@@ -863,7 +891,12 @@ export class PriceOracle {
         // a tick x 4 tokens x ~12 RPC calls each is how a shut indexer turned into ~213k metered
         // Alchemy calls a day. The speculative sweep does not get to buy metered reads at all.
         for (const addr of addresses.slice(0, 1)) {
-          this.debugCounters.poolFallbackFromThrottle += 1;
+          // Count WHY, not just that it happened. This counter read `FromThrottle` for every non-OK
+          // status, so a run of 414s from a malformed proxy URL was indistinguishable from a rate
+          // limit — and the number that would have named the bug instead corroborated the wrong
+          // theory. dex429 was 0 the whole time and nothing tied the two together.
+          if (res.status === 429) this.debugCounters.poolFallbackFromThrottle += 1;
+          else this.debugCounters.poolFallbackFromError += 1;
           await this.fetchFromPool(addr).catch(() => undefined);
           if (this.fresh(addr)) covered.add(addr);
         }
@@ -966,7 +999,8 @@ export class PriceOracle {
         }
         // A public-indexer throttle is not evidence the pool lacks a price.
         // Establish it on chain immediately; Dex is optional enrichment.
-        this.debugCounters.poolFallbackFromThrottle += 1;
+        if (res.status === 429) this.debugCounters.poolFallbackFromThrottle += 1;
+        else this.debugCounters.poolFallbackFromError += 1;
         await this.fetchFromPool(address).catch(() => undefined);
         // Still unpriced: keep it queued so the display says 'pricing', not 'unavailable' — a
         // throttle is not evidence a token has no price. But a 429 goes to the BACKGROUND queue, not
@@ -1030,8 +1064,11 @@ export class PriceOracle {
     if (!base) return { url: `https://api.dexscreener.com${path}`, headers: {} };
     // Path mapping is explicit rather than a blind prefix swap, so the proxy's allowlisted routes and
     // ours cannot drift into a 404 that would read as "this token has no pairs".
+    // The batch list goes in a QUERY PARAM. As a path segment it returned 414 URI Too Long for even a
+    // 3-address batch, and each failure cost an on-chain pool read (~50 metered calls) — an expensive
+    // silent failure rather than a loud one.
     const proxied = path.startsWith('/latest/dex/tokens/')
-      ? `/api/dexproxy/tokens/${path.slice('/latest/dex/tokens/'.length)}`
+      ? `/api/dexproxy/tokens?addresses=${encodeURIComponent(path.slice('/latest/dex/tokens/'.length))}`
       : path.startsWith('/token-pairs/v1/')
         ? `/api/dexproxy/token-pairs/${path.slice('/token-pairs/v1/'.length)}`
         : null;

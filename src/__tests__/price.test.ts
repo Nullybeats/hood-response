@@ -383,10 +383,20 @@ describe('PriceOracle DexScreener rate-limit discipline', () => {
 
     // Negative control for the test above: the hold is time-based, not a permanent latch. Without
     // this, a bug that never cleared dexPenaltyUntil would still pass "sends NOTHING while shut".
-    await new Promise((r) => setTimeout(r, 3_200));
+    //
+    // Poll for the window rather than sleeping a fixed span: the penalty is real wall-clock time, and
+    // a fixed sleep makes this test fail on a loaded machine for reasons that have nothing to do with
+    // the behaviour under test.
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      if ((oracle.debug() as { dexPenaltyMsRemaining: number }).dexPenaltyMsRemaining === 0) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect((oracle.debug() as { dexPenaltyMsRemaining: number }).dexPenaltyMsRemaining).toBe(0);
+
     await oracle.refreshNow(S);
     expect(fetchMock).toHaveBeenCalledTimes(2);
-  });
+  }, 30_000);
 
   it('a throttled token still reads as pricing, and never at the head of the lane', async () => {
     const oracle = new PriceOracle([]);
@@ -542,12 +552,19 @@ describe('PriceOracle DexScreener rate-limit discipline', () => {
 
     expect(seen.length).toBeGreaterThanOrEqual(2);
     expect(seen.some((u) => u.startsWith('https://snipurr.fun/api/dexproxy/token-pairs/'))).toBe(true);
-    expect(seen.some((u) => u.startsWith('https://snipurr.fun/api/dexproxy/tokens/'))).toBe(true);
+    expect(seen.some((u) => u.startsWith('https://snipurr.fun/api/dexproxy/tokens?addresses='))).toBe(true);
     // No double slash from the trailing-slash base, and DexScreener is never contacted directly.
     expect(seen.every((u) => !u.includes('//api/'))).toBe(true);
     expect(seen.every((u) => !u.includes('api.dexscreener.com'))).toBe(true);
     // The proxy refuses an unauthenticated request, so the key must be on every call.
     expect(headers.every((h) => h?.['x-dex-proxy-key'] === 'secret')).toBe(true);
+    // REGRESSION: the address list must never be a PATH segment. It was for one day and every batch
+    // came back 414 URI Too Long — at 8 addresses, and even at 3. Each failure then bought an on-chain
+    // pool read (~50 metered calls), so this one character of URL shape cost ~68k RPC calls in four
+    // hours on the shared Alchemy key. Nothing after the '?' can hit a path-length limit.
+    const batchUrl = seen.find((u) => u.includes('/api/dexproxy/tokens'))!;
+    expect(batchUrl.split('?')[0]).toBe('https://snipurr.fun/api/dexproxy/tokens');
+    expect(batchUrl.split('?')[0]).not.toContain('0x');
   });
 
   it('calls DexScreener directly when no proxy is configured', async () => {
@@ -566,6 +583,37 @@ describe('PriceOracle DexScreener rate-limit discipline', () => {
 
     expect(seen[0]).toContain('api.dexscreener.com');
   });
+
+  it('an unindexed SPECULATIVE token never buys a metered pool read', async () => {
+    // [measured 2026-08-09] with the indexer reachable again, pool-price was STILL 4,316 of 4,528
+    // Alchemy calls. Two causes, and the second is the one that surprised: the sweep grinds a 12k
+    // registry that DexScreener legitimately does not carry, AND a missed token used to be re-queued
+    // at PRIORITY — so "not indexed" was a self-service promotion to live work, which then qualified
+    // it for a ~12-call metered pool read.
+    const oracle = new PriceOracle([]);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true, status: 200, headers: { get: () => null }, json: async () => ({ pairs: [] }),
+    }));
+    vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(3_000);
+    const pool = vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue(null);
+
+    const self = oracle as unknown as { queue: Set<string>; refresh: () => Promise<void> };
+    // Well past DEX_MISS_RETRIES, which is where the pool read used to fire.
+    self.queue.add(R);
+    for (let i = 0; i < 3; i++) await self.refresh();
+
+    expect(pool.mock.calls.length).toBe(0);
+    expect((oracle.debug() as { poolSkippedSpeculative: number }).poolSkippedSpeculative)
+      .toBeGreaterThan(0);
+    // It must not have promoted itself out of the speculative tier either.
+    expect((oracle.debug() as { priorityQueue: number }).priorityQueue).toBe(0);
+
+    // NEGATIVE CONTROL: the same situation, but somebody is waiting. A brand-new pair no indexer has
+    // seen is exactly what the pool read is for, so this MUST still spend the call.
+    oracle.requestRefresh(S);
+    for (let i = 0; i < 3; i++) await self.refresh();
+    expect(pool.mock.calls.length).toBeGreaterThan(0);
+  }, 30_000);
 
   it('does not start a second sweep while one is still in flight', async () => {
     const oracle = new PriceOracle([]);
