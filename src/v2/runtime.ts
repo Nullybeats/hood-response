@@ -22,6 +22,7 @@ import { config } from '../config/env.js';
 import { logger } from '../logger.js';
 import type { SwapEvent, WalletTier } from '../types.js';
 import { buildEntry, Diary, type DiaryEntry } from './diary.js';
+import { V2_RULES_EPOCH_MS } from './epoch.js';
 import { buildMatch, type V2Match } from './emit.js';
 import type { Outcome } from './facts/grade.js';
 import { buildFactSheet, type FactSheet, type SheetInputs } from './facts/sheet.js';
@@ -224,6 +225,12 @@ export class V2Shadow {
       // preserve ordering.
       for (const rec of records.reverse()) {
         const entry = rec.body as DiaryEntry;
+        // Same rules epoch the ledger enforces. The journal outlives a rule change, and a verdict
+        // reached under retired rules is not a reading on this build — restoring one puts a
+        // decision back on the dashboard that the current lanes would never reach, next to ones
+        // they did. The ledger dropped these on load; without this the diary quietly kept them and
+        // the two records disagreed about what the engine had done.
+        if (entry?.at != null && entry.at < V2_RULES_EPOCH_MS) continue;
         if (entry?.txHash && entry.outcome) this.diary.record(entry);
       }
       if (records.length > 0) {
