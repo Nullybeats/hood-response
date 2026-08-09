@@ -205,18 +205,46 @@ describe('PriceOracle batched refresh', () => {
     expect(oracle.priceOf(B)).toBeNull();
   });
 
-  /** A throttle is not evidence a token has no price: nothing may be marked done. */
-  it('re-queues the WHOLE batch when the request is throttled', async () => {
+  /**
+   * A throttle is not evidence a token has no price — so on a 429 the batch falls back to the CHAIN,
+   * which has no shared quota, exactly as the single-token path always did.
+   *
+   * This mattered more than it looks. A 429 freezes the whole indexer lane for 60s, so without a
+   * fallback a token needed two failed rounds (~2 min) before anything tried the pool, against a gate
+   * that gives up at 90s. [verified 2026-08-09] ROB was dropped as "marketCap still unresolved after
+   * 30 attempts" while sitting on DexScreener at a $157k cap with $38k of liquidity.
+   */
+  it('prices from the CHAIN when the batch is throttled', async () => {
     const oracle = new PriceOracle([]);
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 429, json: async () => ({}) }));
+    vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(3_000);
+    vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue({
+      priceEth: 0.001, venue: 'v4', liquidity: 1n,
+      poolAddress: '0x0000000000000000000000000000000000000001', pairCreatedAt: 1_700_000_000_000,
+    });
 
     oracle.requestRefresh(A);
-    oracle.requestRefresh(B);
     await (oracle as unknown as { refresh: () => Promise<void> }).refresh();
 
-    expect(oracle.quoteState(A)).toBe('pricing');
-    expect(oracle.quoteState(B)).toBe('pricing');
+    expect(oracle.priceOf(A)).toBe(3);
+    expect(oracle.sourceOf(A)).toBe('pool');
     expect((oracle.debug() as { dex429Count: number }).dex429Count).toBeGreaterThan(0);
+    vi.restoreAllMocks();
+  });
+
+  /** And when the chain cannot answer either, the token is re-queued rather than written off. */
+  it('re-queues a throttled token the chain could not price either', async () => {
+    const oracle = new PriceOracle([]);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 429, json: async () => ({}) }));
+    vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(3_000);
+    vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue(null);
+
+    oracle.requestRefresh(A);
+    await (oracle as unknown as { refresh: () => Promise<void> }).refresh();
+
+    expect(oracle.priceOf(A)).toBeNull();
+    expect((oracle.debug() as { priorityQueue: number }).priorityQueue).toBe(1);
+    vi.restoreAllMocks();
   });
 });
 

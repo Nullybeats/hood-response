@@ -705,6 +705,21 @@ export class PriceOracle {
         if (res.status === 429) this.debugCounters.dex429++;
         else this.debugCounters.dexErrors++;
         logger.warn({ batch: addresses.length, status: res.status }, 'price: DexScreener batch failed');
+        // FALL BACK TO THE CHAIN, exactly as the single-token path does.
+        //
+        // Without this the batch simply gave up and re-queued, and a 429 freezes the whole indexer
+        // lane for 60s — so a token needed two failed rounds (~2 min) before anything even TRIED the
+        // pool, against a gate that gives up at 90s. [verified 2026-08-09] ROB was dropped as
+        // "marketCap still unresolved after 30 attempts" while sitting on DexScreener at a $157k cap
+        // with $38k of liquidity. The chain has no shared quota and answers in ~150ms; a throttle on
+        // a public indexer is not evidence a coin has no price.
+        //
+        // Bounded to the first few: this runs inside a throttled moment, each pool read costs real
+        // RPC, and the rest are re-queued anyway.
+        for (const addr of addresses.slice(0, 4)) {
+          await this.fetchFromPool(addr).catch(() => undefined);
+          if (this.fresh(addr)) covered.add(addr);
+        }
         return covered;
       }
       const json = (await res.json()) as DexTokenResponse;
