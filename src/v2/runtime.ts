@@ -567,6 +567,17 @@ export class V2Shadow {
    * would treat each as a fresh signal for the same token.
    */
   private emit(sheet: FactSheet, score: ScoreResult, entry: DiaryEntry, now: number): void {
+    // Re-check the ignore list against the ENRICHED symbol.
+    //
+    // The listener filters on symbol before v2 ever sees a swap, so v2 inherits that for free — but
+    // a discovered token arrives as a `TKN-…` placeholder and only learns its real symbol later,
+    // from the DexScreener pair. The legacy path re-checks after enrichment for exactly this reason
+    // (a tokenised equity resolving late), and v2 had no equivalent, so the only filter it got was
+    // the one applied before the name existed.
+    if (config.ignoreSymbols.has(sheet.tokenSymbol.toUpperCase())) {
+      logger.info({ token: sheet.tokenSymbol }, 'v2: match suppressed — ignored symbol (post-enrichment)');
+      return;
+    }
     if (!this.onMatch) {
       logger.info(
         { token: sheet.tokenSymbol, score: score.score, lanes: entry.matchedLanes },
