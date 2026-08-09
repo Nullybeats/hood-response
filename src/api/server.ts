@@ -272,6 +272,22 @@ export async function buildServer(
     };
   });
 
+  /**
+   * Remove ledger records that are WRONG, not merely old.
+   *
+   * Admin-gated and id-only: no predicate, no "delete all matching". Deleting a measurement is how a
+   * scoreboard becomes a story, so it has to be a deliberate act naming exactly what goes.
+   */
+  app.post('/api/v2/outcomes/drop', async (req, reply) => {
+    if (!adminOk(req as { headers: Record<string, unknown>; query?: unknown })) return denyAdmin(reply);
+    const ledger = v2?.outcomes;
+    if (!ledger) return { ok: false, reason: 'v2 ledger not enabled' };
+    const body = (req.body ?? {}) as { ids?: unknown };
+    const ids = Array.isArray(body.ids) ? body.ids.filter((x): x is string => typeof x === 'string') : [];
+    if (!ids.length) return reply.code(400).send({ error: 'ids required' });
+    return { ok: true, removed: ledger.drop(ids), requested: ids.length };
+  });
+
   // ── Metric diagnostics ──────────────────────────────────────────────────────
   // Every number the dashboards show, WITH its freshness and a plain verdict.
   // Exists because "block – / rpc –ms / swaps 0" after a restart was

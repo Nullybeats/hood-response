@@ -493,6 +493,29 @@ export class OutcomeLedger {
     }
   }
 
+  /**
+   * Drop records by id. Returns how many were actually removed.
+   *
+   * A deliberately narrow tool for one situation: a record whose numbers are demonstrably WRONG
+   * rather than merely old. [verified 2026-08-09] Eight records took pool-derived entry prices
+   * 21x-334x below the truth and read as gains up to +33,682% that never happened. The rules epoch
+   * is the wrong instrument for that — it is for a change in what would have FIRED, and wiping the
+   * whole record to delete eight false rows would take the true ones with it.
+   *
+   * Deleting measurements is a thing to do rarely and on purpose, which is why this is admin-gated,
+   * takes explicit ids, and reports the count instead of accepting a predicate. There is no "delete
+   * everything matching" here by design.
+   */
+  drop(ids: readonly string[]): number {
+    let removed = 0;
+    for (const id of ids) if (this.records.delete(id)) removed += 1;
+    if (removed) {
+      logger.warn({ removed, requested: ids.length }, 'v2 ledger: records dropped by an operator');
+      this.schedulePersist();
+    }
+    return removed;
+  }
+
   /** Newest first. */
   list(limit = 200): LedgerRecord[] {
     return [...this.records.values()].sort((a, b) => b.firedAt - a.firedAt).slice(0, limit);
