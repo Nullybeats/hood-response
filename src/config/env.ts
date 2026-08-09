@@ -492,6 +492,15 @@ const schema = z.object({
   // Kept separate from TELEGRAM_* so the two bots never cross-post.
   SNIPER_TELEGRAM_BOT_TOKEN: z.string().default(''),
   SNIPER_TELEGRAM_CHAT_ID: z.string().default(''),
+  // Should the LEGACY alert engine still post cards to the Telegram channel?
+  //
+  // Off, because the channel now speaks v2 — the same cutover snipurr.fun made.
+  // Leaving both on does not give you more coverage, it gives you two different
+  // brains posting about the same chain in two different vocabularies, and no
+  // reader can tell which one is being measured. The flag exists so the old
+  // stream can be brought back for one deploy if v2 goes quiet, not as a mode
+  // anyone is expected to run in.
+  LEGACY_TELEGRAM_ENABLED: bool(false),
   GENERIC_WEBHOOK_URL: z.string().default(''),
 
   DATABASE_URL: z.string().default(''),

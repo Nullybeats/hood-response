@@ -39,6 +39,28 @@ export function mascotUrl(kind: string, prime = false): string {
   return `${base}${path}`;
 }
 
+/**
+ * Mascot art for a v2 match, chosen by its lane.
+ *
+ * Kept separate from mascotUrl() rather than mapping lanes onto legacy kinds:
+ * there is no kind that means "allocation", and inventing one to pick a picture
+ * is how a rendering convenience turns into a wire-level lie. Unknown lanes fall
+ * through to the neutral advance pose — a lane this build has not heard of still
+ * deserves a card.
+ */
+export function mascotUrlForLane(lane: string | undefined): string {
+  const base = config.ASSET_BASE_URL.replace(/\/$/, '');
+  const path =
+    lane === 'solo-buy'
+      ? '/mascot/bipod.webp'
+      : lane === 'fresh-entry'
+        ? '/mascot/prone.webp'
+        : lane === 'allocation'
+          ? '/mascot/point.webp'
+          : '/mascot/advance.webp';
+  return `${base}${path}`;
+}
+
 /** One-tap Sigma bot buy link, pre-filled with the token contract. Null when
  *  no referral id is configured (SIGMA_REF). */
 export function sigmaBuyUrl(tokenAddress: string): string | null {

@@ -19,14 +19,17 @@ import { buildServer } from './api/server.js';
 import {
   configuredChannels,
   dispatchMilestone,
+  dispatchV2,
   editAlertResult,
+  editV2Result,
+  hasV2Card,
   onAlertCardSent,
 } from './notify/index.js';
 import { SafetyChecker } from './chain/safety.js';
 import { FirstBuyRegistry } from './v2/facts/firstBuy.js';
 import { WalletOutcomes } from './v2/facts/outcomes.js';
 import { journal } from './v2/journal.js';
-import { OutcomeLedger, ledgerOptionsFromConfig } from './v2/ledger.js';
+import { OutcomeLedger, ledgerOptionsFromConfig, type LedgerRecord } from './v2/ledger.js';
 import { DEFAULT_V2_RUNTIME_OPTIONS, V2Shadow } from './v2/runtime.js';
 import { PerformanceTracker, type TrackedCall } from './engine/performance.js';
 import { SniperRegistry } from './sniper/registry.js';
@@ -271,6 +274,26 @@ async function main(): Promise<void> {
    * stays unknown, which is exactly what the gate expects.
    */
   const safetyInFlight = new Set<string>();
+  /**
+   * "Can this be sold?", from a safety report — the ONE definition.
+   *
+   * Extracted because two callers now need it (the fact sheet at fire, and the outcome ledger's lazy
+   * resolution) and a second copy would be free to drift. That drift is not hypothetical here: this
+   * logic already regressed once by reading `report.honeypot` alone, which called a 90%-sell-tax token
+   * sellable while blocking coins it merely could not screen.
+   *
+   * Null means UNKNOWN — nothing was checked, or the checks were indeterminate. Never "fine".
+   */
+  const sellVerdict = (report: { source?: string; honeypot?: boolean | null; hardFails?: unknown }): boolean | null => {
+    // `source: 'none'` means nothing was actually checked. Reporting that as sellable is the exact bug
+    // that printed "🛡️ Safe" over unchecked tokens.
+    if (report.source === 'none') return null;
+    if (report.honeypot === true) return false;
+    if (Array.isArray(report.hardFails) && report.hardFails.length > 0) return false;
+    if (report.honeypot === false) return true;
+    return null;
+  };
+
   const warmSafety = (token: string): void => {
     const key = token.toLowerCase();
     if (safetyInFlight.has(key)) return;
@@ -316,6 +339,52 @@ async function main(): Promise<void> {
     // have made us collide more often.
     price.requestRefresh(token.toLowerCase());
   };
+  /**
+   * Should this price sample be written onto the call's Telegram card?
+   *
+   * Almost always NO, and that is the point. The ledger samples every open
+   * record on a 60s-and-widening cadence, and Telegram's edit budget is not
+   * generous — a card rewritten every minute for three days is both rate-limit
+   * bait and unreadable. So an edit costs a MATERIAL move: the peak or the
+   * current gain has to have travelled 10 points since whatever the card
+   * currently says, or the call has to have closed (its last word always lands).
+   *
+   * The threshold is per-card state, not per-tick: comparing against the last
+   * RENDERED numbers rather than the last sample means a coin that drifts 2% a
+   * minute for an hour eventually earns one edit, instead of never earning one.
+   */
+  const cardState = new Map<string, { peak: number; last: number; closed: boolean }>();
+  const maybeEditCard = (r: LedgerRecord): void => {
+    // No card in this process = nothing to edit. Checked first because it is
+    // free and it is the common case: the ledger records every decision, matched
+    // or not, and only matched ones were ever posted.
+    if (!hasV2Card(r.id)) return;
+    const peak = r.maxGainPct ?? 0;
+    const last = r.lastGainPct ?? 0;
+    const prev = cardState.get(r.id);
+    const moved =
+      prev == null || Math.abs(peak - prev.peak) >= 10 || Math.abs(last - prev.last) >= 10;
+    const justClosed = r.closed && prev?.closed !== true;
+    if (!moved && !justClosed) return;
+    cardState.set(r.id, { peak, last, closed: r.closed });
+    if (r.closed) {
+      // A closed record is never sampled again, so this map entry can never be
+      // consulted again either. Drop it after the final edit is queued.
+      setTimeout(() => cardState.delete(r.id), 0).unref?.();
+    }
+    void editV2Result(
+      r.id,
+      {
+        firedAt: r.firedAt,
+        maxGainPct: r.maxGainPct,
+        lastGainPct: r.lastGainPct,
+        closed: r.closed,
+        closedReason: r.closedReason,
+      },
+      Date.now(),
+    );
+  };
+
   // Follows matched decisions to an outcome.
   //
   // INDEXER FIRST, like the decision path. This sampled pool-first on the argument that these are
@@ -339,6 +408,23 @@ async function main(): Promise<void> {
           },
         },
         ledgerOptionsFromConfig(),
+        // Lazy sellability. The sheet's read at fire is cold ~99% of the time (the coin is seconds
+        // old), which made every outcome unjudgeable. The SAME screen is warm long before this
+        // record's first 60s price sample — so read it then, from the cache, for free.
+        {
+          cached: (token) => {
+            const report = safety.cached(token);
+            if (!report) return null; // not screened yet — never "unsellable"
+            const value = sellVerdict(report);
+            return value == null
+              ? { value: null, provenance: 'unknown' as const }
+              : { value, provenance: 'measured' as const };
+          },
+          warm: (token) => warmSafety(token),
+        },
+        // Narrate a call on its own card as it runs. See `maybeEditCard` below
+        // for what counts as worth an edit — most samples are not.
+        (record) => maybeEditCard(record),
       )
     : undefined;
   if (v2Ledger) {
@@ -388,25 +474,7 @@ async function main(): Promise<void> {
         warmSafety(token);
         return null;
       }
-      // `source: 'none'` means nothing was actually checked. Reporting that as
-      // sellable is the exact bug that printed "🛡️ Safe" over unchecked tokens.
-      if (report.source === 'none') return null;
-      // The FULL verdict, not just the honeypot flag.
-      //
-      // This read `report.honeypot` alone, which made v2 strictly less safe than the engine it
-      // replaced: legacy suppresses on `!report.ok`, and `ok` is `hardFails.length === 0` — honeypot
-      // AND cannot-sell-all, cannot-buy, self-destruct, owner-can-reclaim, blacklist, and buy/sell
-      // tax over SAFETY_MAX_TAX_PCT. So a token with a 90% sell tax reported `honeypot: false` and
-      // v2 called it sellable, while blocking coins it merely could not screen. Strict about the
-      // wrong thing in both directions.
-      //
-      // `hardFails` is the same list legacy gates on, so the two now agree on what "cannot sell"
-      // means. Warnings (mintable, pausable, unverified source) are deliberately NOT included: they
-      // are risk appetite, and appetite belongs to the operator, not to a fact.
-      if (report.honeypot === true) return false;
-      if (Array.isArray(report.hardFails) && report.hardFails.length > 0) return false;
-      if (report.honeypot === false) return true;
-      return null;
+      return sellVerdict(report);
     },
     // Grades come from the tracked-call record, joined on the salted walletId
     // the performance module already records — NOT on labels, which mutate and
@@ -434,7 +502,19 @@ async function main(): Promise<void> {
   // The emit path. Gated on its own flag, separate from V2_SHADOW_ENABLED:
   // observing and BROADCASTING are different acts, and the second one is what
   // reaches a funded wallet. Left off, v2 stays exactly the shadow it has been.
-  config.V2_EMIT_ENABLED ? (match) => store.emit('v2match', match) : undefined,
+  // The emit path. Both consumers hang off this one flag on purpose: the SSE
+  // stream (snipurr.fun, the sniper) and the Telegram channel are the same act
+  // of broadcasting, and a build where the site and the channel disagree about
+  // what fired is worse than one where neither speaks.
+  config.V2_EMIT_ENABLED
+    ? (match) => {
+        store.emit('v2match', match);
+        // Fire-and-forget: a Telegram outage must not touch the pipeline that
+        // feeds the sniper. dispatchV2 resolves with per-channel failures rather
+        // than throwing, and logs them itself.
+        void dispatchV2(match);
+      }
+    : undefined,
   );
   v2Shadow.start();
 

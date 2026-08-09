@@ -111,6 +111,22 @@ export interface LedgerRecord {
    */
   canSellAtFire: boolean | null;
   canSellProvenanceAtFire: Provenance;
+  /**
+   * The best sellability answer we ever got — resolved LATER, and what scoring uses.
+   *
+   * `canSellAtFire` answers "was the decision made blind?" and is honestly ~1%: the sheet reads a
+   * cache that is cold seconds after a launch, so it almost always fires unknown (see index.ts's
+   * canSell provider). Scoring that field made every outcome unjudgeable.
+   *
+   * But the answer ARRIVES moments later. [verified 2026-08-09] GoPlus supports chain 4663 and knew
+   * every recently-fired token including one 72 SECONDS old. The screen is warm long before this
+   * record's first 60s price sample, sitting in memory unread. So sellability is resolved on the
+   * sampling loop, and the two questions are kept apart: was the buy informed, and was the gain real.
+   */
+  canSellResolved: boolean | null;
+  canSellResolvedProvenance: Provenance;
+  /** When the resolved answer landed. Null while still unresolved. */
+  canSellResolvedAt: number | null;
 
   /** Block time of the trade — the moment the signal fired. */
   firedAt: number;
@@ -258,8 +274,14 @@ function sampleIntervalMs(ageMs: number): number {
 
 /** Sellability, as this record froze it. See LedgerRecord.canSellAtFire. */
 function sellability(r: LedgerRecord): 'sellable' | 'unsellable' | 'unverified' {
-  if (r.canSellProvenanceAtFire !== 'measured') return 'unverified';
-  return r.canSellAtFire === true ? 'sellable' : 'unsellable';
+  // RESOLVED first. `atFire` is the audit of the decision, not evidence about the outcome — and it is
+  // unknown ~99% of the time because the screen is cold that early. Falling back to it costs nothing
+  // and covers a record whose at-fire read did land.
+  const provenance =
+    r.canSellResolvedProvenance === 'measured' ? r.canSellResolvedProvenance : r.canSellProvenanceAtFire;
+  const value = r.canSellResolvedProvenance === 'measured' ? r.canSellResolved : r.canSellAtFire;
+  if (provenance !== 'measured') return 'unverified';
+  return value === true ? 'sellable' : 'unsellable';
 }
 
 /**
@@ -352,10 +374,33 @@ function ageBand(hours: number | null): string {
 }
 const AGE_BANDS = ['<1h', '1-3h', '3-12h', '12-48h', '48h+', 'unknown'];
 const CAP_BANDS_ORDER: (CapBand | 'unknown')[] = ['micro', 'small', 'mid', 'large', 'unknown'];
+/**
+ * Sellability screens started per sampling tick.
+ *
+ * Small on purpose. The screen is a keyless third-party API behind a leaky bucket, the answer is not
+ * urgent (the record is tracked for 72 hours), and a cache hit costs nothing — so this only paces the
+ * COLD ones. Deliberately far below maxRefreshPerTick: retrying into a rate limit is the antipattern
+ * that cost this project its price lane on 2026-08-09.
+ */
+const MAX_SELLABILITY_WARM_PER_TICK = 6;
+
 const TIERS: (WalletTier | 'unseeded')[] = ['alpha', 'beta', 'chroma', 'delta', 'unseeded'];
 const GRADES: Grade[] = ['A', 'B', 'C', 'D', 'F', 'U'];
 
 /** What a caller must supply to open a record. */
+/**
+ * Read-only sellability lookup for the sampling loop.
+ *
+ * Deliberately a CACHE read plus a fire-and-forget warm, mirroring how the fact sheet consumes the
+ * same checker: the ledger must never block a sampling pass on a third-party screen.
+ */
+export interface LedgerSellability {
+  /** The answer if it is already known. Null means "not in the cache", NOT "unsellable". */
+  cached(token: string): { value: boolean | null; provenance: Provenance } | null;
+  /** Kick off a screen. Must not throw and must not be awaited. */
+  warm(token: string): void;
+}
+
 export interface LedgerEntryInput {
   txHash: string;
   token: string;
@@ -393,6 +438,18 @@ export class OutcomeLedger {
   constructor(
     private readonly price: LedgerPrice,
     private readonly opts: LedgerOptions = DEFAULT_LEDGER_OPTIONS,
+    /** Absent = sellability never resolves and every rate stays null. Honest, and the old behaviour. */
+    private readonly sell?: LedgerSellability,
+    /**
+     * Called after every price observation, so a consumer can narrate a call as
+     * it runs — the Telegram card edits its own result footer from this.
+     *
+     * READ-ONLY BY CONTRACT. The record handed over is the live object, not a
+     * copy: copying every record on every sample is real work for a hook that
+     * exists to render text. A consumer that mutates it corrupts the
+     * measurement, which is the one thing this class is for.
+     */
+    private readonly onSample?: (record: LedgerRecord) => void,
   ) {}
 
   /**
@@ -437,6 +494,11 @@ export class OutcomeLedger {
       // invariant holds here too: a value exists only when the provenance is 'measured'.
       canSellAtFire: input.canSell?.provenance === 'measured' ? (input.canSell.value ?? null) : null,
       canSellProvenanceAtFire: input.canSell?.provenance ?? 'unknown',
+      // Seeded from at-fire so a record that DID know starts resolved; the rest resolve on a later
+      // sample.
+      canSellResolved: input.canSell?.provenance === 'measured' ? (input.canSell.value ?? null) : null,
+      canSellResolvedProvenance: input.canSell?.provenance ?? 'unknown',
+      canSellResolvedAt: input.canSell?.provenance === 'measured' ? now : null,
       score: input.score,
       seedTier: input.seedTier,
       capBand: input.capBand,
@@ -525,6 +587,7 @@ export class OutcomeLedger {
       }
       const tokens = [...byToken.keys()].slice(0, this.opts.maxRefreshPerTick);
 
+      let warmed = 0;
       for (const token of tokens) {
         try {
           await this.price.refreshNow(token);
@@ -532,7 +595,11 @@ export class OutcomeLedger {
           /* a failed quote is a missing sample, not an error worth logging per token */
         }
         const p = this.price.priceOf(token) ?? 0;
-        for (const r of byToken.get(token) ?? []) this.applySample(r, p, now);
+        const rows = byToken.get(token) ?? [];
+        // Resolve sellability from the cache that is warm by now. Once per TOKEN, not per record —
+        // six fires on one coin share one answer.
+        warmed += this.resolveSellability(token, rows, now, warmed);
+        for (const r of rows) this.applySample(r, p, now);
       }
       // Records that were due but did not fit in this tick's budget keep their
       // due time, so they are first in line next tick rather than starved.
@@ -585,6 +652,17 @@ export class OutcomeLedger {
 
     r.nextSampleAt = now + sampleIntervalMs(ageMs);
     r.updatedAt = now;
+
+    // Last, and swallowing everything: the measurement is already committed to
+    // the record above, and a renderer that throws must not be able to cost the
+    // ledger a sample. Same rule the v2 match consumer follows.
+    if (this.onSample) {
+      try {
+        this.onSample(r);
+      } catch (err) {
+        logger.warn({ err: String(err).slice(0, 200) }, 'ledger: sample consumer threw');
+      }
+    }
   }
 
   /** Drop the oldest closed records once over the cap; open ones are never evicted. */
@@ -699,6 +777,40 @@ export class OutcomeLedger {
     };
   }
 
+  /**
+   * Fill in sellability for records still missing it.
+   *
+   * Reads the cache; on a miss, kicks a bounded number of warms per tick and leaves the record
+   * unresolved for a later pass. The bound matters — this is a keyless third-party screen behind a
+   * leaky bucket, and today's lesson was that an unbounded fallback is how a fix becomes an incident.
+   * A `null` cache answer is "not screened yet", never "unsellable".
+   *
+   * @returns how many warm calls this consumed, so the caller can keep the per-tick budget.
+   */
+  private resolveSellability(
+    token: string,
+    rows: readonly LedgerRecord[],
+    now: number,
+    warmedSoFar: number,
+  ): number {
+    if (!this.sell) return 0;
+    const pending = rows.filter((r) => r.canSellResolvedProvenance !== 'measured');
+    if (pending.length === 0) return 0;
+
+    const hit = this.sell.cached(token);
+    if (hit?.provenance === 'measured') {
+      for (const r of pending) {
+        r.canSellResolved = hit.value ?? null;
+        r.canSellResolvedProvenance = 'measured';
+        r.canSellResolvedAt = now;
+      }
+      return 0;
+    }
+    if (warmedSoFar >= MAX_SELLABILITY_WARM_PER_TICK) return 0;
+    this.sell.warm(token);
+    return 1;
+  }
+
   /** Restore a snapshot. No-op without a store path. */
   async load(): Promise<void> {
     if (!this.opts.storePath) return;
@@ -730,6 +842,14 @@ export class OutcomeLedger {
         if (!r.canSellProvenanceAtFire) {
           r.canSellProvenanceAtFire = 'unknown';
           r.canSellAtFire = null;
+        }
+        // Predates lazy resolution. Left unresolved on purpose rather than seeded from at-fire: the
+        // sampling loop will resolve it on the next tick from a cache that is warm by now, which is
+        // strictly better evidence than the cold read it started with.
+        if (!r.canSellResolvedProvenance) {
+          r.canSellResolvedProvenance = r.canSellProvenanceAtFire;
+          r.canSellResolved = r.canSellAtFire;
+          r.canSellResolvedAt = r.canSellProvenanceAtFire === 'measured' ? r.firedAt : null;
         }
         // Added after these were written. Seed from the entry cap rather than null so a restored row
         // shows a number until its next sample replaces it with a measured one.

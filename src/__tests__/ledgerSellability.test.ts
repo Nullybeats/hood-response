@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { OutcomeLedger, DEFAULT_LEDGER_OPTIONS, type LedgerPrice } from '../v2/ledger.js';
+import { OutcomeLedger, DEFAULT_LEDGER_OPTIONS, type LedgerPrice, type LedgerSellability } from '../v2/ledger.js';
 
 /**
  * Sellability in the outcome ledger.
@@ -42,13 +42,45 @@ function priceStub(prices: Record<string, number>): LedgerPrice {
   } as unknown as LedgerPrice;
 }
 
-function ledger(prices: Record<string, number>) {
-  return new OutcomeLedger(priceStub(prices), {
-    ...DEFAULT_LEDGER_OPTIONS,
-    storePath: '',
-    rulesEpochMs: 0,
-    winThresholdPct: 50,
-  });
+function ledger(prices: Record<string, number>, sell?: LedgerSellability) {
+  return new OutcomeLedger(
+    priceStub(prices),
+    { ...DEFAULT_LEDGER_OPTIONS, storePath: '', rulesEpochMs: 0, winThresholdPct: 50 },
+    sell,
+  );
+}
+
+/** A screen that is COLD at first and warms up, which is the real timing. */
+function warmingScreen(answers: Record<string, boolean>) {
+  const warmed = new Set<string>();
+  const warmCalls: string[] = [];
+  return {
+    warmCalls,
+    provider: {
+      cached: (t: string) => {
+        const k = t.toLowerCase();
+        if (!warmed.has(k)) return null; // not screened yet
+        return { value: answers[k] ?? null, provenance: (k in answers ? 'measured' : 'unknown') as 'measured' | 'unknown' };
+      },
+      warm: (t: string) => {
+        warmCalls.push(t.toLowerCase());
+        warmed.add(t.toLowerCase()); // the answer lands before the next tick, as it does live
+      },
+    } satisfies LedgerSellability,
+  };
+}
+
+/**
+ * One sampling pass, with every open record forced due.
+ *
+ * `sample()` returns early unless `nextSampleAt <= now`, and a fresh record is scheduled 60s out —
+ * so a tick straight after `open()` legitimately does nothing. These tests are about what a pass
+ * DOES, not about the schedule (covered in v2/ledger.test.ts), so the due time is set explicitly
+ * rather than by moving the clock.
+ */
+async function tick(l: OutcomeLedger): Promise<void> {
+  for (const r of l.list(500)) r.nextSampleAt = 0;
+  await (l as unknown as { sample: () => Promise<void> }).sample();
 }
 
 type Sell = { value: boolean | null; provenance: 'measured' | 'unknown' | 'failed' };
@@ -178,5 +210,113 @@ describe('outcome ledger — sellability gates the win rate', () => {
     const g = l.summary().byWalletGrade.find((b) => b.label === 'F')!;
     expect(g.winRatePct).toBe(100);
     expect(g.winRateBasis).toBe(1);
+  });
+});
+
+/**
+ * Lazy resolution.
+ *
+ * `canSellAtFire` is unknown ~99% of the time and always will be: the sheet reads a cache seconds
+ * after a launch. [verified 2026-08-09] the answer is available moments later — GoPlus supports chain
+ * 4663 and knew every recently-fired token, one of them 72 SECONDS old. So the ledger resolves it on
+ * the sampling loop it already runs, and scoring uses THAT.
+ */
+describe('outcome ledger — sellability resolves on a later sample', () => {
+  it('a record that fired blind becomes judgeable once the screen warms', async () => {
+    const screen = warmingScreen({ [CASHCAT]: true });
+    const l = ledger({ [CASHCAT]: 1 }, screen.provider);
+    fire(l, { id: '0x1', token: CASHCAT }); // no canSell at fire — the normal case
+
+    const before = l.summary().byWalletGrade.find((b) => b.label === 'F')!;
+    expect(before.unverified).toBe(1);
+    expect(before.winRatePct).toBeNull(); // nothing judgeable yet
+
+    await tick(l); // cold: kicks a warm, still unresolved
+    expect(screen.warmCalls).toContain(CASHCAT);
+    await tick(l); // warm now: resolves
+
+    const r = l.list(1)[0]!;
+    expect(r.canSellResolvedProvenance).toBe('measured');
+    expect(r.canSellResolved).toBe(true);
+    expect(r.canSellResolvedAt).toBeGreaterThan(0);
+    // And the at-fire audit is untouched — it records that the DECISION was blind.
+    expect(r.canSellProvenanceAtFire).toBe('unknown');
+
+    r.entryPrice = 1; r.maxPrice = 3; r.maxGainPct = 200; r.lastGainPct = 200;
+    const after = l.summary().byWalletGrade.find((b) => b.label === 'F')!;
+    expect(after.unverified).toBe(0);
+    expect(after.winRateBasis).toBe(1);
+    expect(after.winRatePct).toBe(100);
+  });
+
+  it('resolving to UNSELLABLE keeps it out of the win rate however far it ran', async () => {
+    // A real honeypot address (PIPEDOG) that fired before anyone screened it — MEW's shape.
+    const screen = warmingScreen({ [PIPEDOG]: false });
+    const l = ledger({ [PIPEDOG]: 1 }, screen.provider);
+    fire(l, { id: '0x2', token: PIPEDOG });
+    await tick(l);
+    await tick(l);
+
+    const r = l.list(1)[0]!;
+    expect(r.canSellResolved).toBe(false);
+    r.entryPrice = 1; r.maxPrice = 8.56; r.maxGainPct = 756; r.lastGainPct = -95;
+
+    const g = l.summary().byWalletGrade.find((b) => b.label === 'F')!;
+    expect(g.unsellable).toBe(1);
+    expect(g.winRateBasis).toBe(0);
+    expect(g.winRatePct).toBeNull(); // not 0% — nothing judgeable, and it is certainly not a win
+  });
+
+  it('a screen that answers "not screened" leaves it unverified, never unsellable', async () => {
+    // The distinction that matters: a cache MISS is not a verdict. Collapsing the two would penalise
+    // every coin the screen simply has no data for — domain.md rule 1.
+    const screen = warmingScreen({}); // warms, but has no answer for anything
+    const l = ledger({ [IF_TOKEN]: 1 }, screen.provider);
+    fire(l, { id: '0x3', token: IF_TOKEN });
+    await tick(l);
+    await tick(l);
+
+    const r = l.list(1)[0]!;
+    expect(r.canSellResolvedProvenance).toBe('unknown');
+    expect(r.canSellResolved).toBeNull();
+    const g = l.summary().byWalletGrade.find((b) => b.label === 'F')!;
+    expect(g.unsellable).toBe(0);
+    expect(g.unverified).toBe(1);
+  });
+
+  it('bounds how many cold screens one tick may start', async () => {
+    // The screen is a keyless third-party API behind a leaky bucket. An unbounded fallback is exactly
+    // how this project lost its price lane earlier the same day.
+    const screen = warmingScreen({});
+    const l = ledger({}, screen.provider);
+    for (let i = 0; i < 30; i++) {
+      fire(l, { id: '0xb' + i, token: '0x' + i.toString(16).padStart(40, '0') });
+    }
+    await tick(l);
+    expect(screen.warmCalls.length).toBeGreaterThan(0);
+    expect(screen.warmCalls.length).toBeLessThanOrEqual(6);
+  });
+
+  it('one screen serves every record on the same coin', async () => {
+    // [verified 2026-08-09] ROB fired six times. That is one screen, not six.
+    const screen = warmingScreen({ [CASHCAT]: true });
+    const l = ledger({ [CASHCAT]: 1 }, screen.provider);
+    for (let i = 0; i < 6; i++) fire(l, { id: '0xs' + i, token: CASHCAT });
+    await tick(l);
+    await tick(l);
+
+    expect(screen.warmCalls.filter((t) => t === CASHCAT).length).toBe(1);
+    expect(l.list(10).every((r) => r.canSellResolvedProvenance === 'measured')).toBe(true);
+  });
+
+  it('without a screen wired, nothing is invented', async () => {
+    // The old behaviour, kept honest: no provider means every rate stays null rather than defaulting
+    // to sellable.
+    const l = ledger({ [CASHCAT]: 1 }); // no LedgerSellability
+    fire(l, { id: '0x4', token: CASHCAT });
+    await tick(l);
+    const r = l.list(1)[0]!;
+    expect(r.canSellResolvedProvenance).toBe('unknown');
+    expect(l.summary().byWalletGrade.find((b) => b.label === 'F')!.winRatePct).toBeNull();
   });
 });

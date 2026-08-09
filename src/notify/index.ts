@@ -11,7 +11,15 @@ import {
   milestoneTextBody,
   telegramHtmlWithResult,
 } from './format.js';
-import { explorerUrl, sigmaBuyUrl, basedBuyUrl, mascotUrl } from '../links.js';
+import { explorerUrl, sigmaBuyUrl, basedBuyUrl, mascotUrl, mascotUrlForLane } from '../links.js';
+import type { V2Match } from '../v2/emit.js';
+import {
+  v2TelegramHtml,
+  v2TextBody,
+  v2Title,
+  v2TelegramHtmlWithResult,
+  type V2Result,
+} from './formatV2.js';
 
 const TIMEOUT_MS = 4000;
 
@@ -226,7 +234,12 @@ export async function dispatch(s: Swarm): Promise<NotificationDelivery[]> {
   // so what you see in /api/alerts is what lands in Telegram. This was PRIME-only from
   // 8838e01, but PRIME_KINDS is ENTRY-only while SOLO is what actually fires — so the
   // channel went silent for a day. s.prime is left alone; it still gates the sniper.
-  if (config.notifications.telegram) {
+  //
+  // …and from 2026-08-09 it is OFF by default (LEGACY_TELEGRAM_ENABLED). The channel
+  // speaks v2 now — see dispatchV2() below and the flag's own note in config/env.ts.
+  // Discord and generic webhooks are deliberately untouched: they are not the public
+  // channel, and anyone consuming them was consuming the legacy shape on purpose.
+  if (config.notifications.telegram && config.LEGACY_TELEGRAM_ENABLED) {
     jobs.push(
       sendTelegram(config.notifications.telegram.token, config.notifications.telegram.chatId, s),
     );
@@ -242,6 +255,157 @@ export async function dispatch(s: Swarm): Promise<NotificationDelivery[]> {
     if (!r.ok) logger.warn({ channel: r.channel, detail: r.detail }, 'notification failed');
   }
   return results;
+}
+
+// ── v2 match cards ──────────────────────────────────────────────────────────
+// The channel's live stream. Everything above this line is the legacy engine's
+// path, kept intact but no longer reaching Telegram.
+
+/**
+ * Which Telegram message carries which match, so a result can be edited onto the
+ * card that made the call instead of arriving as a new post.
+ *
+ * Keyed by txHash, which is the match id AND the ledger record id — the join is
+ * free and stable across restarts of everything except this map. Bounded: a
+ * process that has been up for days must not accumulate a message id for every
+ * call it ever made, and a card old enough to be evicted is old enough that
+ * nobody is watching it move.
+ */
+const v2Cards = new Map<string, { messageId: number; html: string }>();
+const V2_CARD_LIMIT = 500;
+
+function rememberCard(id: string, messageId: number, html: string): void {
+  v2Cards.set(id, { messageId, html });
+  if (v2Cards.size > V2_CARD_LIMIT) {
+    const oldest = v2Cards.keys().next().value;
+    if (oldest != null) v2Cards.delete(oldest);
+  }
+}
+
+async function sendTelegramV2(
+  token: string,
+  chatId: string,
+  m: V2Match,
+): Promise<NotificationDelivery> {
+  try {
+    const cardHtml = v2TelegramHtml(m);
+    const res = await postJson(`https://api.telegram.org/bot${token}/sendMessage`, {
+      chat_id: chatId,
+      text: cardHtml,
+      parse_mode: 'HTML',
+      link_preview_options: {
+        url: mascotUrlForLane(m.lanes[0]),
+        prefer_large_media: true,
+        show_above_text: true,
+      },
+    });
+    if (res.ok) {
+      const messageId = await res
+        .json()
+        .then((b) => (b as { result?: { message_id?: number } }).result?.message_id)
+        .catch(() => undefined);
+      if (messageId != null) rememberCard(m.id, messageId, cardHtml);
+      return delivery('telegram', true);
+    }
+    const reason = await res
+      .json()
+      .then((b) => (b as { description?: string }).description ?? `HTTP ${res.status}`)
+      .catch(() => `HTTP ${res.status}`);
+    return delivery('telegram', false, reason);
+  } catch (err) {
+    return delivery('telegram', false, (err as Error).message);
+  }
+}
+
+/**
+ * Fan a v2 match out to every configured channel.
+ *
+ * Deliberately NOT gated on score, lane, or grade. The gate already ran: v2 only
+ * emits a match when a lane wanted it, and adding a second opinion here is how
+ * the channel went silent for a day in August — the PRIME-only filter was
+ * ENTRY-only while SOLO was what actually fired. One gate, in the place that
+ * owns the decision.
+ */
+export async function dispatchV2(m: V2Match): Promise<NotificationDelivery[]> {
+  const jobs: Promise<NotificationDelivery>[] = [];
+  if (config.notifications.telegram) {
+    jobs.push(
+      sendTelegramV2(config.notifications.telegram.token, config.notifications.telegram.chatId, m),
+    );
+  }
+  if (config.notifications.webhook) {
+    jobs.push(
+      (async () => {
+        try {
+          const res = await postJson(config.notifications.webhook!, {
+            type: 'v2.match',
+            text: v2TextBody(m),
+            match: m,
+          });
+          return delivery('webhook', res.ok, res.ok ? undefined : `HTTP ${res.status}`);
+        } catch (err) {
+          return delivery('webhook', false, (err as Error).message);
+        }
+      })(),
+    );
+  }
+  if (jobs.length === 0) return [];
+  const results = await Promise.all(jobs);
+  for (const r of results) {
+    if (!r.ok) logger.warn({ channel: r.channel, detail: r.detail, match: m.id }, 'v2 notification failed');
+  }
+  logger.info(
+    { token: m.tokenSymbol, lanes: m.lanes, title: v2Title(m), ok: results.every((r) => r.ok) },
+    'v2 match dispatched',
+  );
+  return results;
+}
+
+/**
+ * Edit the running result onto a match's own card.
+ *
+ * Returns false when there is nothing to edit — no card was ever sent, or this
+ * process did not send it (a restart empties the map). That is a normal outcome,
+ * not a failure: the call still stands, it just stops narrating itself.
+ *
+ * Telegram rejects an edit whose text is byte-identical ("message is not
+ * modified"), so the caller is expected to only edit on a material move; that
+ * rejection is logged at debug rather than treated as an error.
+ */
+export async function editV2Result(id: string, result: V2Result, now: number): Promise<boolean> {
+  const tg = config.notifications.telegram;
+  const card = v2Cards.get(id);
+  if (!tg || !card) return false;
+  const text = v2TelegramHtmlWithResult(card.html, result, now);
+  try {
+    const res = await postJson(`https://api.telegram.org/bot${tg.token}/editMessageText`, {
+      chat_id: tg.chatId,
+      message_id: card.messageId,
+      text,
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: false },
+    });
+    if (res.ok) return true;
+    const reason = await res
+      .json()
+      .then((b) => (b as { description?: string }).description ?? `HTTP ${res.status}`)
+      .catch(() => `HTTP ${res.status}`);
+    if (reason.includes('not modified')) {
+      logger.debug({ id }, 'v2 result edit: nothing changed');
+      return false;
+    }
+    logger.warn({ id, reason }, 'v2 result edit failed');
+    return false;
+  } catch (err) {
+    logger.warn({ id, err: String(err).slice(0, 200) }, 'v2 result edit threw');
+    return false;
+  }
+}
+
+/** Test seam: does this process hold a card for `id`? Used by the result hook to
+ *  skip work for calls it could never edit anyway. */
+export function hasV2Card(id: string): boolean {
+  return v2Cards.has(id);
 }
 
 // ── PnL milestone cards ─────────────────────────────────────────────────────
