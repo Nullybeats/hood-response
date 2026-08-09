@@ -60,9 +60,44 @@ interface DexPair {
 type DexTokenResponse = { pairs?: DexPair[] } | DexPair[];
 
 const TTL_MS = 60_000;
-// Tokens re-priced per refresh tick. Each is a separate request because the
-// multi-token endpoint caps at 30 pairs *total*, which starves busy tokens.
-const MAX_PER_TICK = 1;
+/**
+ * Tokens re-priced per refresh tick.
+ *
+ * This was 1, for a real reason: the multi-token endpoint caps its response at 30 PAIRS, not 30
+ * tokens, so a naive batch silently drops whichever tokens fall past the cap and they are never
+ * re-tried. One request per token could not starve anyone.
+ *
+ * It also could not keep up. [verified 2026-08-09] At 1 per 15s the background queue stood at
+ * **12,345 tokens and drained one in two minutes** — seventeen days to clear — while 205 fetches sat
+ * in flight behind a lane serialized at 1.5s. 22% of live decisions were dropped as "market cap still
+ * unresolved after 31 attempts", and every one of those tokens was indexed at DexScreener the whole
+ * time, answering a direct query in ~180ms.
+ *
+ * The cap is handled rather than avoided: `fetchBatch` reads back WHICH tokens the response actually
+ * covered and re-queues the rest (see DEX_BATCH_SIZE). That makes batching safe, and batching is what
+ * makes this number affordable — 24 is three requests per tick, not twenty-four.
+ */
+const MAX_PER_TICK = 24;
+/**
+ * Addresses per multi-token request.
+ *
+ * [verified 2026-08-09 against the live API] The response caps at 30 pairs. At the ~1.75 pairs per
+ * token observed on this chain, **8 addresses came back fully covered and 12 truncated**. Eight is
+ * therefore the measured safe size — but the coverage check in `fetchBatch` is what makes it correct,
+ * not this constant, so a chain with chattier tokens degrades into re-queues rather than silence.
+ */
+const DEX_BATCH_SIZE = 8;
+/**
+ * Ceiling on the best-effort background queue.
+ *
+ * `refresh()` used to re-enqueue the ENTIRE token registry every tick, which is how a queue reaches
+ * five figures: every historical token nobody is deciding anything about sat ahead of the coin being
+ * judged right now. The priority queue always drains first and is never capped; this bound applies
+ * only to the speculative sweep, oldest-first, so the backlog cannot crowd out live work again.
+ */
+const MAX_BACKGROUND_QUEUE = 1_500;
+/** Cheap batch retries before a token falls through to the (expensive) pool read. */
+const DEX_MISS_RETRIES = 2;
 /** Shared-IP friendly spacing for DexScreener's public endpoint. */
 const DEX_MIN_INTERVAL_MS = 1_500;
 const DEX_429_COOLDOWN_MS = 60_000;
@@ -125,6 +160,9 @@ export class PriceOracle {
   /** One public-DexScreener request at a time; Railway shares this egress IP. */
   private dexTail: Promise<void> = Promise.resolve();
   private dexNextAt = 0;
+  /** Consecutive batch responses that did not carry a token, so a permanently un-indexed
+   *  one falls through to the pool instead of cycling at priority forever. */
+  private readonly dexMisses = new Map<string, number>();
   /** Tokens awaiting an on-chain supply read (see drainSupplyQueue). */
   private readonly supplyQueue = new Set<string>();
   /** Failed supply-read counts, so a hopeless contract is not retried forever. */
@@ -243,7 +281,19 @@ export class PriceOracle {
       totalSupply: token.totalSupply,
       supplyVerified: token.supplyVerified === true,
     });
-    if (result.reason === 'unverified-supply') this.maybeEnqueueSupply(token.address);
+    // Queue the supply read on `no-price` TOO, not only on `unverified-supply`.
+    //
+    // This was a deadlock. `resolveMarketCap` short-circuits on price first, so a token with no
+    // price reports `no-price` and never reaches the `unverified-supply` branch — meaning it was
+    // never queued for a supply read. But a pool-derived price always stores `marketCap: null`, so a
+    // pool-priced token can ONLY get a cap by deriving it from a verified supply. The token needed a
+    // supply to get a cap, and needed a cap-with-price to be asked for a supply.
+    //
+    // Fetching the two independently costs nothing extra: `maybeEnqueueSupply` is already bounded by
+    // MAX_SUPPLY_ATTEMPTS, so a contract with no working totalSupply() still gives up after 3 tries.
+    if (result.reason === 'unverified-supply' || result.reason === 'no-price') {
+      if (token.supplyVerified !== true) this.maybeEnqueueSupply(token.address);
+    }
     return result;
   }
 
@@ -463,7 +513,10 @@ export class PriceOracle {
       lastSweepAgeMs: this.debugCounters.lastSweepAt ? Date.now() - this.debugCounters.lastSweepAt : null,
       dex429Count: this.debugCounters.dex429,
       dexErrorCount: this.debugCounters.dexErrors,
-      sweepPerTick: 1,
+      // Read from the constants, not restated. This said `1` for as long as MAX_PER_TICK was 1, so
+      // the number that would have exposed the starvation was itself a literal nobody had to update.
+      sweepPerTick: MAX_PER_TICK,
+      sweepBatchSize: DEX_BATCH_SIZE,
       sweepIntervalMs: config.PRICE_REFRESH_MS,
     };
   }
@@ -537,8 +590,16 @@ export class PriceOracle {
 
   private async refresh(): Promise<void> {
     // Re-price known tokens that have gone stale, plus anything newly queued.
-    if (this.store) {
-      for (const addr of this.store.tokensByAddress.keys()) this.maybeEnqueue(addr);
+    //
+    // BOUNDED. This loop walks the whole registry, so on a long-running process it was re-adding
+    // thousands of historical tokens every 15s and the queue only ever grew — measured at 12,345
+    // entries against a drain of one. The speculative sweep now stops at a ceiling; the priority
+    // queue is untouched by it, because that is where tokens under an actual decision live.
+    if (this.store && this.queue.size < MAX_BACKGROUND_QUEUE) {
+      for (const addr of this.store.tokensByAddress.keys()) {
+        if (this.queue.size >= MAX_BACKGROUND_QUEUE) break;
+        this.maybeEnqueue(addr);
+      }
     }
     // Evict stale/overflowing live prices.
     const staleBefore = Date.now() - LIVE_STALE_MS;
@@ -548,12 +609,42 @@ export class PriceOracle {
     await this.drainSupplyQueue();
 
     if (this.priorityQueue.size === 0 && this.queue.size === 0) return;
+    // Priority first and in full-tick order: a token something is deciding on must never wait behind
+    // the speculative backlog, which is exactly what the old flat slice allowed.
     const batch = [...this.priorityQueue, ...this.queue].slice(0, MAX_PER_TICK);
     for (const a of batch) {
       this.priorityQueue.delete(a);
       this.queue.delete(a);
     }
-    await Promise.all(batch.map((a) => this.refreshNow(a)));
+
+    // Batched, sequentially — `fetchDexScreener` serializes and paces requests anyway, so issuing
+    // these in parallel would only queue them behind each other while looking concurrent.
+    for (let i = 0; i < batch.length; i += DEX_BATCH_SIZE) {
+      const slice = batch.slice(i, i + DEX_BATCH_SIZE);
+      const covered = await this.fetchBatch(slice);
+      // Whatever the response did not cover — truncated by the 30-pair cap, throttled, or simply not
+      // indexed — must not be silently forgotten. But it must not spin at priority forever either:
+      // a token DexScreener genuinely does not carry would then loop ahead of real work, which is
+      // the same starvation single-token requests were protecting against.
+      //
+      // So: retry the cheap way twice (truncation and throttles are transient), then fall through to
+      // the pool ONCE, which is the answer for a brand-new pair no indexer has seen. Either way the
+      // token leaves this loop.
+      for (const addr of slice) {
+        if (covered.has(addr) || this.fresh(addr)) {
+          this.dexMisses.delete(addr);
+          continue;
+        }
+        const misses = (this.dexMisses.get(addr) ?? 0) + 1;
+        if (misses < DEX_MISS_RETRIES) {
+          this.dexMisses.set(addr, misses);
+          this.priorityQueue.add(addr);
+          continue;
+        }
+        this.dexMisses.delete(addr);
+        await this.fetchFromPool(addr).catch(() => undefined);
+      }
+    }
   }
 
   /**
@@ -580,6 +671,91 @@ export class PriceOracle {
       }),
     );
     capMap(this.supplyAttempts, MAX_CACHE);
+  }
+
+  /**
+   * Price several tokens in ONE request, and report which ones actually came back.
+   *
+   * The multi-token route caps its response at 30 pairs, so a batch can be silently truncated. That
+   * is the whole reason this codebase used single-token requests — the danger was never the batching,
+   * it was trusting it. So this returns the covered set and the caller re-queues the difference; a
+   * truncated response costs a retry, never a token that quietly stops being priced.
+   *
+   * On a non-OK response nothing is applied and NOTHING is marked covered, so the entire batch is
+   * re-queued. A throttle must not read as "these tokens have no price".
+   */
+  private async fetchBatch(addresses: string[]): Promise<Set<string>> {
+    const covered = new Set<string>();
+    if (!addresses.length) return covered;
+    const chain = config.DEXSCREENER_CHAIN.toLowerCase();
+    try {
+      const res = await this.fetchDexScreener(
+        `https://api.dexscreener.com/latest/dex/tokens/${addresses.join(',')}`,
+      );
+      if (!res.ok) {
+        if (res.status === 429) this.debugCounters.dex429++;
+        else this.debugCounters.dexErrors++;
+        logger.warn({ batch: addresses.length, status: res.status }, 'price: DexScreener batch failed');
+        return covered;
+      }
+      const json = (await res.json()) as DexTokenResponse;
+      const pairs = Array.isArray(json) ? json : json.pairs ?? [];
+      // Best (deepest) pair per requested address, on our chain, where it is the BASE token.
+      const best = new Map<string, DexPair>();
+      for (const p of pairs) {
+        if ((p.chainId ?? '').toLowerCase() !== chain) continue;
+        const addr = p.baseToken?.address?.toLowerCase();
+        if (!addr || !addresses.includes(addr)) continue;
+        const cur = best.get(addr);
+        if (!cur || (p.liquidity?.usd ?? 0) > (cur.liquidity?.usd ?? 0)) best.set(addr, p);
+      }
+      for (const [addr, pair] of best) {
+        if (this.applyPair(addr, pair)) covered.add(addr);
+      }
+    } catch (err) {
+      logger.debug({ err: String(err) }, 'price: DexScreener batch fetch failed');
+    }
+    return covered;
+  }
+
+  /**
+   * Write one DexScreener pair into the live cache. Returns false when the pair carries no usable
+   * price, so the caller can fall through to the pool rather than record a token as "done".
+   *
+   * Shared by the single and batched paths so the two can never drift into recording a token
+   * differently depending on how it happened to be fetched.
+   */
+  private applyPair(address: string, best: DexPair): boolean {
+    const priceUsd = Number(best.priceUsd);
+    if (!Number.isFinite(priceUsd) || priceUsd <= 0) return false;
+    const priceNative = Number(best.priceNative);
+    const marketCap = best.marketCap ?? best.fdv ?? null;
+    this.recordAth(address, marketCap);
+    this.live.set(address, {
+      source: 'dexscreener',
+      priceUsd,
+      priceNative: Number.isFinite(priceNative) && priceNative > 0 ? priceNative : null,
+      quoteToken: best.quoteToken?.address?.toLowerCase() ?? null,
+      marketCap,
+      liquidityUsd: best.liquidity?.usd ?? null,
+      pairCreatedAt: best.pairCreatedAt ?? null,
+      volume24: best.volume?.h24 ?? null,
+      priceChangeH1: best.priceChange?.h1 ?? null,
+      priceChangeH24: best.priceChange?.h24 ?? null,
+      buys24: best.txns?.h24?.buys ?? null,
+      sells24: best.txns?.h24?.sells ?? null,
+      dexId: best.dexId ?? null,
+      pairAddress: best.pairAddress ?? '',
+      chainId: best.chainId ?? config.DEXSCREENER_CHAIN,
+      fetchedAt: Date.now(),
+    });
+    // Enrich a discovered token's placeholder symbol from the real pair.
+    const sym = best.baseToken?.symbol;
+    const tok = this.store?.tokensByAddress.get(address);
+    if (sym && tok?.discovered && tok.symbol.startsWith('TKN-')) {
+      this.store?.updateTokenMeta(address, { symbol: sym, name: sym });
+    }
+    return true;
   }
 
   private async fetchOne(address: string): Promise<void> {
@@ -619,38 +795,8 @@ export class PriceOracle {
         return;
       }
 
-      const priceUsd = Number(best.priceUsd);
-      if (!Number.isFinite(priceUsd) || priceUsd <= 0) {
-        await this.fetchFromPool(address);
-        return;
-      }
-      const priceNative = Number(best.priceNative);
-      const marketCap = best.marketCap ?? best.fdv ?? null;
-      this.recordAth(address, marketCap);
-      this.live.set(address, {
-        source: 'dexscreener',
-        priceUsd,
-        priceNative: Number.isFinite(priceNative) && priceNative > 0 ? priceNative : null,
-        quoteToken: best.quoteToken?.address?.toLowerCase() ?? null,
-        marketCap,
-        liquidityUsd: best.liquidity?.usd ?? null,
-        pairCreatedAt: best.pairCreatedAt ?? null,
-        volume24: best.volume?.h24 ?? null,
-        priceChangeH1: best.priceChange?.h1 ?? null,
-        priceChangeH24: best.priceChange?.h24 ?? null,
-        buys24: best.txns?.h24?.buys ?? null,
-        sells24: best.txns?.h24?.sells ?? null,
-        dexId: best.dexId ?? null,
-        pairAddress: best.pairAddress ?? '',
-        chainId: best.chainId ?? config.DEXSCREENER_CHAIN,
-        fetchedAt: Date.now(),
-      });
-      // Enrich a discovered token's placeholder symbol from the real pair.
-      const sym = best.baseToken?.symbol;
-      const tok = this.store?.tokensByAddress.get(address);
-      if (sym && tok?.discovered && tok.symbol.startsWith('TKN-')) {
-        this.store?.updateTokenMeta(address, { symbol: sym, name: sym });
-      }
+      // A pair with no usable price is not an answer — fall through to the pool.
+      if (!this.applyPair(address, best)) await this.fetchFromPool(address);
     } catch (err) {
       logger.debug({ err: String(err) }, 'dexscreener price fetch failed');
       await this.fetchFromPool(address).catch(() => undefined);

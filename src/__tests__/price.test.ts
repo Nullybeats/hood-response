@@ -132,3 +132,90 @@ describe('PriceOracle ATH tracking', () => {
     expect(oracle.athMarketCapOf('0xnope')).toBeNull();
   });
 });
+
+/**
+ * Batching the indexer is what turns a 12,345-deep queue draining at one token per 15s into
+ * something that keeps up. The danger was never the batching — it was TRUSTING it: the multi-token
+ * route caps its response at 30 pairs, so a batch can come back truncated and the tokens past the
+ * cap would simply stop being priced, silently and forever. That is why this codebase used one
+ * request per token.
+ *
+ * So the contract is not "we asked for 8" but "we know which 8 came back".
+ */
+describe('PriceOracle batched refresh', () => {
+  const A = '0xaaa0000000000000000000000000000000000001';
+  const B = '0xbbb0000000000000000000000000000000000002';
+
+  /** A response carrying only SOME of the requested tokens — the truncation case. */
+  function partial(addresses: string[]) {
+    return {
+      ok: true,
+      json: async () => ({
+        pairs: addresses.map((a) => ({
+          chainId: 'robinhood',
+          dexId: 'uniswap',
+          pairAddress: '0xpair' + a.slice(-2),
+          baseToken: { address: a, symbol: 'GEM' },
+          priceUsd: '1',
+          priceNative: '0.0004',
+          marketCap: 100_000,
+          liquidity: { usd: 50_000 },
+        })),
+      }),
+    };
+  }
+
+  it('prices every token the response covered, in ONE request', async () => {
+    const oracle = new PriceOracle([]);
+    const fetchMock = vi.fn().mockResolvedValue(partial([A, B]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    oracle.requestRefresh(A);
+    oracle.requestRefresh(B);
+    await (oracle as unknown as { refresh: () => Promise<void> }).refresh();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(oracle.priceOf(A)).toBe(1);
+    expect(oracle.priceOf(B)).toBe(1);
+  });
+
+  /**
+   * THE ONE THAT MATTERS. B is requested and omitted from the reply; it must come back on the
+   * queue rather than being quietly dropped.
+   *
+   * NEGATIVE CONTROL: stop re-queueing the uncovered set and this fails, because B leaves the
+   * queue on the first tick and nothing ever asks for it again.
+   */
+  it('re-queues a requested token the response did NOT cover', async () => {
+    const oracle = new PriceOracle([]);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(partial([A])));
+
+    oracle.requestRefresh(A);
+    oracle.requestRefresh(B);
+    await (oracle as unknown as { refresh: () => Promise<void> }).refresh();
+
+    // Assert on the PRIORITY queue, and before touching priceOf(B).
+    //
+    // `quoteState` is true for either queue, and `priceOf` enqueues as a side effect — so the
+    // obvious assertion (`quoteState(B) === 'pricing'` after reading its price) passes whether or
+    // not the re-queue exists. Verified by deleting the re-queue: this test still went green. It was
+    // measuring its own side effect.
+    expect((oracle.debug() as { priorityQueue: number }).priorityQueue).toBe(1);
+    expect(oracle.priceOf(A)).toBe(1);
+    expect(oracle.priceOf(B)).toBeNull();
+  });
+
+  /** A throttle is not evidence a token has no price: nothing may be marked done. */
+  it('re-queues the WHOLE batch when the request is throttled', async () => {
+    const oracle = new PriceOracle([]);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 429, json: async () => ({}) }));
+
+    oracle.requestRefresh(A);
+    oracle.requestRefresh(B);
+    await (oracle as unknown as { refresh: () => Promise<void> }).refresh();
+
+    expect(oracle.quoteState(A)).toBe('pricing');
+    expect(oracle.quoteState(B)).toBe('pricing');
+    expect((oracle.debug() as { dex429Count: number }).dex429Count).toBeGreaterThan(0);
+  });
+});

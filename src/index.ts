@@ -287,12 +287,23 @@ async function main(): Promise<void> {
    * relying on it alone: market cap resolved on none of the trades it saw, and
    * they were dropped with "marketCap still unresolved after 8 attempts" while
    * the queue was still working through hundreds of restored tokens.
-   * `refreshOnChainNow` reads the canonical V3/V4 pool directly — it is what
-   * enrichSwarm calls, and it already de-duplicates in flight, so calling it per
-   * retry costs one read per token rather than one per attempt.
+   * INDEXER FIRST, pool as fallback — the reverse of the background sweep, and deliberately so.
+   *
+   * This used to call `refreshOnChainNow`, which reads the canonical V3/V4 pool first: roughly ten
+   * scheduled RPC reads including two `eth_getLogs` from block 0, on a bucket shared with the live
+   * listener, receipts and attribution. That is the right order for a pair no indexer has seen — and
+   * the wrong one for everything else. [verified 2026-08-09] Every token v2 dropped as "market cap
+   * still unresolved after 31 attempts" was indexed at DexScreener the entire time and answered a
+   * direct query in ~180ms. We were taking the ten-read road to an answer already sitting behind one
+   * HTTP call.
+   *
+   * `refreshNow` tries the indexer and falls through to the pool itself when there is no pair, so the
+   * brand-new-coin case this was built for still works — it just is not paid for by every token.
+   * Both paths de-duplicate in flight, so a 3s retry loop costs one fetch per token, not one per
+   * attempt.
    */
   const warmQuote = (token: string): void => {
-    void price.refreshOnChainNow(token.toLowerCase()).catch(() => null);
+    void price.refreshNow(token.toLowerCase()).catch(() => null);
   };
   // Follows matched decisions to an outcome. Quotes go through the on-chain path
   // for the same reason the shadow's warmQuote does: these are brand-new pairs,

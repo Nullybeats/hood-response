@@ -414,6 +414,26 @@ export class V2Shadow {
     // is the difference between 47e1's 90% and 0% win rates. Deliberately
     // expressed as a retry so it flows through the same pending queue, appears
     // in the diary as 'waiting' with a reason, and is bounded by the same budget.
+    // A sheet we deliberately did not price cannot resolve, so waiting on it is incoherent.
+    //
+    // `worthPricing` declines to fetch a cap for a distribution from a wallet outside the seed
+    // catalog, because no lane admits one at any cap — a real saving, and correct. But the sheet then
+    // entered the retry loop anyway and burned the full budget (~60 passes over ~177s, each
+    // rebuilding the sheet and writing two synchronous journal records) before being dropped as
+    // "marketCap still unresolved". That reason was also misleading: nothing failed to resolve, we
+    // chose not to ask. Terminal, immediately, with the actual reason.
+    if (!this.worthPricing(p.trade, sheet.walletSeedTier.value ?? null)) {
+      // Decided, not blocked. `blocked` means the evidence failed us; this is a RULE saying no, and
+      // the lanes are evaluated so the diary still shows which condition turned it away rather than
+      // asserting a conclusion with nothing behind it.
+      this.record(sheet, {
+        decision: 'pass',
+        fact: null,
+        reason: 'not priced: no lane admits a distribution from an unseeded wallet',
+      }, now, false);
+      return;
+    }
+
     const settling = p.trade.distribution === true && elapsed < this.opts.distributionSettleMs;
     const verdict: GateVerdict = settling
       ? {
