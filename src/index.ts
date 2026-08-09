@@ -303,7 +303,18 @@ async function main(): Promise<void> {
    * attempt.
    */
   const warmQuote = (token: string): void => {
-    void price.refreshNow(token.toLowerCase()).catch(() => null);
+    // QUEUE it, do not fetch it. `requestRefresh` puts the token at the front of the price sweep,
+    // which now drains in batches of 8 every 15s and empties every tick — so the answer still lands
+    // well inside the gate's 90s patience.
+    //
+    // Fetching individually here is what was getting us throttled. Every waiting sheet re-asks on a
+    // 3s retry loop, and with ~30 sheets pending that is ~30 separate requests a minute on top of
+    // the sweep. [verified 2026-08-09] 50 rate-limit responses in 49 minutes — about one a minute —
+    // and EACH one pauses the entire indexer lane for 60s, which is most of the 90s a sheet has to
+    // live. So coins we could price were being dropped as "unresolved" while the lane sat frozen.
+    // Batching cuts the request count ~8x, which is the actual fix; a shorter cooldown would only
+    // have made us collide more often.
+    price.requestRefresh(token.toLowerCase());
   };
   // Follows matched decisions to an outcome.
   //
