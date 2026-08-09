@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { PriceOracle } from '../chain/price.js';
 import { PoolPriceReader } from '../chain/poolPrice.js';
+import { config } from '../config/env.js';
 
 const TOKEN = '0xabc0000000000000000000000000000000000a';
 
@@ -510,6 +511,60 @@ describe('PriceOracle DexScreener rate-limit discipline', () => {
     // A decision in flight does get one.
     await oracle.refreshNow(R, { live: true });
     expect(pool.mock.calls.length).toBe(base + 1);
+  });
+
+  it('maps both DexScreener paths onto the proxy, with the key, when one is configured', async () => {
+    // The proxy exists because DexScreener quotas by egress IP and the feed's IP is refused outright.
+    // A path that fails to map would 404 through the proxy and read as "this token has no pairs" —
+    // indistinguishable from a real answer, and silently wrong. So pin the mapping.
+    const oracle = new PriceOracle([]);
+    const seen: string[] = [];
+    const headers: Array<Record<string, string> | undefined> = [];
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (u: string, init?: RequestInit) => {
+      seen.push(u);
+      headers.push(init?.headers as Record<string, string> | undefined);
+      return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ pairs: [] }) };
+    }));
+    vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(3_000);
+    vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue(null);
+
+    const cfg = config as unknown as { DEX_PROXY_URL: string; DEX_PROXY_KEY: string };
+    const url0 = cfg.DEX_PROXY_URL, key0 = cfg.DEX_PROXY_KEY;
+    cfg.DEX_PROXY_URL = 'https://snipurr.fun/';  // trailing slash on purpose
+    cfg.DEX_PROXY_KEY = 'secret';
+    try {
+      await oracle.refreshNow(R);                       // single-token path
+      oracle.requestRefresh(S);
+      await (oracle as unknown as { refresh: () => Promise<void> }).refresh(); // batch path
+    } finally {
+      cfg.DEX_PROXY_URL = url0; cfg.DEX_PROXY_KEY = key0;
+    }
+
+    expect(seen.length).toBeGreaterThanOrEqual(2);
+    expect(seen.some((u) => u.startsWith('https://snipurr.fun/api/dexproxy/token-pairs/'))).toBe(true);
+    expect(seen.some((u) => u.startsWith('https://snipurr.fun/api/dexproxy/tokens/'))).toBe(true);
+    // No double slash from the trailing-slash base, and DexScreener is never contacted directly.
+    expect(seen.every((u) => !u.includes('//api/'))).toBe(true);
+    expect(seen.every((u) => !u.includes('api.dexscreener.com'))).toBe(true);
+    // The proxy refuses an unauthenticated request, so the key must be on every call.
+    expect(headers.every((h) => h?.['x-dex-proxy-key'] === 'secret')).toBe(true);
+  });
+
+  it('calls DexScreener directly when no proxy is configured', async () => {
+    // The BOX must keep its direct path: its IP is not refused, and routing it through the box's own
+    // web server to reach the internet would be a pointless hop that can fail on its own.
+    const oracle = new PriceOracle([]);
+    const seen: string[] = [];
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (u: string) => {
+      seen.push(u);
+      return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ pairs: [] }) };
+    }));
+    vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(3_000);
+    vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue(null);
+
+    await oracle.refreshNow(R);
+
+    expect(seen[0]).toContain('api.dexscreener.com');
   });
 
   it('does not start a second sweep while one is still in flight', async () => {

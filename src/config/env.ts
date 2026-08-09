@@ -503,6 +503,25 @@ const schema = z.object({
   // right pair). Left empty, links fall back to universal search and prices
   // stay synthetic.
   DEXSCREENER_CHAIN: z.string().default('robinhood'),
+  /**
+   * Route DexScreener through cipherfi's egress proxy instead of calling it directly.
+   *
+   * DexScreener's public API is keyless and quotaed by EGRESS IP, and this deployment's IP decides
+   * whether it works at all. [verified 2026-08-09] the same endpoint at the same cadence returned
+   * 0/10 from inside the Railway container and 10/10 from the box — and on Railway, waiting the FULL
+   * advertised Retry-After (43s, 62s, 63s) still returned 429 with the header resetting to ~59. There
+   * is no key to buy, and Railway's own static-outbound-IP add-on is explicitly SHARED with other
+   * customers, so it is not a fix.
+   *
+   * Empty = call DexScreener directly. Correct for the BOX, whose IP is not refused. Set it on the
+   * FEED, whose IP is. Both values are right; the deployments genuinely differ.
+   *
+   * The proxy applies cipherfi's own per-host throttle to these requests, so borrowing that IP does
+   * not make us a second unmanaged client on it. Base URL only, no path: e.g. https://snipurr.fun
+   */
+  DEX_PROXY_URL: z.string().default(''),
+  /** Shared secret for DEX_PROXY_URL. The proxy refuses the request without it. */
+  DEX_PROXY_KEY: z.string().default(''),
   // How often (ms) to refresh live prices from DexScreener.
   PRICE_REFRESH_MS: num(15000),
   // When DexScreener has not indexed a token's pair yet, read the price straight

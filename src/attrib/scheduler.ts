@@ -43,6 +43,10 @@ export interface SchedulerStats {
   ratePerSec: number;
   /** Calls dropped at the front of the queue because their deadline had passed. */
   expired: number;
+  /** Dispatches split by lane, so live work and speculative work are separable. */
+  dispatchedByPriority: Record<SchedulerPriority, number>;
+  /** Dispatches split by the caller that asked, highest first. See `dispatchedByLabel`. */
+  dispatchedByCaller: Record<string, number>;
 }
 
 /** A queued call whose caller's deadline elapsed before the bucket reached it. */
@@ -79,6 +83,8 @@ interface QueuedCall {
   /** Wall-clock time after which dispatching this call is pointless. */
   expiresAt: number | null;
   queuedAt: number;
+  priority: SchedulerPriority;
+  label?: string;
 }
 
 const realSleep = (ms: number): Promise<void> =>
@@ -105,6 +111,19 @@ export class RpcScheduler {
   private cooldownUntil = 0;
 
   private dispatched = 0;
+  /**
+   * Dispatches attributed to the caller that asked for them.
+   *
+   * The bucket is keyed by HOST, so when several subsystems share one endpoint the aggregate is all
+   * this reported. [2026-08-09] the feed showed 3,423 calls to one Alchemy host in nine minutes and
+   * nothing here could say how much was pool pricing, attribution, or the listener — so the fix could
+   * only be guessed at. `dispatched` alone answers "how much"; these answer "by whom", which is the
+   * question that picks the fix.
+   */
+  private readonly dispatchedByPriority: Record<SchedulerPriority, number> = {
+    live: 0, normal: 0, background: 0,
+  };
+  private readonly dispatchedByLabel = new Map<string, number>();
   private queueDepth = 0;
   private peakQueueDepth = 0;
   private throttled = 0;
@@ -152,7 +171,13 @@ export class RpcScheduler {
    * occupying the host. Counting only the waiting ones would report a depth of
    * zero at exactly the moment the host is most loaded.
    */
-  async run<T>(fn: () => Promise<T>, priority: SchedulerPriority = 'normal', deadlineMs?: number): Promise<T> {
+  async run<T>(
+    fn: () => Promise<T>,
+    priority: SchedulerPriority = 'normal',
+    deadlineMs?: number,
+    /** Who is asking, for cost attribution. See `dispatchedByLabel`. */
+    label?: string,
+  ): Promise<T> {
     this.queueDepth += 1;
     if (this.queueDepth > this.peakQueueDepth) this.peakQueueDepth = this.queueDepth;
     const queuedAt = this.now();
@@ -163,6 +188,8 @@ export class RpcScheduler {
         reject,
         expiresAt: deadlineMs != null && deadlineMs > 0 ? queuedAt + deadlineMs : null,
         queuedAt,
+        priority,
+        label,
       });
       void this.drain();
     });
@@ -224,6 +251,10 @@ export class RpcScheduler {
           continue;
         }
         this.dispatched += 1;
+        this.dispatchedByPriority[job.priority] += 1;
+        if (job.label) {
+          this.dispatchedByLabel.set(job.label, (this.dispatchedByLabel.get(job.label) ?? 0) + 1);
+        }
         void job.fn().then(job.resolve, job.reject).finally(() => {
           this.queueDepth -= 1;
         });
@@ -291,6 +322,10 @@ export class RpcScheduler {
       cooling: this.cooldownUntil > this.now(),
       ratePerSec: this.rate,
       expired: this.expired,
+      dispatchedByPriority: { ...this.dispatchedByPriority },
+      dispatchedByCaller: Object.fromEntries(
+        [...this.dispatchedByLabel.entries()].sort((a, b) => b[1] - a[1]),
+      ),
     };
   }
 }

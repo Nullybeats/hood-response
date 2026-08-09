@@ -55,7 +55,7 @@ async function ethCall(
       } finally {
         clearTimeout(t);
       }
-    }, priority);
+    }, priority, undefined, 'token-metadata');
   } catch (err) {
     logRpcThrow({ op: 'metadata', url: rpcUrl, method: 'eth_call' }, err);
     return null;

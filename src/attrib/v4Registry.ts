@@ -80,7 +80,7 @@ export class V4PoolRegistry {
         const body = await res.json() as { result?: T; error?: unknown };
         if (body.error) { logRpcError(ctx, body.error); return null; }
         return body.result ?? null;
-      }, 'normal');
+      }, 'normal', undefined, 'v4-registry');
     } catch (err) {
       logRpcThrow({ op: 'v4-pool-registry', url: this.rpcUrl, method }, err);
       return null;

@@ -473,7 +473,7 @@ export class PriceOracle {
     // Last-resort display fallback. Failure here returns unknown; it never
     // changes wallet-trade proof or discards a durable candidate.
     try {
-      const res = await this.fetchDexScreener(`https://api.dexscreener.com/latest/dex/tokens/${config.SNIPER_WETH}`);
+      const res = await this.fetchDexScreener(`/latest/dex/tokens/${config.SNIPER_WETH}`);
       if (!res.ok) return null;
       const json = (await res.json()) as { pairs?: DexPair[] };
       const chain = config.DEXSCREENER_CHAIN.toLowerCase();
@@ -838,7 +838,7 @@ export class PriceOracle {
     const chain = config.DEXSCREENER_CHAIN.toLowerCase();
     try {
       const res = await this.fetchDexScreener(
-        `https://api.dexscreener.com/latest/dex/tokens/${addresses.join(',')}`,
+        `/latest/dex/tokens/${addresses.join(',')}`,
       );
       if (!res.ok) {
         if (res.status === 429) this.debugCounters.dex429++;
@@ -955,7 +955,7 @@ export class PriceOracle {
       // `latest/dex/tokens` fan-out route. It returns the same pair records,
       // but only for the chain we actually observe.
       const res = await this.fetchDexScreener(
-        `https://api.dexscreener.com/token-pairs/v1/${encodeURIComponent(chain)}/${address}`,
+        `/token-pairs/v1/${encodeURIComponent(chain)}/${address}`,
       );
       if (!res.ok) {
         if (res.status === 429) this.debugCounters.dex429++;
@@ -1016,7 +1016,30 @@ export class PriceOracle {
    * lane with zero refusals while Railway's egress is held to roughly one request per minute — so
    * any number we hardcode is wrong somewhere. See DEX_429_COOLDOWN_MS for the measurement.
    */
-  private async fetchDexScreener(url: string): Promise<Response> {
+  /**
+   * Where DexScreener requests actually go, and with what credential.
+   *
+   * When DEX_PROXY_URL is set the request is forwarded by cipherfi from an egress IP DexScreener will
+   * answer (see the env doc). The proxy is a transparent pass-through — same paths, same bodies,
+   * status and `Retry-After` preserved — so everything downstream of here, including the rate-limit
+   * discipline below, is identical either way. That is deliberate: the proxy must not become a second
+   * code path whose failure modes are untested.
+   */
+  private dexEndpoint(path: `/${string}`): { url: string; headers: Record<string, string> } {
+    const base = config.DEX_PROXY_URL.replace(/\/+$/, '');
+    if (!base) return { url: `https://api.dexscreener.com${path}`, headers: {} };
+    // Path mapping is explicit rather than a blind prefix swap, so the proxy's allowlisted routes and
+    // ours cannot drift into a 404 that would read as "this token has no pairs".
+    const proxied = path.startsWith('/latest/dex/tokens/')
+      ? `/api/dexproxy/tokens/${path.slice('/latest/dex/tokens/'.length)}`
+      : path.startsWith('/token-pairs/v1/')
+        ? `/api/dexproxy/token-pairs/${path.slice('/token-pairs/v1/'.length)}`
+        : null;
+    if (!proxied) return { url: `https://api.dexscreener.com${path}`, headers: {} };
+    return { url: `${base}${proxied}`, headers: { 'x-dex-proxy-key': config.DEX_PROXY_KEY } };
+  }
+
+  private async fetchDexScreener(path: `/${string}`): Promise<Response> {
     let release: () => void = () => undefined;
     const previous = this.dexTail;
     this.dexTail = new Promise<void>((resolve) => { release = resolve; });
@@ -1031,7 +1054,8 @@ export class PriceOracle {
       const timeout = setTimeout(() => ctrl.abort(), 6_000);
       try {
         this.debugCounters.dexRequests += 1;
-        const res = await fetch(url, { signal: ctrl.signal });
+        const { url, headers } = this.dexEndpoint(path);
+        const res = await fetch(url, { signal: ctrl.signal, headers });
         if (res.status === 429) {
           const cooldown = this.retryAfterMs(res);
           this.dexNextAt = Date.now() + cooldown;

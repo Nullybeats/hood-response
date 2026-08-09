@@ -79,7 +79,7 @@ class ScheduledJsonRpcProvider extends JsonRpcProvider {
       // by a gate that gives up at `maxPendingMs`; one that surfaces from the
       // queue minutes later cannot be used by anybody, and dispatching it just
       // pushes the next live read further back. Expiring it returns the budget.
-      return await sched.run(() => super._send(payload), 'normal', config.PRICE_RPC_DEADLINE_MS);
+      return await sched.run(() => super._send(payload), 'normal', config.PRICE_RPC_DEADLINE_MS, 'pool-price');
     } catch (err) {
       // Ethers wraps HTTP failures. Preserve its error for callers, but make a
       // provider-level 429 cool the same shared bucket as every other caller.

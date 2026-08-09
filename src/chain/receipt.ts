@@ -39,7 +39,7 @@ async function rpc<T>(method: string, params: unknown[]): Promise<T | null> {
         return null;
       }
       return body.result ?? null;
-    }, 'live');
+    }, 'live', undefined, 'receipt');
   } catch (err) {
     logRpcThrow({ op: 'receipt', url: config.CHAIN_HTTP_URL, method }, err);
     return null;

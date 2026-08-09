@@ -348,7 +348,7 @@ export class AttributionShadow {
           return { ok: false as const, kind: 'rpc_jsonrpc_error' as const, detail: 'json-rpc error' };
         }
         return { ok: true as const, value: body.result as T };
-      }, 'background');
+      }, 'background', undefined, 'attrib-runtime-a');
     } catch (err) {
       logRpcThrow({ op: 'attrib-enrich', url, method }, err);
       return { ok: false, kind: 'rpc_transport_error', detail: String(err).slice(0, 160) };
@@ -423,7 +423,7 @@ export class AttributionShadow {
           return [];
         }
         return nativeDeltasFromCallTrace(body.result, wallet);
-      }, 'background');
+      }, 'background', undefined, 'attrib-runtime-b');
     } catch (err) {
       logRpcThrow({ op: 'attrib-trace', url, method: 'debug_traceTransaction' }, err);
       this.ledger.recordFailure({

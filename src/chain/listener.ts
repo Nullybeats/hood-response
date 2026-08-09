@@ -739,7 +739,7 @@ export class HttpPollingChainListener implements ChainListener {
         } finally {
           clearTimeout(t);
         }
-      }, 'live');
+      }, 'live', undefined, 'listener-logs');
     } catch (err) {
       logRpcThrow(ctx, err);
       return null;

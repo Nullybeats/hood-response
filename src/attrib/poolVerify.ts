@@ -154,7 +154,7 @@ export function makeEthCall(rpcUrl: string): EthCall {
       logRpcThrow({ op: 'pool-verify', url: rpcUrl, method: 'eth_call' }, err);
       return { ok: false, detail: redact(String(err)).slice(0, 120) };
     }
-    }, 'background');
+    }, 'background', undefined, 'attrib-pool-verify');
 }
 
 /**

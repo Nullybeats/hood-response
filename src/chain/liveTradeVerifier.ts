@@ -267,7 +267,7 @@ export class LiveTradeVerifier {
           return null;
         }
         return body.result ?? null;
-      }, priority);
+      }, priority, undefined, 'live-trade-verify');
     } catch (err) {
       logRpcThrow({ op: 'live-trade-verify', url, method }, err);
       return null;
