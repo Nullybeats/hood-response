@@ -164,7 +164,7 @@ export const DASHBOARD_V2_HTML = `<!doctype html>
       </div>
 
       <div class="card">
-        <h2 title="Every signal followed to an outcome, one row each — CALLED and CONTROL together, which is why this is not titled 'call record'. A CONTROL row matched no lane and was never called; it is tracked so the lanes can be proven wrong, because 'the rules pick winners' is unfalsifiable without the ones they turned down. This tracks exactly three things: ENTRY, PEAK and NOW. It does NOT model an exit — when a position actually closes is decided by your own trailing stop / take-profit config, which is per-operator and can change mid-position. Peak is the honest measure because it does not depend on when you happened to look.">signal record — called AND control</h2>
+        <h2 title="Every signal followed to an outcome, one row each — CALLED and CONTROL together, which is why this is not titled 'call record'. A CONTROL row matched no lane and was never called; it is tracked so the lanes can be proven wrong, because 'the rules pick winners' is unfalsifiable without the ones they turned down. Each row shows the market cap AT THE CALL and NOW, then the move from that call. Percentages are always measured from the call, never all-time — but the two caps are what let you check that, because a huge percentage off a launch-seed entry price looks identical to a real run until you can see it went \$237 to \$80k. It does NOT model an exit — when a position actually closes is decided by your own trailing stop / take-profit config, which is per-operator and can change mid-position. Peak is the honest measure because it does not depend on when you happened to look.">signal record — called AND control</h2>
         <div class="tabs" id="calltabs">
           <button class="tab" data-c="matched" aria-selected="true">called</button>
           <button class="tab" data-c="control">control</button>
@@ -363,11 +363,17 @@ async function load() {
             '<span>' + glyph(r.eventType) + '</span>',
             '<span class="sym">' + esc(r.tokenSymbol) + '</span>',
             '<span class="sc">' + (r.score == null ? '—' : r.score) + '</span>',
-            '<span class="sc">' + mcap(r.entryMarketCap) + '</span>',
+            // ENTRY cap -> cap NOW. The percentages alone were unfalsifiable on screen: a row reading
+            // "+33,682%" is indistinguishable from an entry price captured at a launch seed until you
+            // can see it went $237 -> $80k. That artifact is exactly what the $25k floor rejects, and
+            // every one of those rows is in the control group for that reason — but nothing on the
+            // row said so. An em dash when the current cap could not be established; never derived from the
+            // price ratio, which would assume a fixed supply and look identical to a measured one.
+            '<span class="sc">' + mcap(r.entryMarketCap) + ' → ' + mcap(r.lastMarketCap) + '</span>',
             '<span class="why">' + (unpriced
               ? 'never quotable — no entry price, excluded from the averages'
-              : 'now <b class="' + sign(r.lastGainPct) + '">' + pct(r.lastGainPct) + '</b>' +
-                ' · peak <b class="' + sign(r.maxGainPct) + '">' + pct(r.maxGainPct) + '</b>' +
+              : '<b class="' + sign(r.lastGainPct) + '">' + pct(r.lastGainPct) + '</b> from call' +
+                ' · peak <b class="' + sign(r.maxGainPct) + '">' + pct(r.maxGainPct) + '</b> since call' +
                 // "tracking ended", never "closed" — when a POSITION closes is the operator's
                 // trailing stop / take-profit, not ours. This flag only says we stopped sampling.
                 (r.closed ? ' · tracking ended (' + esc(r.closedReason || 'window') + ')' : ' · tracking') +

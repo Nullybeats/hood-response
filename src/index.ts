@@ -313,6 +313,13 @@ async function main(): Promise<void> {
         {
           priceOf: (token) => price.priceOf(token),
           refreshNow: (token) => price.refreshOnChainNow(token),
+          // Measured, never derived: `price.marketCap` needs a real price AND a contract-verified
+          // supply, and returns null without both. A cap inferred from the price ratio would assume
+          // a fixed supply and be indistinguishable on screen from one we actually established.
+          marketCapOf: (token) => {
+            const t = store.tokensByAddress.get(token.toLowerCase());
+            return t ? price.marketCap(t) : null;
+          },
         },
         ledgerOptionsFromConfig(),
       )

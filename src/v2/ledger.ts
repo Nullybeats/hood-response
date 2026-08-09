@@ -43,6 +43,16 @@ export interface LedgerPrice {
   priceOf(token: string): number | null;
   /** Fetch a fresh price now. May reject; the caller treats that as "no sample". */
   refreshNow(token: string): Promise<unknown>;
+  /**
+   * Current market cap, or null when it cannot be established.
+   *
+   * Recorded alongside the price so a row can show what the coin is worth NOW next to what it was
+   * worth at the call. Without it, "+33,682%" is unfalsifiable on screen: the reader cannot tell a
+   * real run from an entry price captured at a launch seed, which is precisely the artifact the
+   * $25k floor exists to reject. Deliberately MEASURED and not derived from the price ratio — a
+   * derived cap would silently assume a fixed supply and would look identical to a real one.
+   */
+  marketCapOf?(token: string): number | null;
 }
 
 /** One evaluated event, followed until it closes. */
@@ -102,6 +112,8 @@ export interface LedgerRecord {
 
   lastPrice: number | null;
   lastGainPct: number;
+  /** Market cap at the last sample. Null when it could not be established — never derived. */
+  lastMarketCap: number | null;
   maxPrice: number | null;
   maxGainPct: number;
   maxGainAt: number;
@@ -329,6 +341,7 @@ export class OutcomeLedger {
       entryDelayMs: entryPrice != null ? 0 : null,
       lastPrice: entryPrice,
       lastGainPct: 0,
+      lastMarketCap: input.marketCap,
       maxPrice: entryPrice,
       maxGainPct: 0,
       maxGainAt: now,
@@ -439,6 +452,8 @@ export class OutcomeLedger {
       }
       r.lastPrice = p;
       r.lastGainPct = gainPct(r.entryPrice, p);
+      const cap = this.price.marketCapOf?.(r.token) ?? null;
+      if (cap != null && cap > 0) r.lastMarketCap = cap;
       if (r.maxPrice == null || p > r.maxPrice) {
         r.maxPrice = p;
         r.maxGainPct = gainPct(r.entryPrice, p);
@@ -577,6 +592,9 @@ export class OutcomeLedger {
         if (r.matched === undefined) r.matched = (r.lanes?.length ?? 0) > 0;
         if (!r.cohortWallets) r.cohortWallets = r.wallet ? [r.wallet] : [];
         if (!r.walletGradeAtFire) r.walletGradeAtFire = 'U';
+        // Added after these were written. Seed from the entry cap rather than null so a restored row
+        // shows a number until its next sample replaces it with a measured one.
+        if (r.lastMarketCap === undefined) r.lastMarketCap = r.entryMarketCap;
         this.records.set(r.id, r);
       }
       logger.info({ loaded: this.records.size, retired }, 'v2 ledger: restored snapshot');
