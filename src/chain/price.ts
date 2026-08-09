@@ -98,6 +98,14 @@ const DEX_BATCH_SIZE = 8;
 const MAX_BACKGROUND_QUEUE = 1_500;
 /** Cheap batch retries before a token falls through to the (expensive) pool read. */
 const DEX_MISS_RETRIES = 2;
+/**
+ * How far a pool read may differ from a live indexer price before it is refused.
+ *
+ * Generous on purpose: a memecoin genuinely moving 5x in a minute is ordinary here, and both sources
+ * would move together. This only catches the case where they DISAGREE about the same moment, which
+ * is a reading error, not a rally.
+ */
+const POOL_DISAGREEMENT_MAX = 20;
 /** Shared-IP friendly spacing for DexScreener's public endpoint. */
 const DEX_MIN_INTERVAL_MS = 1_500;
 const DEX_429_COOLDOWN_MS = 60_000;
@@ -502,7 +510,7 @@ export class PriceOracle {
    * undiagnosable without knowing whether the sweep is running, how deep the
    * queue is, and whether DexScreener is throttling — each a different fix.
    */
-  private readonly debugCounters = { dex429: 0, dexErrors: 0, lastSweepAt: 0 };
+  private readonly debugCounters = { dex429: 0, dexErrors: 0, lastSweepAt: 0, poolDisagreements: 0 };
 
   debug(): Record<string, unknown> {
     return {
@@ -512,6 +520,7 @@ export class PriceOracle {
       lastSweepAt: this.debugCounters.lastSweepAt || null,
       lastSweepAgeMs: this.debugCounters.lastSweepAt ? Date.now() - this.debugCounters.lastSweepAt : null,
       dex429Count: this.debugCounters.dex429,
+    poolDisagreements: this.debugCounters.poolDisagreements,
       dexErrorCount: this.debugCounters.dexErrors,
       // Read from the constants, not restated. This said `1` for as long as MAX_PER_TICK was 1, so
       // the number that would have exposed the starvation was itself a literal nobody had to update.
@@ -849,6 +858,28 @@ export class PriceOracle {
     if (!pool) return;
     const priceUsd = pool.priceEth * ethUsd;
     if (!Number.isFinite(priceUsd) || priceUsd <= 0) return;
+    // DISAGREEMENT GUARD. When the indexer already has a live price for this token and the pool read
+    // is wildly different, one of the two is wrong and we cannot tell which — so the indexer wins
+    // (it prices the deepest pair; a cold pool discovery can land on a shallow one) and the
+    // disagreement is COUNTED rather than swallowed.
+    //
+    // [verified 2026-08-09] Eight records took pool prices 21x-334x below the truth on two-to-three
+    // week old pairs with real liquidity, and every downstream number was computed from them. The
+    // error ran LOW there, so the $25k floor rejected them — the safe direction. Inverted, it is the
+    // ANOA incident this repo already paid for: a fabricated cap sailing through the one floor whose
+    // only job was to stop it. A market cap is only as true as its price.
+    const prior = this.fresh(address);
+    if (prior && prior.source === 'dexscreener' && prior.priceUsd > 0) {
+      const ratio = priceUsd > prior.priceUsd ? priceUsd / prior.priceUsd : prior.priceUsd / priceUsd;
+      if (ratio > POOL_DISAGREEMENT_MAX) {
+        this.debugCounters.poolDisagreements++;
+        logger.warn(
+          { token: address, venue: pool.venue, poolPriceUsd: priceUsd, indexerPriceUsd: prior.priceUsd, ratio: Math.round(ratio) },
+          'price oracle: pool read disagrees with the indexer — keeping the indexer price',
+        );
+        return;
+      }
+    }
     logger.debug(
       { token: address, venue: pool.venue, priceUsd },
       'price oracle: priced from chain (no DexScreener pair)',

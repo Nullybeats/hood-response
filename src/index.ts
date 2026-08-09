@@ -305,14 +305,20 @@ async function main(): Promise<void> {
   const warmQuote = (token: string): void => {
     void price.refreshNow(token.toLowerCase()).catch(() => null);
   };
-  // Follows matched decisions to an outcome. Quotes go through the on-chain path
-  // for the same reason the shadow's warmQuote does: these are brand-new pairs,
-  // and the indexer is the slow, rate-limited way to learn about them.
+  // Follows matched decisions to an outcome.
+  //
+  // INDEXER FIRST, like the decision path. This sampled pool-first on the argument that these are
+  // brand-new pairs and the indexer is slow — true when it ran one token per 15s, false now that it
+  // batches. And the cost of being wrong here is not latency, it is a WRONG NUMBER: [verified
+  // 2026-08-09] eight records took pool-derived entry prices 21x-334x below the real price, on coins
+  // whose pairs were two to three weeks old with $26k-$56k of liquidity, producing outcomes reading
+  // up to +33,682% that were pure mispricing. `refreshNow` still falls through to the pool when no
+  // pair is indexed, so the brand-new-coin case this was built for is unaffected.
   const v2Ledger = config.V2_LEDGER_ENABLED
     ? new OutcomeLedger(
         {
           priceOf: (token) => price.priceOf(token),
-          refreshNow: (token) => price.refreshOnChainNow(token),
+          refreshNow: (token) => price.refreshNow(token),
           // Measured, never derived: `price.marketCap` needs a real price AND a contract-verified
           // supply, and returns null without both. A cap inferred from the price ratio would assume
           // a fixed supply and be indistinguishable on screen from one we actually established.

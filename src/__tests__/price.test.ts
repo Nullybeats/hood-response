@@ -219,3 +219,61 @@ describe('PriceOracle batched refresh', () => {
     expect((oracle.debug() as { dex429Count: number }).dex429Count).toBeGreaterThan(0);
   });
 });
+
+/**
+ * A market cap is only as true as its price, and the $25k floor is the one threshold everything in
+ * this system leans on.
+ *
+ * [verified 2026-08-09] Eight ledger records took pool-derived prices 21x-334x BELOW the truth, on
+ * pairs two to three weeks old carrying $26k-$56k of liquidity, and produced outcomes reading up to
+ * +33,682% that were pure mispricing. The error ran low there, so the floor rejected them — the safe
+ * direction. Inverted, it is the ANOA incident this repo already paid for: a fabricated cap sailing
+ * through the one floor whose only job was to stop it.
+ */
+describe('PriceOracle pool/indexer disagreement', () => {
+  const T = '0xccc0000000000000000000000000000000000003';
+
+  const dexAt = (priceUsd: string) => ({
+    ok: true,
+    json: async () => ({
+      pairs: [{
+        chainId: 'robinhood', dexId: 'uniswap', pairAddress: '0xp',
+        baseToken: { address: T, symbol: 'REAL' },
+        priceUsd, priceNative: '0.0004', marketCap: 100_000, liquidity: { usd: 50_000 },
+      }],
+    }),
+  });
+
+  it('keeps the indexer price when a pool read disagrees wildly', async () => {
+    const oracle = new PriceOracle([]);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(dexAt('1')));
+    await oracle.refreshNow(T);
+    expect(oracle.priceOf(T)).toBe(1);
+
+    // A pool that would price it 300x lower — the observed failure shape.
+    const pools = { enabled: true, priceEthOf: async () => ({ priceEth: 1e-9, venue: 'v4' }) };
+    Object.defineProperty(oracle, 'pools', { value: pools, configurable: true });
+    Object.defineProperty(oracle, 'ensureEthUsd', { value: async () => 3_000, configurable: true });
+    await (oracle as unknown as { fetchFromPool: (a: string) => Promise<void> }).fetchFromPool(T);
+
+    // Unchanged, and the disagreement is counted rather than swallowed.
+    expect(oracle.priceOf(T)).toBe(1);
+    expect((oracle.debug() as { poolDisagreements: number }).poolDisagreements).toBe(1);
+  });
+
+  /** The guard must not fire on ordinary movement, or it becomes a second outage. */
+  it('accepts a pool read that merely moved, rather than disagreeing', async () => {
+    const oracle = new PriceOracle([]);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(dexAt('1')));
+    await oracle.refreshNow(T);
+
+    // 3x — a real memecoin minute, well inside the band.
+    const pools = { enabled: true, priceEthOf: async () => ({ priceEth: 0.001, venue: 'v4' }) };
+    Object.defineProperty(oracle, 'pools', { value: pools, configurable: true });
+    Object.defineProperty(oracle, 'ensureEthUsd', { value: async () => 3_000, configurable: true });
+    await (oracle as unknown as { fetchFromPool: (a: string) => Promise<void> }).fetchFromPool(T);
+
+    expect(oracle.priceOf(T)).toBe(3);
+    expect((oracle.debug() as { poolDisagreements: number }).poolDisagreements).toBe(0);
+  });
+});
