@@ -34,6 +34,13 @@ export interface TxContext {
   /** The watched wallet as a 20-byte address, lower-cased. */
   wallet: string;
   txTo: string | null;
+  /**
+   * Who SENT the transaction, lower-cased. Required to attribute `nativeValueWei`: the top-level
+   * value is paid by `tx.from`, so crediting it to the watched wallet without this would let a
+   * third party's ETH prove OUR wallet bought something — a receipt that merely contains the
+   * wallet's token transfer is not evidence the wallet paid for it.
+   */
+  txFrom: string | null;
   selector: string | null;
   /** Top-level native value in wei. Does NOT include internal transfers. */
   nativeValueWei: string | null;

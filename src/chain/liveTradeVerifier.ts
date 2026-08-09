@@ -13,7 +13,7 @@ import { schedulerFor } from '../attrib/scheduler.js';
 
 type RawLog = { address?: string; topics?: string[]; data?: string; logIndex?: string | number };
 type RawReceipt = { status?: string; blockNumber?: string; logs?: RawLog[] } | null;
-type RawTx = { to?: string | null; input?: string; value?: string } | null;
+type RawTx = { from?: string; to?: string | null; input?: string; value?: string } | null;
 
 export interface LiveTradeVerdict {
   /** The old receipt rule, retained only for shadow reconciliation. */
@@ -94,6 +94,7 @@ function toContext(bundle: Bundle, transfer: DecodedTransfer, wallet: string, ve
     wallet: lc(wallet),
     walletTopic: addressToTopic(wallet).toLowerCase(),
     txTo: bundle.tx.to ? lc(bundle.tx.to) : null,
+    txFrom: bundle.tx.from ? lc(bundle.tx.from) : null,
     selector: bundle.tx.input?.slice(0, 10).toLowerCase() ?? null,
     nativeValueWei: bundle.tx.value ?? null,
     receiptStatus: bundle.receipt.status ?? null,

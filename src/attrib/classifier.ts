@@ -164,6 +164,10 @@ export function classifyTransaction(input: ClassifyInput): AttributionResult {
     ctx.nativeValueWei != null &&
     ctx.nativeValueWei !== '0' &&
     ctx.txTo != null &&
+    // The top-level value is paid by tx.from. Without this the watched wallet could be credited
+    // with a stranger's ETH whenever a batched transaction happens to contain its token transfer.
+    ctx.txFrom != null &&
+    lc(ctx.txFrom) === lc(ctx.wallet) &&
     (ctx.verifiedContracts?.has(lc(ctx.txTo)) ?? false);
   const traceNativeProven = deltas.some(
     (d) => d.source === 'trace_native' && BigInt(d.rawDelta) !== 0n,

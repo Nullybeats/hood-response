@@ -32,7 +32,9 @@ function xfer(): TxLogView {
 function ctx(logs: TxLogView[], over: Partial<TxContext> = {}): TxContext {
   return {
     txHash: transfer.txHash, logs, wallet: WALLET, walletTopic: addressToTopic(WALLET),
-    txTo: FORK_ENTRY, selector: '0x12345678', nativeValueWei: '500000000000000000', receiptStatus: '0x1',
+    // The wallet SENT this transaction — that is what makes its 0.5 ETH the wallet's payment
+    // rather than someone else's. Modelled explicitly because the whole native-leg proof rests on it.
+    txTo: FORK_ENTRY, txFrom: WALLET, selector: '0x12345678', nativeValueWei: '500000000000000000', receiptStatus: '0x1',
     verifiedContracts: new Set([FORK_ENTRY]), ...over,
   };
 }
@@ -46,6 +48,21 @@ describe('live V3/V4 verified-trade gate', () => {
     expect(verdict.legacyCandidate).toBe(true);
     expect(verdict.confirmed).toBe(true);
     expect(verdict.category).toBe('swap_v4_poolmanager');
+  });
+
+  /**
+   * The native leg is the ONLY payment proof on this chain — traces do not exist here
+   * (debug_traceTransaction returns -32601), so `tx.value` is all there is. That makes "whose
+   * value is it?" load-bearing: a batched transaction can carry our wallet's token transfer while
+   * a stranger pays. Without the sender check that reads as our wallet buying.
+   */
+  it('refuses to credit a native payment made by someone other than the watched wallet', () => {
+    const verdict = verifiedTransferVerdict(ctx([
+      xfer(),
+      { address: POOL_MANAGER, topic0: V4_SWAP_TOPIC, topic1: POOL_ID, topic2: addressToTopic(FORK_ENTRY), topic3: null, data: '0x', logIndex: 2 },
+    ], { txFrom: OTHER }), transfer, 'BUY', true);
+    expect(verdict.legacyCandidate).toBe(true);
+    expect(verdict.confirmed).toBe(false);
   });
 
   it('fails closed when the trigger transfer does not agree with the wallet net exchange', () => {

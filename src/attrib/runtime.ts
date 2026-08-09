@@ -525,6 +525,7 @@ export class AttributionShadow {
         wallet: wallet.toLowerCase(),
         walletTopic: addressToTopic(wallet).toLowerCase(),
         txTo: tx.value.to?.toLowerCase() ?? null,
+        txFrom: tx.value.from?.toLowerCase() ?? null,
         selector: tx.value.input?.slice(0, 10).toLowerCase() ?? null,
         nativeValueWei: tx.value.value ?? null,
         receiptStatus: receipt.value.status ?? null,
