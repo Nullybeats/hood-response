@@ -682,6 +682,12 @@ async function main(): Promise<void> {
     pendingSignals.restore(feedState.pendingSignals);
     logger.info({ candidates: feedState.pendingSignals.length }, 'signal retry queue: restored pending candidates');
   }
+  if (feedState?.pendingV2?.length) {
+    // `savedAt` is how the downtime is measured, so a deploy does not spend the gate's patience on
+    // time nobody was looking. A snapshot with no savedAt forgives nothing, which is the safe way to
+    // be wrong: worst case a stale sheet blocks immediately, exactly as it does today.
+    v2Shadow.restorePending(feedState.pendingV2, feedState.savedAt ? Date.now() - feedState.savedAt : 0);
+  }
   listener.start();
 
   // The chain head, off-meter. Independent of wallet activity by design: the
@@ -716,6 +722,7 @@ async function main(): Promise<void> {
       swaps: history.swaps,
       pendingMetadata: listener.pendingMetadata?.() ?? [],
       pendingSignals: pendingSignals.snapshot(),
+      pendingV2: v2Shadow.snapshotPending(),
     });
   };
   const feedStateTimer = config.FEED_STATE_PATH

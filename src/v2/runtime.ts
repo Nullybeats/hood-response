@@ -748,6 +748,49 @@ export class V2Shadow {
     return [...set];
   }
 
+  /**
+   * The sheets still waiting on a fact, for the feed snapshot.
+   *
+   * Bounded at the same 512 the loader accepts, newest first — if a deploy lands during a burst, the
+   * sheets most likely to still be resolvable are the recent ones.
+   */
+  snapshotPending(): { trade: SwapEvent; firstSeenAt: number; attempts: number }[] {
+    return [...this.pending]
+      .sort((a, b) => b.firstSeenAt - a.firstSeenAt)
+      .slice(0, 512)
+      .map((p) => ({ trade: p.trade, firstSeenAt: p.firstSeenAt, attempts: p.attempts }));
+  }
+
+  /**
+   * Put them back after a restart, with the downtime forgiven.
+   *
+   * `attempts` carries over untouched — that is how many times WE asked, and a restart does not earn
+   * a sheet a fresh budget. `firstSeenAt` is shifted forward by however long the process was down,
+   * because `pendingMs` is charged against the gate's 180s patience and a five-minute deploy would
+   * otherwise block every restored sheet the instant it came back — persisting the queue only to
+   * discard it on arrival, which is worse than not persisting it at all.
+   *
+   * A sheet from before the rules epoch is dropped rather than restored: it was decided under rules
+   * this build does not have, exactly as the ledger and the diary treat their own history.
+   */
+  restorePending(saved: readonly { trade: SwapEvent; firstSeenAt: number; attempts: number }[], downtimeMs: number): void {
+    const shift = Math.max(0, downtimeMs);
+    let restored = 0;
+    for (const p of saved) {
+      if (p.trade.timestamp != null && p.trade.timestamp < V2_RULES_EPOCH_MS) continue;
+      if (this.emitted.has(p.trade.txHash)) continue;
+      this.pending.push({
+        trade: p.trade,
+        firstSeenAt: Math.min(Date.now(), p.firstSeenAt + shift),
+        attempts: p.attempts,
+      });
+      restored += 1;
+    }
+    if (restored) {
+      logger.info({ restored, downtimeMs: shift }, 'v2: restored pending sheets from the feed snapshot');
+    }
+  }
+
   private drainPending(): void {
     if (this.pending.length === 0) return;
     const now = Date.now();

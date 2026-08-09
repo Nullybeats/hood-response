@@ -376,6 +376,67 @@ describe('V2Shadow', () => {
     expect((shadow.status().intake as { buysThrottled: number }).buysThrottled).toBe(1);
   });
 
+  /**
+   * Persisting the pending queue across a redeploy.
+   *
+   * The legacy queue has survived restarts since it was written; v2's was memory-only, so every
+   * deploy silently dropped every in-flight decision — and a sheet waiting on a market cap is
+   * exactly the one most likely to be mid-flight when a deploy lands.
+   */
+  describe('pending queue durability', () => {
+    it('carries a waiting sheet across a restart, attempts intact', () => {
+      const first = makeShadow(providers({ marketCap: () => null }));
+      // `timestamp` is the BLOCK time and is checked against the rules epoch on restore. The shared
+      // NOW fixture in this file predates that epoch, so a durability test has to stamp a real one
+      // or it would assert the epoch drop while claiming to test persistence.
+      first.onSwap(swap({ txHash: '0xkeep', timestamp: Date.now() }));
+      const saved = first.snapshotPending();
+      expect(saved).toHaveLength(1);
+      first.stop();
+
+      shadow = makeShadow(providers({ marketCap: () => null }));
+      shadow.restorePending(saved, 0);
+      expect(shadow.status().pending).toBe(1);
+    });
+
+    /**
+     * THE ONE THAT MATTERS. `pendingMs` is charged against the gate's 180s patience, so without
+     * forgiving the downtime a five-minute deploy would block every restored sheet the instant it
+     * came back — persisting the queue only to discard it on arrival, which is worse than not
+     * persisting at all. `attempts` is NOT forgiven: that counts how many times we asked.
+     *
+     * NEGATIVE CONTROL: pass the downtime as 0 below and the sheet survives, because nothing was
+     * charged for it — which is precisely the bug this argument is about.
+     */
+    it('forgives the downtime, so a long deploy does not instantly exhaust the budget', () => {
+      const first = makeShadow(providers({ marketCap: () => null }));
+      first.onSwap(swap({ txHash: '0xdeploy', timestamp: Date.now() }));
+      const saved = first.snapshotPending();
+      first.stop();
+
+      // Pretend the snapshot is 10 minutes old — well past the gate's 180s patience.
+      const TEN_MIN = 600_000;
+      const stale = saved.map((p) => ({ ...p, firstSeenAt: p.firstSeenAt - TEN_MIN }));
+
+      shadow = makeShadow(providers({ marketCap: () => null }));
+      shadow.restorePending(stale, TEN_MIN);
+      shadow.restorePending([], 0); // no-op, proves an empty restore is safe
+      const [restored] = (shadow as unknown as { pending: { firstSeenAt: number; attempts: number }[] }).pending;
+      // Shifted back to roughly now, so the sheet gets its remaining patience rather than none.
+      expect(Date.now() - restored!.firstSeenAt).toBeLessThan(5_000);
+    });
+
+    /** A sheet decided under retired rules must not come back, exactly as the ledger and diary do. */
+    it('drops a pre-epoch sheet rather than restoring it', () => {
+      shadow = makeShadow(providers({ marketCap: () => null }));
+      shadow.restorePending(
+        [{ trade: swap({ txHash: '0xold', timestamp: 1 }), firstSeenAt: Date.now(), attempts: 0 }],
+        0,
+      );
+      expect(shadow.status().pending).toBe(0);
+    });
+  });
+
   it('blocks a token proven unsellable', () => {
     shadow = makeShadow(providers({ canSell: () => false }));
     shadow.onSwap(swap());

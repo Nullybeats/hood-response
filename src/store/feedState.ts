@@ -78,6 +78,25 @@ export interface FeedStateSnapshot {
   /** Candidates are data, not alerts: restoring them retries verification but
    * never re-emits an alert that was already recorded. */
   pendingSignals?: PersistedSignalCandidate[];
+  /**
+   * v2 sheets still waiting on a fact.
+   *
+   * The legacy queue has survived a restart since it was written; v2's was memory-only, so every
+   * deploy silently dropped every in-flight decision — and we deploy often. A sheet waiting on a
+   * market cap is exactly the one most likely to be mid-flight when a deploy lands.
+   *
+   * Safe to restore for the same reason `pendingSignals` is: these are TRADES, not alerts. Replaying
+   * one re-enters evaluation, and the emit-once guard is keyed on txHash, so a decision already
+   * emitted cannot be emitted twice.
+   */
+  pendingV2?: PersistedV2Pending[];
+}
+
+/** One v2 sheet mid-flight: the trade, when we first saw it, and how many times we have asked. */
+export interface PersistedV2Pending {
+  trade: SwapEvent;
+  firstSeenAt: number;
+  attempts: number;
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> =>
@@ -132,6 +151,21 @@ function parseSignalCandidate(v: unknown): PersistedSignalCandidate | null {
     mode: v.mode,
     attempts: finiteNum(v.attempts) && v.attempts >= 0 ? Math.floor(v.attempts) : 0,
     nextAt: finiteNum(v.nextAt) ? v.nextAt : Date.now(),
+  };
+}
+
+function parseV2Pending(v: unknown): PersistedV2Pending | null {
+  if (!isObj(v) || !isObj(v.trade)) return null;
+  const t = v.trade as unknown as SwapEvent;
+  // The same three fields every downstream reader keys on. A sheet missing any of them could not be
+  // evaluated anyway, and restoring it would only produce a crash or a phantom.
+  if (typeof t.txHash !== 'string' || !/^0x[0-9a-f]{64}$/i.test(t.txHash)) return null;
+  if (typeof t.token !== 'string' || !/^0x[0-9a-f]{40}$/i.test(t.token)) return null;
+  if (typeof t.wallet !== 'string' || !/^0x[0-9a-f]{40}$/i.test(t.wallet)) return null;
+  return {
+    trade: t,
+    firstSeenAt: finiteNum(v.firstSeenAt) ? v.firstSeenAt : Date.now(),
+    attempts: finiteNum(v.attempts) && v.attempts >= 0 ? Math.floor(v.attempts) : 0,
   };
 }
 
@@ -191,6 +225,9 @@ export async function loadFeedState(path: string): Promise<FeedStateSnapshot | n
   const pendingSignals = Array.isArray(parsed.pendingSignals)
     ? parsed.pendingSignals.map(parseSignalCandidate).filter((x): x is PersistedSignalCandidate => x !== null).slice(0, 256)
     : [];
+  const pendingV2 = Array.isArray(parsed.pendingV2)
+    ? parsed.pendingV2.map(parseV2Pending).filter((x): x is PersistedV2Pending => x !== null).slice(0, 512)
+    : [];
 
   return {
     version: FEED_STATE_VERSION,
@@ -201,6 +238,7 @@ export async function loadFeedState(path: string): Promise<FeedStateSnapshot | n
     alerts,
     pendingMetadata,
     pendingSignals,
+    pendingV2,
   };
 }
 
