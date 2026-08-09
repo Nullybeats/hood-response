@@ -305,3 +305,213 @@ describe('PriceOracle pool/indexer disagreement', () => {
     expect((oracle.debug() as { poolDisagreements: number }).poolDisagreements).toBe(0);
   });
 });
+
+/**
+ * The rate-limit spiral, pinned.
+ *
+ * [verified 2026-08-09, probing from inside the Railway container] DexScreener's public endpoint
+ * refuses this egress IP and, critically, a request made WHILE the penalty is running RESETS it to a
+ * fresh ~60s. Ten probes 20s apart returned 0 successes, with Retry-After counting 55 -> 35 -> 15 and
+ * then jumping back to 57 exactly when it would have expired. The same probe from the box IP returned
+ * 10/10 200s and never sent the header at all.
+ *
+ * The old code paced from a flat 60s constant measured from when WE saw the 429 and ignored the header
+ * entirely, so it re-poked the window just before it opened, forever: dex429Count climbed ~1/min from
+ * boot and successful responses were approximately zero. These tests exist so that never returns.
+ */
+describe('PriceOracle DexScreener rate-limit discipline', () => {
+  const R = '0xddd0000000000000000000000000000000000004';
+  const S = '0xeee0000000000000000000000000000000000005';
+  const T2 = '0xfff0000000000000000000000000000000000006';
+  const U = '0x1110000000000000000000000000000000000007';
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  const limited = (retryAfter: string | null) => ({
+    ok: false,
+    status: 429,
+    headers: { get: (h: string) => (h.toLowerCase() === 'retry-after' ? retryAfter : null) },
+    json: async () => ({}),
+  });
+
+  it('honours Retry-After instead of its own constant', async () => {
+    const oracle = new PriceOracle([]);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(limited('30')));
+    vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(3_000);
+    vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue(null);
+
+    await oracle.refreshNow(R);
+
+    const d = oracle.debug() as { dexPenaltyMsRemaining: number };
+    // 30s from the header (+ grace), NOT the 60s fallback constant.
+    expect(d.dexPenaltyMsRemaining).toBeGreaterThan(25_000);
+    expect(d.dexPenaltyMsRemaining).toBeLessThan(40_000);
+  });
+
+  it('sends NOTHING while the penalty window is still shut', async () => {
+    const oracle = new PriceOracle([]);
+    const fetchMock = vi.fn().mockResolvedValue(limited('60'));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(3_000);
+    vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue(null);
+
+    await oracle.refreshNow(R);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Every subsequent caller, by every path, must be refused locally rather than on the wire.
+    await oracle.refreshNow(S);
+    oracle.requestRefresh(S);
+    await (oracle as unknown as { refresh: () => Promise<void> }).refresh();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((oracle.debug() as { dexSkippedRateLimited: number }).dexSkippedRateLimited).toBeGreaterThan(0);
+  });
+
+  it('resumes once the window reopens', async () => {
+    const oracle = new PriceOracle([]);
+    const fetchMock = vi.fn().mockResolvedValue(limited('1'));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(3_000);
+    vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue(null);
+
+    await oracle.refreshNow(R);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Negative control for the test above: the hold is time-based, not a permanent latch. Without
+    // this, a bug that never cleared dexPenaltyUntil would still pass "sends NOTHING while shut".
+    await new Promise((r) => setTimeout(r, 3_200));
+    await oracle.refreshNow(S);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('a throttled token still reads as pricing, and never at the head of the lane', async () => {
+    const oracle = new PriceOracle([]);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(limited('60')));
+    vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(3_000);
+    vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue(null);
+
+    await oracle.refreshNow(R);
+
+    // 'unavailable' would tell the UI and the ledger the coin has no price; it means we were refused.
+    expect(oracle.quoteState(R)).toBe('pricing');
+    // ...but it must sit in the BACKGROUND queue. At priority it cycled at the head forever, retried
+    // into a shut window while newly-seen tokens waited behind it.
+    const d = oracle.debug() as { priorityQueue: number; backgroundQueue: number };
+    expect(d.priorityQueue).toBe(0);
+    expect(d.backgroundQueue).toBe(1);
+  });
+
+  it('a bad Retry-After cannot wedge the lane or open it early', async () => {
+    for (const [header, lo, hi] of [
+      ['0', 55_000, 65_000],        // 0 means "no useful answer", not "send now"
+      ['-5', 55_000, 65_000],       // negative likewise falls back
+      ['99999', 115_000, 125_000],  // clamped to the 120s ceiling
+      [null, 55_000, 65_000],       // absent falls back to the constant
+    ] as [string | null, number, number][]) {
+      const oracle = new PriceOracle([]);
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(limited(header)));
+      vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(3_000);
+      vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue(null);
+
+      await oracle.refreshNow(R);
+
+      const ms = (oracle.debug() as { dexPenaltyMsRemaining: number }).dexPenaltyMsRemaining;
+      expect(ms, `retry-after=${header}`).toBeGreaterThan(lo);
+      expect(ms, `retry-after=${header}`).toBeLessThan(hi);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('a refusal buys at most one metered pool read, and the counters attribute it', async () => {
+    const oracle = new PriceOracle([]);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(limited('60')));
+    vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(3_000);
+    const pool = vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue(null);
+
+    // A full batch of speculative tokens, all refused in one request.
+    for (const a of [R, S, T2, U]) oracle.requestRefresh(a);
+    await (oracle as unknown as { refresh: () => Promise<void> }).refresh();
+
+    // It was 4. With the window permanently shut the "fallback" became the primary path, and 3
+    // batches a tick x 4 tokens x ~12 RPC calls each is how a refused indexer turned into ~213k
+    // metered Alchemy calls a day.
+    expect(pool.mock.calls.length).toBeLessThanOrEqual(1);
+    const d = oracle.debug() as { poolFallbackFromThrottle: number; dexRequests: number; dexOk: number };
+    expect(d.poolFallbackFromThrottle).toBeLessThanOrEqual(1);
+    // The denominator that made this diagnosable at all.
+    expect(d.dexRequests).toBe(1);
+    expect(d.dexOk).toBe(0);
+  });
+
+  it('keeps pricing priority tokens from the chain while the indexer is shut', async () => {
+    const oracle = new PriceOracle([]);
+    const fetchMock = vi.fn().mockResolvedValue(limited('60'));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(3_000);
+    vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue({
+      priceEth: 0.001, venue: 'v4', liquidity: 1n,
+      poolAddress: '0x0000000000000000000000000000000000000001', pairCreatedAt: 1_700_000_000_000,
+    });
+
+    // Shut the window.
+    await oracle.refreshNow(U);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // On the feed's egress IP the window is shut essentially all the time, so a sweep that merely
+    // waits for the indexer means a displayed row is NEVER priced. It must still reach the chain.
+    oracle.requestRefresh(R);
+    await (oracle as unknown as { refresh: () => Promise<void> }).refresh();
+
+    expect(oracle.priceOf(R)).toBe(3);
+    expect(oracle.sourceOf(R)).toBe('pool');
+    // ...without touching the indexer.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not spend metered reads on the speculative backlog while shut', async () => {
+    const oracle = new PriceOracle([]);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(limited('60')));
+    vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(3_000);
+    const pool = vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue(null);
+
+    await oracle.refreshNow(U);
+    const before = pool.mock.calls.length;
+
+    // Background queue only — nobody is deciding on these. The chain is not free.
+    const self = oracle as unknown as { queue: Set<string>; refresh: () => Promise<void> };
+    for (const a of [R, S, T2]) self.queue.add(a);
+    await self.refresh();
+
+    expect(pool.mock.calls.length).toBe(before);
+  });
+
+  it('does not start a second sweep while one is still in flight', async () => {
+    const oracle = new PriceOracle([]);
+    let release: (v: unknown) => void = () => undefined;
+    const gate = new Promise((r) => { release = r; });
+    const fetchMock = vi.fn().mockImplementation(async () => {
+      await gate;
+      return limited('60');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(PoolPriceReader.prototype, 'ethUsdFromUsdG').mockResolvedValue(3_000);
+    vi.spyOn(PoolPriceReader.prototype, 'priceEthOf').mockResolvedValue(null);
+
+    oracle.requestRefresh(R);
+    const refresh = () => (oracle as unknown as { refresh: () => Promise<void> }).refresh();
+    const first = refresh();
+    const second = refresh();
+    const third = refresh();
+
+    release(undefined);
+    await Promise.all([first, second, third]);
+
+    // Overlapping passes each appended a request to the serialized lane AND pulled tokens out of both
+    // queues into a local array, so those tokens appeared in NEITHER queue and quoteState() called
+    // them 'unavailable' while we were in fact holding them.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});

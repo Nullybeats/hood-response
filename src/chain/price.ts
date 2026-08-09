@@ -96,6 +96,15 @@ const DEX_BATCH_SIZE = 8;
  * only to the speculative sweep, oldest-first, so the backlog cannot crowd out live work again.
  */
 const MAX_BACKGROUND_QUEUE = 1_500;
+/**
+ * Only top the background queue up from the registry when it has drained below this.
+ *
+ * The cap alone did not stop the starvation: the queue simply sat AT 1,500 forever, because every
+ * tick refilled whatever the tick had drained. [verified 2026-08-09] the feed's backgroundQueue read
+ * 1476/1500 continuously against 12,463 tracked tokens. A ceiling bounds memory; this bounds
+ * ambition — the sweep finishes something before asking for more.
+ */
+const BACKGROUND_TOPUP_BELOW = 200;
 /** Cheap batch retries before a token falls through to the (expensive) pool read. */
 const DEX_MISS_RETRIES = 2;
 /**
@@ -108,7 +117,30 @@ const DEX_MISS_RETRIES = 2;
 const POOL_DISAGREEMENT_MAX = 20;
 /** Shared-IP friendly spacing for DexScreener's public endpoint. */
 const DEX_MIN_INTERVAL_MS = 1_500;
+/**
+ * Fallback cooldown when a 429 carries no `Retry-After`. Prefer the header.
+ *
+ * [verified 2026-08-09, from inside the Railway container] A request made WHILE the penalty is
+ * still running RESETS it to a fresh ~60s. Probing every 20s for 200s produced 0 successes and a
+ * `Retry-After` that counted 55 → 35 → 15 and then jumped back to 57 the moment it would have
+ * expired. The old behaviour — a flat 60s measured from when WE saw the 429, ignoring the header —
+ * re-poked the window just before it opened, forever: `dex429Count` climbed ~1/min from boot and
+ * successful responses were approximately zero.
+ *
+ * This is the same trap cipherfi already documented for GMGN and 1inch (`sources/throttle.ts`):
+ * retrying into a rate limit EXTENDS the ban. Never send inside the window.
+ */
 const DEX_429_COOLDOWN_MS = 60_000;
+/** Hard ceiling on a server-supplied cooldown, so a hostile/erroneous header cannot wedge the lane. */
+const DEX_429_MAX_COOLDOWN_MS = 120_000;
+/**
+ * Slack added to a server-supplied `Retry-After` before we send again.
+ *
+ * The header is whole seconds, so it is already rounded DOWN relative to the real window, and our
+ * clock is not theirs. Landing one request early costs a fresh 60s penalty, so the asymmetry is
+ * brutally one-sided: pay 2s to avoid a 60s reset.
+ */
+const DEX_429_GRACE_MS = 2_000;
 // Bound the caches on a long-running process (many discovered tokens).
 const MAX_CACHE = 5_000;
 /** On-chain supply backfills per refresh tick — 3 eth_calls each, so kept small. */
@@ -119,6 +151,8 @@ const MAX_SUPPLY_ATTEMPTS = 3;
 const LIVE_STALE_MS = 30 * 60_000;
 // How long a fetched ETH/USD reference rate stays usable.
 const ETH_USD_REF_TTL_MS = 5 * 60_000;
+/** Refresh the ETH/USD reference on its own clock, at 5x margin against its TTL. See start(). */
+const ETH_USD_KEEPALIVE_MS = 60_000;
 /** Plausibility band for an ETH/USD rate. Wide on purpose: this exists to reject a
  *  catastrophically wrong rate (the observed failures were $1.00 and $0.0089), not to
  *  second-guess the market. Widen it before ETH ever threatens either end. */
@@ -168,6 +202,10 @@ export class PriceOracle {
   /** One public-DexScreener request at a time; Railway shares this egress IP. */
   private dexTail: Promise<void> = Promise.resolve();
   private dexNextAt = 0;
+  /** True while a 429 penalty is running, so callers can skip instead of queueing into it. */
+  private dexPenaltyUntil = 0;
+  /** One refresh pass at a time — see refresh(). */
+  private refreshing = false;
   /** Consecutive batch responses that did not carry a token, so a permanently un-indexed
    *  one falls through to the pool instead of cycling at priority forever. */
   private readonly dexMisses = new Map<string, number>();
@@ -176,6 +214,7 @@ export class PriceOracle {
   /** Failed supply-read counts, so a hopeless contract is not retried forever. */
   private readonly supplyAttempts = new Map<string, number>();
   private timer: NodeJS.Timeout | null = null;
+  private ethUsdTimer: NodeJS.Timeout | null = null;
   /** Highest market cap seen for each token since this process started
    *  tracking it (not a true lifetime ATH — DexScreener doesn't expose one —
    *  but the best signal available without a paid data source). */
@@ -510,7 +549,24 @@ export class PriceOracle {
    * undiagnosable without knowing whether the sweep is running, how deep the
    * queue is, and whether DexScreener is throttling — each a different fix.
    */
-  private readonly debugCounters = { dex429: 0, dexErrors: 0, lastSweepAt: 0, poolDisagreements: 0 };
+  private readonly debugCounters = {
+    dex429: 0,
+    dexErrors: 0,
+    lastSweepAt: 0,
+    poolDisagreements: 0,
+    // A refusal count with no denominator is uninterpretable: 32 refusals could be a 3% failure rate
+    // at 40 req/min or a 100% failure rate at 1 req/min, and those need opposite fixes. It was the
+    // latter, and nothing in this object could say so.
+    dexRequests: 0,
+    dexOk: 0,
+    dexCooldownMsTotal: 0,
+    dexWaitMs: 0,
+    dexSkippedRateLimited: 0,
+    poolFallbackFromThrottle: 0,
+    poolFallbackFromNoPair: 0,
+  };
+  /** One log line per penalty window, not per refused request. */
+  private dexPenaltyLogged = false;
 
   debug(): Record<string, unknown> {
     return {
@@ -520,8 +576,17 @@ export class PriceOracle {
       lastSweepAt: this.debugCounters.lastSweepAt || null,
       lastSweepAgeMs: this.debugCounters.lastSweepAt ? Date.now() - this.debugCounters.lastSweepAt : null,
       dex429Count: this.debugCounters.dex429,
-    poolDisagreements: this.debugCounters.poolDisagreements,
+      poolDisagreements: this.debugCounters.poolDisagreements,
       dexErrorCount: this.debugCounters.dexErrors,
+      // The ratio is the diagnosis. dexOk === 0 with dexRequests > 0 means the window never opens.
+      dexRequests: this.debugCounters.dexRequests,
+      dexOk: this.debugCounters.dexOk,
+      dexCooldownMsTotal: this.debugCounters.dexCooldownMsTotal,
+      dexWaitMs: this.debugCounters.dexWaitMs,
+      dexSkippedRateLimited: this.debugCounters.dexSkippedRateLimited,
+      dexPenaltyMsRemaining: Math.max(0, this.dexPenaltyUntil - Date.now()),
+      poolFallbackFromThrottle: this.debugCounters.poolFallbackFromThrottle,
+      poolFallbackFromNoPair: this.debugCounters.poolFallbackFromNoPair,
       // Read from the constants, not restated. This said `1` for as long as MAX_PER_TICK was 1, so
       // the number that would have exposed the starvation was itself a literal nobody had to update.
       sweepPerTick: MAX_PER_TICK,
@@ -590,21 +655,58 @@ export class PriceOracle {
       this.debugCounters.lastSweepAt = Date.now();
       void this.refresh();
     }, config.PRICE_REFRESH_MS);
+    // Keep the ETH/USD reference alive on its own clock.
+    //
+    // This is a POSITION-MANAGEMENT dependency, not a display one. `ethUsdPrice()` returns null when
+    // no live ETH-quoted pair exists AND `ethUsdRef` is older than ETH_USD_REF_TTL_MS — and the
+    // sniper's exit loop throws 'on-chain exit quote unavailable' in that case, which skips the rug
+    // guard, trailing stop, recoup and take-profit for that position, silently, logged only to
+    // `lastExecutionError`. Until now `ethUsdRef` was refreshed only as a SIDE EFFECT of some other
+    // token happening to need a pool read, so a quiet period with an open position could disarm every
+    // exit on a funded wallet. Cheap to make unconditional: a few cached reads per interval.
+    if (this.pools.enabled) {
+      void this.ensureEthUsd();
+      this.ethUsdTimer = setInterval(() => {
+        void this.ensureEthUsd().catch(() => undefined);
+      }, ETH_USD_KEEPALIVE_MS);
+    }
   }
 
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    if (this.ethUsdTimer) clearInterval(this.ethUsdTimer);
+    this.ethUsdTimer = null;
   }
 
   private async refresh(): Promise<void> {
+    // ONE pass at a time.
+    //
+    // Without this, a pass blocked on a paced request kept getting a fresh caller every
+    // PRICE_REFRESH_MS. Each overlapping pass appended another request to the serialized dex lane AND
+    // pulled up to MAX_PER_TICK tokens out of both queues into a local array it was holding — tokens
+    // that then appear in NEITHER queue, so `quoteState()` reports them 'unavailable' and every
+    // consumer reads "this token has no price" when the truth is "we are sitting on it". The ledger
+    // and the sniper engine already guard their own loops this way; this one did not.
+    if (this.refreshing) return;
+    this.refreshing = true;
+    try {
+      await this.refreshOnce();
+    } finally {
+      this.refreshing = false;
+    }
+  }
+
+  private async refreshOnce(): Promise<void> {
     // Re-price known tokens that have gone stale, plus anything newly queued.
     //
-    // BOUNDED. This loop walks the whole registry, so on a long-running process it was re-adding
-    // thousands of historical tokens every 15s and the queue only ever grew — measured at 12,345
-    // entries against a drain of one. The speculative sweep now stops at a ceiling; the priority
-    // queue is untouched by it, because that is where tokens under an actual decision live.
-    if (this.store && this.queue.size < MAX_BACKGROUND_QUEUE) {
+    // BOUNDED, and only when there is room to actually drain. This loop walks the whole registry, so
+    // on a long-running process it was re-adding thousands of historical tokens every 15s and the
+    // queue only ever grew — measured at 12,345 entries against a drain of one, and still pinned at
+    // its ceiling with 12,463 tracked tokens on the feed. Topping up only when the backlog is nearly
+    // empty is what lets a pass finish: at the indexer's real allowance the registry is many hours
+    // per full sweep, and none of it is work anyone is waiting on.
+    if (this.store && this.priorityQueue.size === 0 && this.queue.size < BACKGROUND_TOPUP_BELOW) {
       for (const addr of this.store.tokensByAddress.keys()) {
         if (this.queue.size >= MAX_BACKGROUND_QUEUE) break;
         this.maybeEnqueue(addr);
@@ -618,6 +720,26 @@ export class PriceOracle {
     await this.drainSupplyQueue();
 
     if (this.priorityQueue.size === 0 && this.queue.size === 0) return;
+    // The indexer's window is shut. Do not send — that would only extend the penalty — and leave
+    // every token in its queue, position preserved, nothing pulled into limbo.
+    //
+    // But the sweep must not go fully dark: on the feed's egress IP the window is shut essentially
+    // all the time, so "wait for the indexer" would mean a displayed row is never priced at all. Take
+    // ONE priority token per tick to the chain instead. Priority only, and one at a time, because
+    // this is metered RPC and the speculative backlog is nobody's decision — that asymmetry is the
+    // whole reason the two queues are separate.
+    if (this.dexRateLimited()) {
+      this.debugCounters.dexSkippedRateLimited += 1;
+      const next = this.priorityQueue.values().next().value;
+      if (next !== undefined) {
+        this.priorityQueue.delete(next);
+        this.debugCounters.poolFallbackFromThrottle += 1;
+        await this.fetchFromPool(next).catch(() => undefined);
+        // Unpriced by the chain too: back to the queue so it reads 'pricing', not 'unavailable'.
+        if (!this.fresh(next)) this.queue.add(next);
+      }
+      return;
+    }
     // Priority first and in full-tick order: a token something is deciding on must never wait behind
     // the speculative backlog, which is exactly what the old flat slice allowed.
     const batch = [...this.priorityQueue, ...this.queue].slice(0, MAX_PER_TICK);
@@ -696,6 +818,14 @@ export class PriceOracle {
   private async fetchBatch(addresses: string[]): Promise<Set<string>> {
     const covered = new Set<string>();
     if (!addresses.length) return covered;
+    // Do not join the queue for a window we know is shut. Every request that lands inside the
+    // penalty resets it to a fresh ~60s, so a queue draining at DEX_MIN_INTERVAL_MS the moment the
+    // window opens is what kept it permanently closed: request 1 succeeds, request 2 arrives 1.5s
+    // later on a ~1/min allowance and re-locks the lane for everyone.
+    if (this.dexRateLimited()) {
+      this.debugCounters.dexSkippedRateLimited += 1;
+      return covered;
+    }
     const chain = config.DEXSCREENER_CHAIN.toLowerCase();
     try {
       const res = await this.fetchDexScreener(
@@ -704,7 +834,11 @@ export class PriceOracle {
       if (!res.ok) {
         if (res.status === 429) this.debugCounters.dex429++;
         else this.debugCounters.dexErrors++;
-        logger.warn({ batch: addresses.length, status: res.status }, 'price: DexScreener batch failed');
+        // A 429 already logged itself once per penalty window in fetchDexScreener. Logging it again
+        // per batch is what made a single shut window look like dozens of distinct failures.
+        if (res.status !== 429) {
+          logger.warn({ batch: addresses.length, status: res.status }, 'price: DexScreener batch failed');
+        }
         // FALL BACK TO THE CHAIN, exactly as the single-token path does.
         //
         // Without this the batch simply gave up and re-queued, and a 429 freezes the whole indexer
@@ -714,9 +848,13 @@ export class PriceOracle {
         // with $38k of liquidity. The chain has no shared quota and answers in ~150ms; a throttle on
         // a public indexer is not evidence a coin has no price.
         //
-        // Bounded to the first few: this runs inside a throttled moment, each pool read costs real
-        // RPC, and the rest are re-queued anyway.
-        for (const addr of addresses.slice(0, 4)) {
+        // Bounded to ONE: this runs inside a throttled moment, each pool read costs real RPC, and
+        // the rest are re-queued anyway. It was 4, which mattered once the window stopped reopening:
+        // with the indexer refusing everything, the "fallback" became the primary path and 3 batches
+        // a tick x 4 tokens x ~12 RPC calls each is how a shut indexer turned into ~213k metered
+        // Alchemy calls a day. The speculative sweep does not get to buy metered reads at all.
+        for (const addr of addresses.slice(0, 1)) {
+          this.debugCounters.poolFallbackFromThrottle += 1;
           await this.fetchFromPool(addr).catch(() => undefined);
           if (this.fresh(addr)) covered.add(addr);
         }
@@ -784,6 +922,15 @@ export class PriceOracle {
 
   private async fetchOne(address: string): Promise<void> {
     const chain = config.DEXSCREENER_CHAIN.toLowerCase();
+    // The window is shut and sending into it would extend it. Price this token from the chain, which
+    // has no shared quota — the answer a caller of refreshNow() actually needs — rather than spending
+    // the next reopening on one token and re-locking the lane for every other consumer.
+    if (this.dexRateLimited()) {
+      this.debugCounters.dexSkippedRateLimited += 1;
+      this.debugCounters.poolFallbackFromThrottle += 1;
+      await this.fetchFromPool(address).catch(() => undefined);
+      return;
+    }
     try {
       // This chain-specific endpoint avoids the globally throttled
       // `latest/dex/tokens` fan-out route. It returns the same pair records,
@@ -794,11 +941,22 @@ export class PriceOracle {
       if (!res.ok) {
         if (res.status === 429) this.debugCounters.dex429++;
         else this.debugCounters.dexErrors++;
-        logger.warn({ token: address, status: res.status }, 'price: DexScreener request failed');
+        // 429 already logged once for this penalty window in fetchDexScreener.
+        if (res.status !== 429) {
+          logger.warn({ token: address, status: res.status }, 'price: DexScreener request failed');
+        }
         // A public-indexer throttle is not evidence the pool lacks a price.
         // Establish it on chain immediately; Dex is optional enrichment.
+        this.debugCounters.poolFallbackFromThrottle += 1;
         await this.fetchFromPool(address).catch(() => undefined);
-        if (res.status === 429 && !this.fresh(address)) this.requestRefresh(address);
+        // Still unpriced: keep it queued so the display says 'pricing', not 'unavailable' — a
+        // throttle is not evidence a token has no price. But a 429 goes to the BACKGROUND queue, not
+        // the front: re-queueing at priority is what made one rate-limited token cycle at the head of
+        // the lane forever, retried into a shut window while newly-seen tokens waited behind it.
+        if (!this.fresh(address)) {
+          if (res.status === 429) this.queue.add(address);
+          else this.requestRefresh(address);
+        }
         return;
       }
       const json = (await res.json()) as DexTokenResponse;
@@ -815,6 +973,7 @@ export class PriceOracle {
       // pool itself rather than leaving the token priceless.
       if (!best) {
         logger.debug({ token: address, chain }, 'price: no matching DexScreener pair; trying on-chain pool');
+        this.debugCounters.poolFallbackFromNoPair += 1;
         await this.fetchFromPool(address);
         return;
       }
@@ -832,6 +991,11 @@ export class PriceOracle {
    * share one, so parallel fetches look like an abusive burst even when this
    * process is modest. A 429 pauses the entire lane instead of immediately
    * retrying the same failing pattern.
+   *
+   * The pause length comes from the SERVER (`Retry-After`), not from a constant of ours. The IP's
+   * real allowance differs by two orders of magnitude between deployments — the box sustains this
+   * lane with zero refusals while Railway's egress is held to roughly one request per minute — so
+   * any number we hardcode is wrong somewhere. See DEX_429_COOLDOWN_MS for the measurement.
    */
   private async fetchDexScreener(url: string): Promise<Response> {
     let release: () => void = () => undefined;
@@ -840,12 +1004,41 @@ export class PriceOracle {
     await previous;
     try {
       const delay = Math.max(0, this.dexNextAt - Date.now());
-      if (delay) await sleep(delay);
+      if (delay) {
+        this.debugCounters.dexWaitMs += delay;
+        await sleep(delay);
+      }
       const ctrl = new AbortController();
       const timeout = setTimeout(() => ctrl.abort(), 6_000);
       try {
+        this.debugCounters.dexRequests += 1;
         const res = await fetch(url, { signal: ctrl.signal });
-        this.dexNextAt = Date.now() + (res.status === 429 ? DEX_429_COOLDOWN_MS : DEX_MIN_INTERVAL_MS);
+        if (res.status === 429) {
+          const cooldown = this.retryAfterMs(res);
+          this.dexNextAt = Date.now() + cooldown;
+          this.dexPenaltyUntil = this.dexNextAt;
+          this.debugCounters.dexCooldownMsTotal += cooldown;
+          // Log the FIRST refusal of each penalty only. Logging every one turned a rate limit into a
+          // log flood that said the same thing 32 times an hour.
+          if (!this.dexPenaltyLogged) {
+            this.dexPenaltyLogged = true;
+            logger.warn(
+              {
+                retryAfter: res.headers?.get?.('retry-after') ?? null,
+                cooldownMs: cooldown,
+                server: res.headers?.get?.('server') ?? null,
+                requests: this.debugCounters.dexRequests,
+                ok: this.debugCounters.dexOk,
+              },
+              'price: DexScreener rate limited — holding the lane until the window reopens',
+            );
+          }
+        } else {
+          this.dexNextAt = Date.now() + DEX_MIN_INTERVAL_MS;
+          this.dexPenaltyUntil = 0;
+          this.dexPenaltyLogged = false;
+          if (res.ok) this.debugCounters.dexOk += 1;
+        }
         return res;
       } finally {
         clearTimeout(timeout);
@@ -853,6 +1046,37 @@ export class PriceOracle {
     } finally {
       release();
     }
+  }
+
+  /**
+   * How long to hold off after a 429, preferring the server's own answer.
+   *
+   * `Retry-After` may be seconds or an HTTP date (RFC 9110). Clamped at both ends: a header of 0 or
+   * a past date must not mean "send immediately", and a wild value must not wedge the lane for hours.
+   */
+  private retryAfterMs(res: Response): number {
+    // Defensive on purpose. This runs on the rate-limit path, inside a try/catch that falls back to
+    // the chain — so a throw here would be swallowed and would look exactly like "the indexer had no
+    // answer", quietly turning every 429 into an unexplained pool read. A header bag is not worth
+    // that risk.
+    const raw = res.headers?.get?.('retry-after') ?? null;
+    let ms = 0;
+    if (raw) {
+      const secs = Number(raw);
+      if (Number.isFinite(secs)) ms = secs * 1000;
+      else {
+        const at = Date.parse(raw);
+        if (Number.isFinite(at)) ms = at - Date.now();
+      }
+    }
+    if (!(ms > 0)) ms = DEX_429_COOLDOWN_MS;
+    else ms += DEX_429_GRACE_MS;
+    return Math.min(ms, DEX_429_MAX_COOLDOWN_MS);
+  }
+
+  /** True while the indexer's rate-limit window is still shut. Callers skip rather than queue. */
+  private dexRateLimited(): boolean {
+    return Date.now() < this.dexPenaltyUntil;
   }
 
   /**
