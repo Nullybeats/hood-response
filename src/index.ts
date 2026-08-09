@@ -367,7 +367,20 @@ async function main(): Promise<void> {
       // `source: 'none'` means nothing was actually checked. Reporting that as
       // sellable is the exact bug that printed "🛡️ Safe" over unchecked tokens.
       if (report.source === 'none') return null;
+      // The FULL verdict, not just the honeypot flag.
+      //
+      // This read `report.honeypot` alone, which made v2 strictly less safe than the engine it
+      // replaced: legacy suppresses on `!report.ok`, and `ok` is `hardFails.length === 0` — honeypot
+      // AND cannot-sell-all, cannot-buy, self-destruct, owner-can-reclaim, blacklist, and buy/sell
+      // tax over SAFETY_MAX_TAX_PCT. So a token with a 90% sell tax reported `honeypot: false` and
+      // v2 called it sellable, while blocking coins it merely could not screen. Strict about the
+      // wrong thing in both directions.
+      //
+      // `hardFails` is the same list legacy gates on, so the two now agree on what "cannot sell"
+      // means. Warnings (mintable, pausable, unverified source) are deliberately NOT included: they
+      // are risk appetite, and appetite belongs to the operator, not to a fact.
       if (report.honeypot === true) return false;
+      if (Array.isArray(report.hardFails) && report.hardFails.length > 0) return false;
       if (report.honeypot === false) return true;
       return null;
     },

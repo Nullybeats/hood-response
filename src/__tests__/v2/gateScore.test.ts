@@ -56,11 +56,21 @@ describe('gate — the unknown-law', () => {
     expect(v.decision).toBe('pass');
   });
 
-  /** The "🛡️ Safe" bug, now structurally impossible: unknown cannot become pass. */
-  it('retries — never passes — when sellability was not checked', () => {
+  /**
+   * Sellability no longer STOPS a signal — it stops a BUY.
+   *
+   * It used to be a required fact, and the bill was 29 retries at 3s then a block, on a check that
+   * resolves ~1% of the time; `source: 'none'` was a permanent stall because re-reading the same
+   * 10-minute cache returns the same non-answer. 14% of live decisions died there.
+   *
+   * The "🛡️ Safe" rule it was protecting is intact, just moved: the sheet reports
+   * `canSell.provenance !== 'measured'`, the match carries `sellabilityUnverified`, the feed badges
+   * it, and the sniper (SNIPER_REQUIRE_SAFE, default true) refuses to buy it. Unknown is still not
+   * safe — it is simply no longer silent.
+   */
+  it('PASSES an unchecked sellability — the signal fires, the buy is stopped elsewhere', () => {
     const v = gate(sheetWith({ canSell: null }), 0, 0);
-    expect(v.decision).toBe('retry');
-    expect(v.fact).toBe('canSell');
+    expect(v.decision).toBe('pass');
   });
 
   it('blocks a token that was checked and cannot be sold', () => {
@@ -78,7 +88,7 @@ describe('gate — the unknown-law', () => {
    * or it silently becomes "unknown passes eventually".
    */
   it('drops an alert whose facts never resolve, rather than passing it', () => {
-    const stuck = sheetWith({ canSell: null });
+    const stuck = sheetWith({ marketCap: null });
     const v = gate(stuck, DEFAULT_GATE_OPTIONS.maxAttempts - 1, 0);
     expect(v.decision).toBe('block');
     expect(v.reason).toMatch(/never assumed/);
@@ -91,7 +101,9 @@ describe('gate — the unknown-law', () => {
   });
 
   it('never returns pass for any sheet with an unknown house-rule fact', () => {
-    for (const over of [{ canSell: null }, { marketCap: null }, { canSell: null, marketCap: null }]) {
+    // canSell is deliberately NOT in this list any more — see the pass test above. marketCap is the
+    // only remaining house rule, and it must hold at every attempt and every elapsed time.
+    for (const over of [{ marketCap: null }, { marketCap: null, canSell: null }]) {
       for (const attempt of [0, 1, 5, 99]) {
         for (const pending of [0, 1000, 999_999]) {
           expect(gate(sheetWith(over as Partial<SheetInputs>), attempt, pending).decision).not.toBe('pass');

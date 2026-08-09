@@ -114,16 +114,18 @@ describe('V2Match payload', () => {
    */
   it('emits once per transaction, however many times it is re-evaluated', () => {
     const emitted: unknown[] = [];
-    // canSell null forces retries, so the same sheet is evaluated repeatedly.
-    let sellable: boolean | null = null;
+    // An unresolved marketCap forces retries, so the same sheet is evaluated repeatedly. It used to
+    // be canSell — that no longer waits, so using it here would emit on the first pass and this test
+    // would assert the guard without ever exercising it.
+    let cap: number | null = null;
     const shadow = shadowWith(
       (m) => emitted.push(m),
-      providers({ canSell: () => sellable }),
+      providers({ marketCap: () => cap }),
     );
     shadow.onSwap(dist());
     expect(emitted).toHaveLength(0); // still waiting on evidence
 
-    sellable = true;
+    cap = 80_000;
     const drain = () => (shadow as unknown as { drainPending: () => void }).drainPending();
     drain();
     expect(emitted).toHaveLength(1);
@@ -189,6 +191,8 @@ describe('buildMatch', () => {
       walletSeedTier: { value: 'alpha' },
       walletGrade: { value: null },
       cohortSize: { value: 1 },
+      // buildMatch reads provenance to report sellabilityUnverified, so the stub carries it.
+      canSell: { value: true, provenance: 'measured' },
     } as never;
     const score = { score: 68 } as never;
     const entry = { matchedLanes: ['allocation'], lanes: [{ matched: true, reason: 'ok' }] } as never;

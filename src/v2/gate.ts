@@ -70,7 +70,23 @@ export const DEFAULT_GATE_OPTIONS: GateOptions = {
  * sensibly reason without, and adding to this list makes the whole pipeline
  * stricter, so it should be argued for rather than grown by habit.
  */
-const REQUIRED_FACTS = ['canSell', 'marketCap'] as const;
+const REQUIRED_FACTS = ['marketCap'] as const;
+
+/**
+ * Facts checked for a PROVEN NEGATIVE but never waited on.
+ *
+ * `canSell` used to be a required fact, and the cost was not theoretical: an unresolved safety check
+ * burned 29 retries at 3s and then blocked, and `source: 'none'` was a PERMANENT stall — `warmSafety`
+ * re-reads the same 10-minute cache and gets the same non-answer, so the sheet could never succeed.
+ * [measured] 14% of live decisions died there, and canSell resolved on ~1% of trades.
+ *
+ * The reference engine never required it either: its safety check always returns a report, and a
+ * total screening failure yields `ok: true`. But "unknown is not safe" still holds — so the rule
+ * moved rather than being deleted. UNKNOWN no longer stops the SIGNAL (you see it, marked
+ * unverified); it still stops the BUY, at the sniper, where a person chose the risk appetite. A
+ * checked-and-cannot-be-sold token is blocked outright here, as it always was.
+ */
+const PROVEN_NEGATIVE_FACTS = ['canSell'] as const;
 
 /**
  * Decide what to do with a sheet.
@@ -87,7 +103,7 @@ export function gate(
 ): GateVerdict {
   // A proven negative is final, and is checked before the retry budget so that a
   // known-bad token is never reported as merely "unresolved".
-  for (const name of REQUIRED_FACTS) {
+  for (const name of [...REQUIRED_FACTS, ...PROVEN_NEGATIVE_FACTS]) {
     const fact = sheet[name];
     if (fact.provenance === 'failed') {
       return { decision: 'block', fact: name, reason: fact.reason ?? `${name} failed` };

@@ -195,7 +195,7 @@ describe('diary', () => {
     const cases: Partial<SheetInputs>[] = [
       {}, // matches
       { marketCap: 9_000 }, // skipped — under the cap floor, the one bar the lanes still enforce
-      { canSell: null }, // waiting
+      { marketCap: null }, // waiting — the one remaining REQUIRED fact
       { canSell: false }, // blocked
       { outcomesByWallet: new Map() }, // ungraded — now MATCHES, and must (the bootstrap)
       { pairAgeHours: 900 }, // old pair — solo-buy does not care, so this matches too
@@ -216,9 +216,9 @@ describe('diary', () => {
   });
 
   it('classifies an unresolved fact as waiting, not as a skip', () => {
-    const { entry } = evaluate({ canSell: null });
+    const { entry } = evaluate({ marketCap: null });
     expect(entry.outcome).toBe('waiting');
-    expect(entry.reason).toMatch(/waiting on canSell/);
+    expect(entry.reason).toMatch(/waiting on marketCap/);
   });
 
   it('classifies a proven-unsellable token as blocked', () => {
@@ -272,7 +272,7 @@ describe('diary supersede', () => {
    */
   it('replaces an earlier verdict for the same transaction instead of appending', () => {
     const diary = new Diary();
-    const waiting = evaluate({ canSell: null }, { ...trade, txHash: '0xsame' }).entry;
+    const waiting = evaluate({ marketCap: null }, { ...trade, txHash: '0xsame' }).entry;
     diary.record(waiting);
     diary.record(waiting);
     diary.record(waiting);

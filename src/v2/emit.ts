@@ -69,6 +69,16 @@ export interface V2Match {
   /** Distinct watched wallets on this token in the window. 1 = solo. */
   cohortSize: number;
   /**
+   * TRUE when no honeypot screen has produced an answer for this token.
+   *
+   * The signal is allowed to fire on an unscreened coin — the reference engine does the same, and
+   * blocking on it cost 14% of decisions to a check that resolves ~1% of the time. But an unscreened
+   * coin must never be presented as a checked one, so the uncertainty travels WITH the match instead
+   * of being dropped at the gate. Every surface that renders a match is expected to show it, and the
+   * sniper refuses to buy it. False means a screen ran and said the token is sellable.
+   */
+  sellabilityUnverified: boolean;
+  /**
    * Opaque wallet handle. The address itself is never emitted — same rule the
    * aggregate endpoints follow.
    */
@@ -106,6 +116,9 @@ export function buildMatch(
     seedTier: sheet.walletSeedTier.value ?? null,
     walletGrade: sheet.walletGrade.value ?? 'U',
     cohortSize: sheet.cohortSize.value ?? 1,
+    // `isKnown` is the only honest test here: a null value with 'unknown' provenance means nothing
+    // screened it, which is exactly what this flag reports.
+    sellabilityUnverified: sheet.canSell.provenance !== 'measured',
     walletId: walletIdOf(sheet.wallet),
   };
 }

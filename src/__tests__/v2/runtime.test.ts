@@ -295,7 +295,7 @@ describe('V2Shadow', () => {
      *  stamp an entry price against a decision that has not happened. */
     it('does not follow a decision still waiting on evidence', () => {
       const spy = ledgerSpy();
-      shadow = shadowWith(providers({ canSell: () => null }), spy);
+      shadow = shadowWith(providers({ marketCap: () => null }), spy);
       shadow.onSwap(swap());
       expect(shadow.diary.recent(1)[0]!.outcome).toBe('waiting');
       expect(spy.opened).toHaveLength(0);
@@ -342,11 +342,11 @@ describe('V2Shadow', () => {
 
   /** Unknown evidence must produce a WAITING verdict, not a silent drop. */
   it('queues a trade whose facts have not landed, and says so', () => {
-    shadow = makeShadow(providers({ canSell: () => null }));
+    shadow = makeShadow(providers({ marketCap: () => null }));
     shadow.onSwap(swap());
     const entry = shadow.diary.recent(1)[0]!;
     expect(entry.outcome).toBe('waiting');
-    expect(entry.reason).toMatch(/waiting on canSell/);
+    expect(entry.reason).toMatch(/waiting on marketCap/);
     expect(shadow.status().pending).toBe(1);
   });
 
@@ -363,7 +363,7 @@ describe('V2Shadow', () => {
   it('claims a first buy once per trade, however many times it is re-evaluated', () => {
     let claims = 0;
     const p = providers({
-      canSell: () => null, // force retries
+      marketCap: () => null, // force retries (the one remaining required fact)
       claimFirstBuy: () => {
         claims++;
         return claims === 1;
