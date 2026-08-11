@@ -59,6 +59,24 @@ import type { ScoreResult } from './score.js';
 
 export type Condition =
   | { kind: 'eventType'; is: SheetEventType }
+  /** Any of several event kinds — how a lane admits both a proven buy and an
+   *  unproven `transfer` without needing two near-identical lanes. */
+  | { kind: 'eventTypeIn'; in: SheetEventType[] }
+  /**
+   * Sellability, required ONLY for an event we could not attribute.
+   *
+   * This deliberately does NOT re-open the decision in c9dea13 ("Sellability
+   * stops a BUY, not a SIGNAL"): a `verified-buy` still passes without a
+   * honeypot answer, because we already proved someone paid for it and the
+   * sniper's own gate refuses the buy if it cannot be sold.
+   *
+   * A `transfer` is different in kind. We could not prove the wallet paid, so
+   * the ONE question left that protects capital is whether the coin can be sold
+   * at all — and unlike trace forensics, that is a question we can answer.
+   * UNKNOWN FAILS CLOSED here: unknown is not safe (CLAUDE.md rule 7), and the
+   * sheet retries while safety warms rather than assuming either way.
+   */
+  | { kind: 'sellableWhenUnproven' }
   | { kind: 'seedTierIn'; in: readonly WalletTier[] }
   /**
    * DELIBERATELY UNUSED BY `DEFAULT_LANES`. Read the header before adding it back.
@@ -180,7 +198,8 @@ export const DEFAULT_LANES: readonly Lane[] = [
     name: 'Solo buy',
     sentence: 'ONE watched wallet BUYS a coin between $25k and $125k market cap, pair 30m+ old',
     conditions: [
-      { kind: 'eventType', is: 'verified-buy' },
+      { kind: 'eventTypeIn', in: ['verified-buy', 'transfer'] },
+      { kind: 'sellableWhenUnproven' },
       { kind: 'cohortAtMost', n: 1 },
       { kind: 'capAtLeast', usd: 25_000 },
       { kind: 'capBand', in: ['micro'] },
@@ -202,7 +221,8 @@ export const DEFAULT_LANES: readonly Lane[] = [
     name: 'Fresh entry',
     sentence: "an alpha/beta wallet's first-ever buy of a pair under 48h old, over $25k",
     conditions: [
-      { kind: 'eventType', is: 'verified-buy' },
+      { kind: 'eventTypeIn', in: ['verified-buy', 'transfer'] },
+      { kind: 'sellableWhenUnproven' },
       { kind: 'firstBuy', is: true },
       { kind: 'seedTierIn', in: ['alpha', 'beta'] },
       { kind: 'pairAgeHoursBelow', hours: 48 },
@@ -224,7 +244,8 @@ export const DEFAULT_LANES: readonly Lane[] = [
     name: 'Crowd confirm',
     sentence: 'two or more watched wallets BUYING the same coin over $25k',
     conditions: [
-      { kind: 'eventType', is: 'verified-buy' },
+      { kind: 'eventTypeIn', in: ['verified-buy', 'transfer'] },
+      { kind: 'sellableWhenUnproven' },
       { kind: 'crowdSizeAtLeast', n: 2 },
       { kind: 'capAtLeast', usd: 25_000 },
       { kind: 'pairAgeMinutesAtLeast', minutes: 30 },
@@ -303,6 +324,20 @@ function check(condition: Condition, sheet: FactSheet, score: ScoreResult): Cond
   const r = (outcome: CheckOutcome, detail: string): ConditionResult => ({ condition, outcome, detail });
 
   switch (condition.kind) {
+    case 'eventTypeIn': {
+      return condition.in.includes(sheet.eventType)
+        ? r('met', sheet.eventType)
+        : r('unmet', `${sheet.eventType}, lane wants ${condition.in.join('/')}`);
+    }
+    case 'sellableWhenUnproven': {
+      // A proven buy is not gated on this — see the type. Only an unattributed
+      // transfer has to earn its place with a sellability answer.
+      if (sheet.eventType !== 'transfer') return r('met', 'attributed — sellability not required');
+      if (!isKnown(sheet.canSell)) return r('unknown', 'unproven transfer, sellability not established yet');
+      return sheet.canSell.value === true
+        ? r('met', 'unproven transfer, but sellable')
+        : r('unmet', 'unproven transfer and NOT sellable');
+    }
     case 'eventType': {
       // Always known — how an event entered is never a mystery. This is the
       // guard that keeps buy lanes off distributions and vice versa.
@@ -409,6 +444,12 @@ export function describeCondition(c: Condition): string {
   switch (c.kind) {
     case 'eventType':
       return c.is === 'distribution' ? 'wallet RECEIVES the token (allocation)' : c.is.replace('-', ' ');
+    case 'eventTypeIn':
+      return c.in.includes('transfer')
+        ? 'a verified buy, or a transfer we could not attribute'
+        : c.in.map((k) => k.replace('-', ' ')).join(' or ');
+    case 'sellableWhenUnproven':
+      return 'if the buyer is unproven, the coin must be verified SELLABLE';
     case 'seedTierIn':
       return `${c.in.join('/')}-seed wallet (holder rank, not a grade)`;
     case 'walletGrade':

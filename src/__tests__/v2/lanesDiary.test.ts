@@ -343,10 +343,34 @@ describe('the premise behind skipping a quote', () => {
   it('no lane admits a distribution without naming the event type', () => {
     // A lane with no eventType condition would match BOTH buys and
     // distributions, so the skip rule above would starve it silently.
+    // `eventTypeIn` names it just as explicitly, for a lane that admits more
+    // than one kind (a verified buy AND an unattributed transfer).
     for (const lane of DEFAULT_LANES) {
       expect(
-        lane.conditions.some((c) => c.kind === 'eventType'),
+        lane.conditions.some((c) => c.kind === 'eventType' || c.kind === 'eventTypeIn'),
         `lane "${lane.id}" does not state which event type it is for`,
+      ).toBe(true);
+    }
+  });
+
+  /**
+   * The `transfer` class exists because an attribution gap is not evidence the
+   * trade did not happen — but such an event is still UNPROVEN, so the one thing
+   * standing between it and a buy is whether the coin can be sold at all. A lane
+   * that admitted transfers without that condition would walk the sniper into a
+   * honeypot on an event nobody proved was a purchase — strictly worse than the
+   * starvation this class was added to fix.
+   */
+  it('every lane admitting an unattributed transfer requires sellability', () => {
+    const transferLanes = DEFAULT_LANES.filter((lane) =>
+      lane.conditions.some((c) => c.kind === 'eventTypeIn' && c.in.includes('transfer')),
+    );
+    expect(transferLanes.length).toBeGreaterThan(0);
+
+    for (const lane of transferLanes) {
+      expect(
+        lane.conditions.some((c) => c.kind === 'sellableWhenUnproven'),
+        `lane "${lane.id}" admits an unproven transfer without requiring it to be sellable`,
       ).toBe(true);
     }
   });

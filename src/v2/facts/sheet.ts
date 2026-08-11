@@ -35,7 +35,23 @@ import { measured, unknown, type Fact, type Grade } from './types.js';
  * not buying. Calling those "buys" was a lie; discarding them was a waste. A
  * typed event keeps the fact honest and the signal.
  */
-export type SheetEventType = 'verified-buy' | 'distribution' | 'verified-sell';
+/**
+ * 'transfer' is a REAL transfer, in a transaction that DID contain a swap, where
+ * we could not prove THIS wallet was the one who paid.
+ *
+ * [verified 2026-08-11] the gate suppressed 57-100% of the trades the legacy
+ * stream alerted on, split across `insufficient_trace_data`,
+ * `unsupported_protocol` and `v4_pool_key_pending`. Every one of those means
+ * "we could not attribute it", none of them means "it did not happen" — and
+ * binning them is why v2 called 2 of the 8 coins the legacy boards called.
+ *
+ * The proof we cannot obtain is who paid. The proof that actually protects
+ * capital is whether the coin can be SOLD, and that one we can obtain. So a
+ * transfer is admitted on sellability instead of on trace forensics — see
+ * `sellableWhenUnproven` in lanes.ts. Distinct from 'distribution', which is a
+ * transfer with NO swap anywhere in the transaction (an allocation/airdrop).
+ */
+export type SheetEventType = 'verified-buy' | 'distribution' | 'verified-sell' | 'transfer';
 
 /** Market-cap band. Named rather than numeric so a lane reads as a sentence. */
 export type CapBand = 'micro' | 'small' | 'mid' | 'large';

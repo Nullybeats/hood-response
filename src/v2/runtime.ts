@@ -33,6 +33,29 @@ import type { OutcomeLedger } from './ledger.js';
 import { scoreSheet, type ScoreResult } from './score.js';
 
 /**
+ * Verifier categories that mean "the trade is real, we could not attribute it".
+ *
+ * Deliberately a WHITELIST. The categories NOT here — `no_receipt_available`,
+ * `no_exact_receipt_transfer`, `no_successful_swap_receipt` — mean the transfer
+ * was not real or nothing swapped in that transaction, and those must keep
+ * dropping. Adding a category here admits a new class of event to the buy
+ * lanes, so it is a decision to make on evidence, not a default.
+ */
+const ATTRIBUTION_GAP = new Set([
+  // The payment may be native ETH we cannot see: the public RPC answers
+  // debug_traceTransaction with -32601, so this never resolves there.
+  'insufficient_trace_data',
+  // A router we do not decode. Says nothing about whether the trade happened.
+  'unsupported_protocol',
+  // PoolKey provenance not established YET — a backlog, not a verdict.
+  'v4_pool_key_pending',
+]);
+// Deliberately NOT gaps, and they keep dropping: `v4_pool_token_mismatch` (the
+// pool provably does not contain this token) and
+// `trigger_direction_not_net_exchange` (the wallet's net position contradicts
+// the direction) are positive evidence AGAINST the trade, not an absence of it.
+
+/**
  * Everything the pipeline needs from the outside world.
  *
  * Each may legitimately answer "I don't know" (null), and the gate is what turns
@@ -139,6 +162,10 @@ export class V2Shadow {
     distributionsCooled: 0,
     /** Repeat buys of one token by one wallet, collapsed by the throttle. */
     buysThrottled: 0,
+    /** Real transfers, in a tx containing a swap, whose payer we could not prove.
+     *  Counted separately from `unverified` so "we could not attribute it" never
+     *  hides inside "we rejected it". */
+    unattributedTransfers: 0,
   };
   /** Last verified buy per (wallet, token); the re-buy collapser. */
   private readonly buyThrottle = new Map<string, number>();
@@ -151,6 +178,7 @@ export class V2Shadow {
     verifiedSell: null,
     distribution: null,
     unverified: null,
+    transfer: null,
   };
 
   /**
@@ -305,6 +333,28 @@ export class V2Shadow {
     if (swap.verifiedTrade !== true) {
       this.intake.unverified++;
       this.intakeLastAt.unverified = Date.now();
+      // AN ATTRIBUTION GAP IS NOT EVIDENCE THE TRADE DID NOT HAPPEN.
+      //
+      // [verified 2026-08-11] every suppression the gate reported was one of
+      // `insufficient_trace_data`, `unsupported_protocol` or
+      // `v4_pool_key_pending` — together 57-100% of the trades the legacy stream
+      // alerted on, and the reason v2 called 2 of the 8 coins those boards did.
+      // All three mean "we could not work out who paid". The first is a
+      // PERMANENT floor on the public RPC, which answers debug_traceTransaction
+      // with -32601, so waiting for proof there waits forever.
+      //
+      // Such an event carries on as a `transfer`, admitted on SELLABILITY
+      // instead of on trace forensics: it is the one question left that protects
+      // capital and, unlike attribution, one we can actually answer. Categories
+      // meaning the transfer itself was not real (no receipt, not in its own
+      // receipt, no swap in the tx) still drop here.
+      if (swap.direction !== 'BUY') return;
+      if (!ATTRIBUTION_GAP.has(swap.verifiedCategory ?? '')) return;
+      this.intake.unattributedTransfers++;
+      this.intakeLastAt.transfer = Date.now();
+      this.seen++;
+      this.jrnl.write('trade', swap);
+      this.evaluate({ trade: swap, firstSeenAt: Date.now(), attempts: 0 }, Date.now());
       return;
     }
     if (swap.direction !== 'BUY') {
@@ -666,7 +716,14 @@ export class V2Shadow {
       // would no longer read as first.
       firstBuy: trade.distribution === true ? false : this.firstBuyMemo(trade),
       rotatedFrom: null,
-      eventType: trade.distribution === true ? 'distribution' : 'verified-buy',
+      eventType:
+        trade.distribution === true
+          ? 'distribution'
+          : trade.verifiedTrade === true
+            ? 'verified-buy'
+            : // Reached only via the ATTRIBUTION_GAP path in onSwap — a real
+              // transfer whose payer we could not prove, never an unchecked one.
+              'transfer',
       seedTier,
       usdValueLate:
         trade.usdValue == null ? (this.providers.usdValueNow?.(trade.token, trade.amount) ?? null) : null,
