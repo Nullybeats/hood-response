@@ -249,6 +249,22 @@ export class PriceOracle {
    *  tracking it (not a true lifetime ATH — DexScreener doesn't expose one —
    *  but the best signal available without a paid data source). */
   private readonly athMarketCap = new Map<string, number>();
+  /**
+   * Pair creation time (unix ms) per token, kept OUTSIDE the 60s price TTL.
+   *
+   * [verified 2026-08-11] `pairCreatedAt()` read through `fresh()`, so a creation
+   * timestamp expired 60 seconds after it was fetched and the token read as
+   * "pair age unknown" again — even though we had already established it. Pair
+   * creation is immutable: it is the one field on a LivePrice that cannot go
+   * stale, and expiring it was the largest single source of v2's unknown pair
+   * age (42% measured), which the `pairAgeHoursBelow` ceiling rejects on.
+   *
+   * Write-once per token, and a null NEVER overwrites a known value: the two
+   * sources disagree in coverage, not in fact — DexScreener omits
+   * `pairCreatedAt` on pairs it has only just indexed, and before this that
+   * omission erased a chain-derived timestamp we already held.
+   */
+  private readonly pairCreated = new Map<string, number>();
   private readonly pools = new PoolPriceReader();
   /** Last ETH/USD rate fetched from WETH's own pairs — see ensureEthUsd(). */
   private ethUsdRef: { rate: number; at: number } | null = null;
@@ -394,9 +410,20 @@ export class PriceOracle {
     return this.fresh(tokenAddress)?.liquidityUsd ?? null;
   }
 
-  /** Pair creation time (unix ms) for the token, or null if unknown. */
+  /** Pair creation time (unix ms) for the token, or null if unknown.
+   *  Served from the permanent memo, not the 60s price cache — see `pairCreated`. */
   pairCreatedAt(tokenAddress: string): number | null {
-    return this.fresh(tokenAddress)?.pairCreatedAt ?? null;
+    return this.pairCreated.get(tokenAddress.toLowerCase()) ?? null;
+  }
+
+  /** Record an immutable pair creation time. Ignores nulls and implausible
+   *  values, and never overwrites one we already hold. */
+  private notePairCreated(address: string, at: number | null | undefined): void {
+    if (at == null || !Number.isFinite(at) || at <= 0) return;
+    const key = address.toLowerCase();
+    if (this.pairCreated.has(key)) return;
+    this.pairCreated.set(key, at);
+    capMap(this.pairCreated, MAX_CACHE);
   }
 
   /** Highest market cap seen for this token since tracking began, or null if
@@ -973,6 +1000,7 @@ export class PriceOracle {
     const priceNative = Number(best.priceNative);
     const marketCap = best.marketCap ?? best.fdv ?? null;
     this.recordAth(address, marketCap);
+    this.notePairCreated(address, best.pairCreatedAt);
     this.live.set(address, {
       source: 'dexscreener',
       priceUsd,
@@ -1252,6 +1280,10 @@ export class PriceOracle {
       { token: address, venue: pool.venue, priceUsd },
       'price oracle: priced from chain (no DexScreener pair)',
     );
+    // Chain-derived creation evidence, and the ONLY source for the newest pairs:
+    // DexScreener has not indexed them yet (poolFallbackFromNoPair, 3,607 this
+    // boot), which is exactly the cohort the lanes hunt.
+    this.notePairCreated(address, pool.pairCreatedAt);
     this.live.set(address, {
       source: 'pool',
       priceUsd,

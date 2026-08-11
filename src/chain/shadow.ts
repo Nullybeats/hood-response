@@ -4,7 +4,7 @@ import { TRANSFER_TOPIC, addressToTopic } from './decoder.js';
 import { V3_SWAP_TOPIC, V4_SWAP_TOPIC } from './receipt.js';
 import { classifyCandidate, emptyTally, type CandidateClass, type TxLog } from './classify.js';
 import { rpcHost } from './rpcLog.js';
-import { HyperSyncClient, type HsLog } from './hypersync.js';
+import { HyperSyncClient, type HsLog, type HyperSyncLimits } from './hypersync.js';
 
 /**
  * HyperSync SHADOW listener — measures, never acts.
@@ -40,6 +40,13 @@ export interface ShadowStats {
   byClass: Record<CandidateClass, number>;
   /** Per-source failures, so a quiet result is never mistaken for a quiet chain. */
   failures: { height: number; query: number };
+  /** Rate-limit / auth state from the client. `authFailures > 0` means the
+   *  token is dead or not yet active — the condition that stalled this shadow
+   *  for days behind a `failures.query` counter that named no cause. */
+  limits: HyperSyncLimits;
+  /** One line naming what is wrong, or null when nothing is. Exists so the
+   *  answer to "is the shadow healthy?" does not require reading four counters. */
+  verdict: string | null;
   pagesFetched: number;
   startedAt: number | null;
   lastTickAt: number | null;
@@ -102,7 +109,26 @@ export class HyperSyncShadow {
     this.timer = null;
   }
 
+  /**
+   * Name the fault, in priority order. A revoked token outranks lag, because
+   * lag is its symptom: the shadow that stalled 77,307 blocks behind was not
+   * slow, it was unauthenticated.
+   */
+  private verdict(limits: HyperSyncLimits): string | null {
+    if (!this.enabled) return 'disabled — FEED_HYPERSYNC_TOKEN is unset';
+    if (!config.FEED_SHADOW_ENABLED) return 'disabled — FEED_SHADOW_ENABLED is off';
+    if (limits.authFailures > 0 && this.lastTickAt == null)
+      return `token rejected (${limits.lastStatus}) — rotate FEED_HYPERSYNC_TOKEN at app.envio.dev/api-tokens; /height answers 200 even when it is dead, only /query tells the truth`;
+    if (limits.authFailures > 0) return `token rejected (${limits.lastStatus}) on the most recent attempts — check FEED_HYPERSYNC_TOKEN`;
+    if (limits.cooldownMsRemaining > 0)
+      return `rate limited — holding off ${Math.round(limits.cooldownMsRemaining / 1000)}s`;
+    if (this.lastTickAt == null && this.startedAt != null && Date.now() - this.startedAt > 120_000)
+      return 'no successful tick since boot';
+    return null;
+  }
+
   stats(): ShadowStats {
+    const limits = this.hs.limitState();
     return {
       enabled: this.enabled && config.FEED_SHADOW_ENABLED,
       cursor: this.cursor,
@@ -111,6 +137,8 @@ export class HyperSyncShadow {
       rawTransfers: this.rawTransfers,
       byClass: { ...this.byClass },
       failures: { ...this.failures },
+      limits,
+      verdict: this.verdict(limits),
       pagesFetched: this.pagesFetched,
       startedAt: this.startedAt,
       lastTickAt: this.lastTickAt,

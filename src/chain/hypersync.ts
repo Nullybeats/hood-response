@@ -103,6 +103,31 @@ export interface HyperSyncFailure {
   detail?: string;
 }
 
+/**
+ * What the client is currently doing about rate limits and auth, so a stalled
+ * sweep can be told apart from a quiet chain WITHOUT reading the logs.
+ *
+ * [verified 2026-08-11] the feed shadow sat at `failures.query: 1539`,
+ * `lastTickAt: null` and 77,307 blocks of lag while `/height` answered 200. The
+ * token had been revoked, `/query` was returning 401, and every failure was
+ * collapsed into the same `null` a genuinely empty range returns. Nothing in
+ * any endpoint distinguished "the token is dead" from "nothing happened", and
+ * the verified-trade gate silently starved behind it for days.
+ */
+export interface HyperSyncLimits {
+  /** 429s observed. */
+  rateLimited: number;
+  /** 401/403s observed — a dead or not-yet-active token, never a quiet chain. */
+  authFailures: number;
+  /** ms until the next request is allowed; 0 when not held back. */
+  cooldownMsRemaining: number;
+  /** Requests refused locally, before touching the network. */
+  skippedInCooldown: number;
+  /** Last non-ok HTTP status, so a caller can name the problem. */
+  lastStatus: number | null;
+  lastStatusAt: number | null;
+}
+
 export interface HyperSyncOptions {
   url: string;
   token: string;
@@ -115,7 +140,53 @@ export interface HyperSyncOptions {
   maxPages?: number;
 }
 
+/**
+ * `Retry-After`, in either RFC 9110 form: delay-seconds, or an HTTP date.
+ *
+ * Falls back to `fallbackMs` on anything unparseable, and clamps to a sane
+ * ceiling — a server that says "retry in 10 hours" must not silently park the
+ * shadow for the rest of the day with no other signal that it happened.
+ */
+/**
+ * Read `Retry-After` without trusting the response shape.
+ *
+ * A header lookup that throws would be caught by the surrounding catch and
+ * reported as a TRANSPORT failure — turning a known 429 into an unknown one and
+ * losing the very status the backoff depends on. The classification must not
+ * hinge on the response being well-formed.
+ */
+function retryAfterOf(res: { headers?: { get?: (k: string) => string | null } }): string | null {
+  try {
+    return res.headers?.get?.('retry-after') ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function parseRetryAfter(header: string | null, fallbackMs: number): number {
+  if (!header) return fallbackMs;
+  const secs = Number(header.trim());
+  if (Number.isFinite(secs) && secs >= 0) return Math.min(secs * 1000, AUTH_COOLDOWN_MAX_MS);
+  const at = Date.parse(header);
+  if (Number.isFinite(at)) return Math.min(Math.max(at - Date.now(), 0), AUTH_COOLDOWN_MAX_MS);
+  return fallbackMs;
+}
+
 const DEFAULT_MAX_PAGES = 40;
+
+/** Backoff applied when the server says 429 and offers no `Retry-After`. */
+const RATE_LIMIT_COOLDOWN_MS = 2_000;
+/**
+ * Backoff after a 401/403, doubling to a cap.
+ *
+ * Not permanent, deliberately: a freshly-minted Envio token answers 403
+ * "pending activation" for a short while before it starts working, so refusing
+ * forever would turn a rotation into an outage requiring a redeploy. Long
+ * enough that a genuinely dead token stops generating traffic — the old
+ * behaviour retried every tick and logged 1,539 identical failures.
+ */
+const AUTH_COOLDOWN_MIN_MS = 30_000;
+const AUTH_COOLDOWN_MAX_MS = 10 * 60_000;
 
 export class HyperSyncClient {
   private readonly url: string;
@@ -125,6 +196,16 @@ export class HyperSyncClient {
   private readonly maxPages: number;
   /** Cumulative page count, for metrics. */
   pagesFetched = 0;
+  private cooldownUntil = 0;
+  private authBackoffMs = AUTH_COOLDOWN_MIN_MS;
+  private readonly limits: HyperSyncLimits = {
+    rateLimited: 0,
+    authFailures: 0,
+    cooldownMsRemaining: 0,
+    skippedInCooldown: 0,
+    lastStatus: null,
+    lastStatusAt: null,
+  };
 
   constructor(opts: HyperSyncOptions) {
     this.url = opts.url;
@@ -153,8 +234,59 @@ export class HyperSyncClient {
     }
   }
 
+  /** Rate-limit and auth state. Snapshot, never the live object. */
+  limitState(): HyperSyncLimits {
+    return { ...this.limits, cooldownMsRemaining: Math.max(0, this.cooldownUntil - Date.now()) };
+  }
+
+  /**
+   * Are we holding ourselves back right now?
+   *
+   * Checked BEFORE the request, which is the whole point: once the server has
+   * said 429 or 401, sending the next request immediately is what earns the
+   * next one. The old client had no such state, so a dead token produced one
+   * failed request per tick forever.
+   */
+  private inCooldown(): boolean {
+    if (Date.now() < this.cooldownUntil) {
+      this.limits.skippedInCooldown += 1;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Translate a non-ok response into backoff.
+   *
+   * 429 honours `Retry-After` when present (seconds per RFC 9110, or an HTTP
+   * date). 401/403 backs off separately and geometrically — it is not a
+   * transient condition and must not be retried at request cadence.
+   */
+  private noteHttpFailure(status: number, retryAfter: string | null): void {
+    const now = Date.now();
+    this.limits.lastStatus = status;
+    this.limits.lastStatusAt = now;
+    if (status === 429) {
+      this.limits.rateLimited += 1;
+      this.cooldownUntil = Math.max(this.cooldownUntil, now + parseRetryAfter(retryAfter, RATE_LIMIT_COOLDOWN_MS));
+      return;
+    }
+    if (status === 401 || status === 403) {
+      this.limits.authFailures += 1;
+      this.cooldownUntil = Math.max(this.cooldownUntil, now + this.authBackoffMs);
+      this.authBackoffMs = Math.min(this.authBackoffMs * 2, AUTH_COOLDOWN_MAX_MS);
+    }
+  }
+
+  /** A request succeeded: clear the auth backoff so a rotated token recovers
+   *  at full speed instead of inheriting the dead token's penalty. */
+  private noteSuccess(): void {
+    this.authBackoffMs = AUTH_COOLDOWN_MIN_MS;
+  }
+
   async height(): Promise<number | null> {
     if (!this.enabled) return null;
+    if (this.inCooldown()) return null;
     try {
       const res = await fetch(`${this.url}/height`, {
         headers: { authorization: `Bearer ${this.token}` },
@@ -162,9 +294,11 @@ export class HyperSyncClient {
       });
       if (!res.ok) {
         logHttpFailure({ op: `${this.op}-height`, url: this.url }, res.status, res.statusText);
+        this.noteHttpFailure(res.status, retryAfterOf(res));
         this.fail({ op: `${this.op}-height`, range: '', kind: 'http', status: res.status });
         return null;
       }
+      this.noteSuccess();
       const j = (await res.json()) as { height?: number };
       return typeof j.height === 'number' ? j.height : null;
     } catch (err) {
@@ -177,6 +311,7 @@ export class HyperSyncClient {
   /** One raw query. Callers needing full coverage must use {@link sweep}. */
   async query(body: unknown, range = ''): Promise<HsResponse | null> {
     if (!this.enabled) return null;
+    if (this.inCooldown()) return null;
     try {
       const res = await fetch(`${this.url}/query`, {
         method: 'POST',
@@ -186,9 +321,11 @@ export class HyperSyncClient {
       });
       if (!res.ok) {
         logHttpFailure({ op: `${this.op}-query`, url: this.url, range }, res.status, res.statusText);
+        this.noteHttpFailure(res.status, retryAfterOf(res));
         this.fail({ op: `${this.op}-query`, range, kind: 'http', status: res.status });
         return null;
       }
+      this.noteSuccess();
       return (await res.json()) as HsResponse;
     } catch (err) {
       logRpcThrow({ op: `${this.op}-query`, url: this.url, range }, err);
