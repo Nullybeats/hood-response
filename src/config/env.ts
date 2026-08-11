@@ -442,6 +442,12 @@ const schema = z.object({
   // A quote older than 3× this is discarded rather than used (an underpriced tx sits unmined, which
   // costs far more than the round trip it saved). 0 = look fees up inline as before.
   SNIPER_FEE_CACHE_MS: num(0),
+  // How long a wallet balance may be reused for DISPLAY, ms. Every /api/sniper snapshot otherwise
+  // does an uncached eth_getBalance on the metered executor RPC, and the snapshot is polled per
+  // dashboard AND once per registered operator every 90s by cipherfi's portfolio poll — so the
+  // read count grows with users who are not even logged in. The trade path never reads this cache.
+  // 0 = no caching (previous behaviour).
+  SNIPER_BALANCE_CACHE_MS: num(30_000),
   // Only act on the first time a token appears in the global Signals feed.
   // This is intentionally independent of whether this operator bought it.
   SNIPER_NEW_COINS_ONLY: bool(false),

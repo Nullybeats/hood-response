@@ -14,6 +14,7 @@ function stubSafety() {
 function stubExecutor(log: string[]) {
   return {
     ready: true, address: () => '0xw', async balanceEth() { return 1; },
+    async balanceEthForDisplay() { return 1; },
     async buy(t: string, eth: number) { log.push('buy:' + t); return { txHash: '0xb', tokensReceived: 1000, tokensReceivedRaw: '1000', ethSpent: eth, gasEth: 1e-5, quotedTokens: 1000, venue: 'v4' as const }; },
     async sell() { return { txHash: '0xs', ethReceived: 0.001, quotedEthOut: 0.001, tokensSold: 1000, gasEth: 1e-5, venue: 'v4' as const }; },
     async previewRoundTrip(_t: string, eth: number) { return { venue: 'v4' as const, ethIn: eth, quotedTokens: 1000, ethBack: eth * 0.98, lossPct: 2, poolLiquidity: 1e18 }; },

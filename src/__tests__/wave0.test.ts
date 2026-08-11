@@ -29,6 +29,9 @@ function stubExecutor(log: string[]) {
     ready: true,
     address: () => '0xwallet',
     async balanceEth() { return 1; },
+    // Display-path read. Delegates to balanceEth here on purpose: these stubs assert on CALL
+    // COUNTS, so a caching double would hide a trade path that had started reading stale state.
+    async balanceEthForDisplay() { return 1; },
     async buy(token: string, eth: number) {
       log.push('buy:' + token + ':' + eth);
       return { txHash: '0xbuy', tokensReceived: 1000, ethSpent: eth, gasEth: 0.00001, quotedTokens: 1000, venue: 'v4' as const };

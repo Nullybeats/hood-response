@@ -1726,7 +1726,9 @@ export class SniperEngine {
     const investedEth = open.reduce((s, p) => s + p.ethIn, 0);
     const openValueEth = open.reduce((s, p) => s + p.valueEth, 0);
     const totalGasEth = positions.reduce((s, p) => s + p.gasEth, 0);
-    const walletEth = await this.executor.balanceEth();
+    // Display path: a few seconds of staleness on a screen is free, an eth_getBalance per poll per
+    // operator is not. Sizing and the gas-reserve gate still call balanceEth() directly.
+    const walletEth = await this.executor.balanceEthForDisplay();
     return {
       configured: this.executor.ready,
       mode: this.mode,

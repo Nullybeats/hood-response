@@ -330,6 +330,8 @@ const poolIdOf = (p: ResolvedPool): string =>
  */
 export class SwapExecutor {
   private provider: JsonRpcProvider | null = null;
+  /** Last fresh balance read, for the display path. Never holds a failed read. */
+  private balanceCache: { at: number; eth: number } | null = null;
   private wallet: Wallet | null = null;
   /**
    * Serializes tx SENDS for this wallet. ethers reads the pending nonce at send time, so two
@@ -420,14 +422,46 @@ export class SwapExecutor {
     return this.wallet?.address ?? null;
   }
 
+  /**
+   * Fresh on-chain balance. Every call is a real eth_getBalance on the executor's (metered) RPC.
+   * This is the TRADE-path read — sizing and the gas-reserve check must never act on a stale
+   * number — and it refreshes the display cache as a side effect.
+   */
   async balanceEth(): Promise<number | null> {
     this.init();
     if (!this.wallet || !this.provider) return null;
     try {
-      return Number(formatEther(await this.provider.getBalance(this.wallet.address)));
+      const eth = Number(formatEther(await this.provider.getBalance(this.wallet.address)));
+      this.balanceCache = { at: Date.now(), eth };
+      return eth;
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Balance for DISPLAY only — snapshots, dashboards, telemetry.
+   *
+   * A wallet balance seconds out of date is harmless on a screen and expensive on a meter: the
+   * snapshot is polled by every open dashboard and, independently, once per registered operator
+   * every 90s by cipherfi's portfolio poll. Without this, read volume grows with the user table
+   * rather than with demand, and nobody has to be logged in for it to.
+   *
+   * A FAILED read is never cached. Storing null would pin "balance unavailable" for the whole TTL
+   * on one transient RPC blip, and the snapshot renders that as an outage.
+   */
+  async balanceEthForDisplay(): Promise<number | null> {
+    const ttl = config.SNIPER_BALANCE_CACHE_MS;
+    if (ttl > 0 && this.balanceCache && Date.now() - this.balanceCache.at < ttl) {
+      return this.balanceCache.eth;
+    }
+    return this.balanceEth();
+  }
+
+  /** Drop the display cache — called after anything that moves the balance, so the UI does not
+   *  keep showing a pre-trade number for the rest of the TTL. */
+  invalidateBalanceCache(): void {
+    this.balanceCache = null;
   }
 
   // ── Pool discovery ──────────────────────────────────────────────────────────
@@ -993,6 +1027,9 @@ export class SwapExecutor {
   ): Promise<BuyResult> {
     this.init();
     if (!this.wallet) throw new Error('sniper wallet not configured');
+    // Whatever happens below moves the balance. Drop the display cache now rather than on success:
+    // a buy that reverts still burned gas, so a "failed" trade is not a no-op for the wallet.
+    this.invalidateBalanceCache();
     const amountIn = parseEther(ethAmount.toString());
     // The depth gate ran the quote race milliseconds ago (previewRoundTrip → bestVenue). Re-running it
     // here re-quotes every candidate pool in both directions for an answer we already have — pure
@@ -1485,6 +1522,7 @@ export class SwapExecutor {
   ): Promise<SellResult> {
     this.init();
     if (!this.wallet) throw new Error('sniper wallet not configured');
+    this.invalidateBalanceCache(); // see buy(): gas moves the balance even on a revert
     // Route the exit the same way as the entry. Getting this wrong is worse
     // than a missed buy: a position whose real market is v3 would try v4 first
     // and only reach v3 after a failed attempt — burning gas, and burning the
@@ -1695,6 +1733,9 @@ export class SwapExecutor {
     if (balBefore == null) return Number(formatEther(quotedOut));
     try {
       const balAfter = await this.provider!.getBalance(this.wallet!.address);
+      // Free refresh: this read is the post-trade truth, so seed the display cache with it rather
+      // than making the next snapshot pay for the same number.
+      this.balanceCache = { at: Date.now(), eth: Number(formatEther(balAfter)) };
       const delta = Number(formatEther(balAfter - balBefore));
       const received = delta + gasEth; // add gas back — it left the same balance
       return received > 0 ? received : Number(formatEther(quotedOut));
