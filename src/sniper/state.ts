@@ -1,9 +1,18 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { createRequire } from 'node:module';
 import { config } from '../config/env.js';
 import { logger } from '../logger.js';
+
+// `node:sqlite` via createRequire, not a static import — the same reason
+// attrib/ledger.ts and v2/facts/firstBuy.ts do it. Vite (and therefore Vitest)
+// rewrites the `node:sqlite` specifier to a bare `sqlite` it cannot resolve, and
+// the suite then collects ZERO tests while still exiting 0. A static import here
+// is why nothing could test the sniper state store at all.
+const nodeRequire = createRequire(import.meta.url);
+const { DatabaseSync } = nodeRequire('node:sqlite') as typeof import('node:sqlite');
+type DatabaseSync = InstanceType<typeof DatabaseSync>;
 
 export type SniperMode = 'off' | 'live';
 
@@ -66,7 +75,29 @@ export class SniperStateStore {
   get keyEnabled(): boolean { return this.key !== null && this.db !== null; }
 
   /**
-   * Atomically record a token's first appearance in the Signals feed.
+   * Has this token already had an ACTIONABLE signal? Read-only.
+   *
+   * Split out from `claimFirstSignal`, because claiming eagerly is what cost a
+   * real entry. [verified 2026-08-11] GACHA threw a solo-buy at score 23 that
+   * every operator's floor rejected — and it claimed the token anyway. Two hours
+   * later the fresh-entry signal at score 74 arrived and `New coins only`
+   * refused it: "token already appeared in Signals". A signal nobody could act
+   * on had permanently burned the coin.
+   */
+  hasSignalToken(token: string): boolean {
+    if (!this.db) return false;
+    const normalized = token.trim().toLowerCase();
+    if (!normalized) return false;
+    return this.db.prepare('SELECT 1 FROM sniper_signal_tokens WHERE token = ?').get(normalized) != null;
+  }
+
+  /**
+   * Atomically record a token's first ACTIONABLE appearance in the Signals feed.
+   *
+   * Called only once a signal has cleared the quality gates (lane, score,
+   * grade) — see engine.onAlert. A signal that no operator could have bought
+   * must leave the token untouched, or `New coins only` spends its one shot on
+   * something it then refuses.
    *
    * The boolean belongs to the emitted alert, rather than to an operator: every
    * operator is allowed to evaluate the same initial alert, while any later

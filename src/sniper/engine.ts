@@ -769,6 +769,23 @@ export class SniperEngine {
     if (!allowed.has(grade)) {
       return this.decide(swarm, 'skipped', `wallet grade ${grade} not in the buy list`);
     }
+    // THE TOKEN IS CLAIMED HERE, not on arrival.
+    //
+    // Everything above this line is a QUALITY judgement — lane, score, grade — and
+    // a signal failing one of them is a signal nobody could have bought.
+    // Everything below is CIRCUMSTANCE: too late, already holding, a buy already
+    // in flight, out of funds. Circumstance is a fine reason to have spent the
+    // token's one shot. Quality is not.
+    //
+    // [verified 2026-08-11] claiming on arrival cost a real entry: GACHA
+    // signalled solo-buy at score 23, was rejected by every operator's floor,
+    // and claimed the token anyway — so the fresh-entry signal at score 74 two
+    // hours later was refused as "already appeared in Signals".
+    //
+    // Idempotent (INSERT OR IGNORE), and the `firstSignal` annotation every
+    // engine is judging was read once before the fan-out, so a claim by one
+    // operator cannot change the answer another is mid-way through using.
+    this.state?.claimFirstSignal(swarm.token, swarm.id, swarm.tokenSymbol);
     // Freshness gate (before any network call): the alert's edge decays fast — on real trades every
     // >50%-peak winner filled in <2s, while a 38s-late fill bought the top (PIPEDOG). Skip an alert
     // already older than staleMaxSec by the time we see it. Lenient default while we still carry the

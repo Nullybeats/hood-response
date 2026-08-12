@@ -127,11 +127,12 @@ export class SniperRegistry {
   }
 
   /** Fan an alert out to every engine; each decides independently by its own
-   *  settings + wallet. First-signal status is claimed ONCE globally before
-   *  fan-out, so two operators can both evaluate the launch alert but neither
-   *  can buy a later Signals-feed repeat with New coins only enabled. */
+   *  settings + wallet. First-signal status is READ once globally before
+   *  fan-out, so two operators both see the same answer for one alert, and is
+   *  CLAIMED later by whichever engine finds the signal actionable — a signal
+   *  every operator rejected must not burn the token. See state.hasSignalToken. */
   onAlert(swarm: Swarm): void {
-    const firstSignal = this.state.claimFirstSignal(swarm.token, swarm.id, swarm.tokenSymbol);
+    const firstSignal = !this.state.hasSignalToken(swarm.token);
     const annotated = { ...swarm, firstSignal };
     for (const engine of this.engines.values()) void engine.onAlert(annotated);
   }
